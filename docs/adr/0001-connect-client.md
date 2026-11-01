@@ -4,7 +4,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 -->
 # ADR 0001 — The Rongroi Connect client: how it is built, hardened and shipped
 
-- Status: proposed
+- Status: accepted — owner, 2026-11-01 (local-address origins and the 14-day patch rule accepted)
 - Date: 2026-11-01
 - Related: aeterna-rongroi ADR 0089 (product line and schema 2,
   [aeterna-rongroi#252](https://github.com/aeterna/aeterna-rongroi/pull/252), not merged yet; this ADR follows
@@ -111,10 +111,9 @@ Required in every build, applied before `app` is ready or as the first statement
 code is pasted, so the paste field says "Only paste a code shown to you inside the game". Connect refuses a
 code whose `server_origin` is not exactly `http://` or `https://`, host, optional port: no userinfo
 (`user@`), no path, query or fragment, no other scheme. The consent screen shows the origin in large type,
-with the host in its ASCII (punycode) form. **Proposal, not decided:** a loopback (`127.0.0.0/8`, `::1`) or
+with the host in its ASCII (punycode) form. **Owner decision (2026-11-01):** a loopback (`127.0.0.0/8`, `::1`) or
 private-range (`10/8`, `172.16/12`, `192.168/16`, `fc00::/7`, `169.254/16`) origin is allowed, because a
-server on the same LAN is ordinary, and shown with a warning line naming it as a local address. The owner
-decides this before 0.1.0.
+server on the same LAN is ordinary, and shown with a warning line naming it as a local address.
 
 **The proof runs on what ships.** The automated flow lives in one module, `src/test-hook.js`, compiled in
 only when the build flag `CONNECT_TEST_HOOK=1` is set; the release build gets a stub with the same exports
@@ -247,7 +246,7 @@ Connect's own process exit codes, for scripts and tests, start at 10 so they can
 |---|---|---|
 | Paste code | a field for the `rr1.` code; "Only paste a code shown to you inside the game" | paste, quit |
 | Checking | "Contacting `<server_origin>`" | quit |
-| Consent | `server_origin` large; `policy.server_name` (covered by `policy_hash`); every collector by name; whether Windows will ask for admin rights; the countdown; the local-address warning if section 2's proposal is accepted | consent, decline (the button says the server is told), quit |
+| Consent | `server_origin` large; `policy.server_name` (covered by `policy_hash`); every collector by name; whether Windows will ask for admin rights; the countdown; the local-address warning for a loopback or private-range origin | consent, decline (the button says the server is told), quit |
 | Scanning | "Scanning"; while elevation is pending, "Windows will ask for permission"; the countdown | quit |
 | Hash shown | `visual_hash` in large type, grouped 4×4; a "See what will be sent" panel with the record as text; the countdown | send, quit (nothing sent) |
 | Uploading | progress by slice when chunked | — |
@@ -262,7 +261,7 @@ locale file, English and Thai at 0.1.0.
 
 Connect follows Electron's security releases, not rongroi's release rhythm. Electron and its tooling are
 pinned to exact versions in `package.json` and the lockfile. Dependabot watches them. A patch release of
-Connect ships within 14 days of an Electron release that fixes a Chromium or Electron security bug, on the
+Connect ships (owner, 2026-11-01) within 14 days of an Electron release that fixes a Chromium or Electron security bug, on the
 same major, after the quarantine job of section 2 passes on it. When the pinned major leaves Electron's
 supported range, Connect moves to a supported major in the next release. A major upgrade repeats the pktmon
 check, because Chromium may add a background fetch the switches do not cover.
