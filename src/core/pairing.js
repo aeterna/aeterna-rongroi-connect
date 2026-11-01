@@ -19,6 +19,10 @@ function fail(code, message) {
 }
 
 function isLocalAddress(host) {
+  if (typeof host !== 'string') return false;
+  const name = host.toLowerCase().replace(/\.$/, '');
+  if (name === 'localhost' || name.endsWith('.localhost')) return true;
+
   const family = net.isIP(host);
   if (family === 4) {
     const [first, second] = host.split('.').map(Number);
@@ -36,6 +40,17 @@ function isLocalAddress(host) {
     return /^f[cd][0-9a-f]{2}(?::|$)/.test(value);
   }
   return false;
+}
+
+function isCanonicalIpv4(host) {
+  if (!/^(?:0|[1-9]\d{0,2})(?:\.(?:0|[1-9]\d{0,2})){3}$/.test(host)) return false;
+  return host.split('.').every((part) => Number(part) <= 255);
+}
+
+function isIpv4Looking(host) {
+  const candidate = host.endsWith('.') ? host.slice(0, -1) : host;
+  return candidate !== ''
+    && candidate.split('.').every((part) => /^(?:0[xX][0-9a-fA-F]+|[0-9]+)$/.test(part));
 }
 
 function parseOrigin(value) {
@@ -78,7 +93,12 @@ function parseOrigin(value) {
 
   const urlHost = url.hostname.replace(/^\[|\]$/g, '');
   let hostAscii;
-  if (net.isIP(host)) {
+  if (isIpv4Looking(host) || net.isIP(urlHost) === 4) {
+    if (!isCanonicalIpv4(host) || urlHost !== host) {
+      fail('BAD_ORIGIN', 'server_origin must use a canonical dotted-quad IPv4 host');
+    }
+    hostAscii = host;
+  } else if (net.isIP(host)) {
     hostAscii = urlHost;
   } else {
     try {

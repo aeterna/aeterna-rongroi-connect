@@ -52,6 +52,9 @@ test('flags loopback and private-range origins', () => {
     'http://[fc00::1]',
     'http://[fd12::1]:30130',
     'http://[::ffff:192.168.1.1]',
+    'http://localhost:30130',
+    'http://app.localhost',
+    'http://deep.app.localhost:30130',
   ];
   for (const origin of local) assert.equal(parse({ server_origin: origin }).isLocalAddress, true, origin);
 
@@ -59,6 +62,8 @@ test('flags loopback and private-range origins', () => {
   for (const origin of remote) assert.equal(parse({ server_origin: origin }).isLocalAddress, false, origin);
   assert.equal(isLocalAddress('fdff::1'), true);
   assert.equal(isLocalAddress('fc::1'), false);
+  assert.equal(isLocalAddress('LOCALHOST'), true);
+  assert.equal(isLocalAddress('notlocalhost'), false);
 });
 
 test('refuses hostile or non-canonical origins', () => {
@@ -75,6 +80,13 @@ test('refuses hostile or non-canonical origins', () => {
     'http:///missing-host',
     'http://exa mple.com',
     'http://127.1',
+    'http://0x7f.1',
+    'http://2130706433',
+    'http://0177.0.0.1',
+    'http://127.0.0.01',
+    'http://256.0.0.1',
+    'http://1.2.3.4.5',
+    'http://127.0.0.1.',
   ];
   for (const origin of origins) {
     assert.throws(() => parse({ server_origin: origin }), isPairingError('BAD_ORIGIN'), origin);

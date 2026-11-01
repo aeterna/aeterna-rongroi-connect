@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 
 const INFO_PREFIX = 'rongroi-connect report v1';
 const SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex');
+const PKCS8_PREFIX = Buffer.from('302e020100300506032b656e04220420', 'hex');
 
 function ticketBytes(ticket) {
   if (typeof ticket !== 'string' || !/^[0-9a-f]{32}$/.test(ticket)) {
@@ -35,28 +36,62 @@ function importPublicKey(raw) {
   return crypto.createPublicKey({ key: der, format: 'der', type: 'spki' });
 }
 
+function importPrivateKey(value) {
+  if (value !== null && typeof value === 'object' && value.type === 'private') return value;
+  const raw = base64urlBytes(value, 32, 'ephemeral private key');
+  const der = Buffer.concat([PKCS8_PREFIX, raw]);
+  return crypto.createPrivateKey({ key: der, format: 'der', type: 'pkcs8' });
+}
+
+function deriveSharedSecret(privateKey, peerRaw) {
+  return crypto.diffieHellman({
+    privateKey,
+    publicKey: importPublicKey(peerRaw),
+  });
+}
+
 function deriveKey(shared, kitRaw, epkRaw, ticket) {
   const info = Buffer.concat([Buffer.from(INFO_PREFIX, 'utf8'), kitRaw, epkRaw]);
   const key = crypto.hkdfSync('sha256', shared, Buffer.from(ticket, 'ascii'), info, 32);
   return Buffer.from(key);
 }
 
-function sealEnvelope(plaintextUtf8, kitPublicB64u, ticket) {
+function fixedIv(value) {
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    const iv = Buffer.from(value);
+    if (iv.length !== 12) throw new RangeError('iv must be 12 bytes');
+    return iv;
+  }
+  return base64urlBytes(value, 12, 'iv');
+}
+
+/**
+ * Seal a report into an envelope v1.
+ *
+ * The optional `fixed` argument is a test seam for the shared vector. Pass
+ * `{ ephemeralPrivate, iv }` to use a known X25519 private key (a KeyObject or
+ * a 32-byte base64url raw key) and a known 12-byte IV (a Buffer or base64url).
+ * Production code must omit it, so every report gets a fresh key and IV.
+ */
+function sealEnvelope(plaintextUtf8, kitPublicB64u, ticket, fixed) {
   const kitRaw = base64urlBytes(kitPublicB64u, 32, 'kit public key');
   const salt = ticketBytes(ticket);
   if (typeof plaintextUtf8 !== 'string' && !Buffer.isBuffer(plaintextUtf8)) {
     throw new TypeError('plaintext must be a UTF-8 string or a Buffer');
   }
+  if (fixed !== undefined && fixed !== null
+      && (typeof fixed !== 'object' || Array.isArray(fixed))) {
+    throw new TypeError('fixed must be an object');
+  }
   const plaintext = Buffer.isBuffer(plaintextUtf8) ? plaintextUtf8 : Buffer.from(plaintextUtf8, 'utf8');
 
-  const ephemeral = crypto.generateKeyPairSync('x25519');
-  const epkRaw = rawPublicKey(ephemeral.publicKey);
-  const shared = crypto.diffieHellman({
-    privateKey: ephemeral.privateKey,
-    publicKey: importPublicKey(kitRaw),
-  });
+  const ephemeralPrivate = fixed && fixed.ephemeralPrivate !== undefined
+    ? importPrivateKey(fixed.ephemeralPrivate)
+    : crypto.generateKeyPairSync('x25519').privateKey;
+  const epkRaw = rawPublicKey(crypto.createPublicKey(ephemeralPrivate));
+  const shared = deriveSharedSecret(ephemeralPrivate, kitRaw);
   const key = deriveKey(shared, kitRaw, epkRaw, ticket);
-  const iv = crypto.randomBytes(12);
+  const iv = fixed && fixed.iv !== undefined ? fixedIv(fixed.iv) : crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   cipher.setAAD(salt);
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
@@ -83,10 +118,7 @@ function openEnvelope(envelope, kitPrivateKey, ticket) {
   const salt = ticketBytes(ticket);
 
   const kitRaw = rawPublicKey(crypto.createPublicKey(kitPrivateKey));
-  const shared = crypto.diffieHellman({
-    privateKey: kitPrivateKey,
-    publicKey: importPublicKey(epkRaw),
-  });
+  const shared = deriveSharedSecret(kitPrivateKey, epkRaw);
   const key = deriveKey(shared, kitRaw, epkRaw, ticket);
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
   decipher.setAAD(salt);
@@ -97,4 +129,4 @@ function openEnvelope(envelope, kitPrivateKey, ticket) {
   ]).toString('utf8');
 }
 
-module.exports = { sealEnvelope, openEnvelope };
+module.exports = { sealEnvelope, openEnvelope, deriveKey, deriveSharedSecret };
