@@ -24,6 +24,16 @@ const SECTION_1_FUSES = [
   { name: 'EnableCookieEncryption', value: true },
 ];
 
+// The fuse wire stores each fuse as the ASCII byte for '0' (off), '1' (on) or
+// 'r' (removed).  These are the fallbacks when @electron/fuses does not export
+// its FuseState enum.
+const FUSE_STATE_BYTES = {
+  DISABLE: 48,
+  ENABLE: 49,
+  REMOVED: 114,
+  INVALID: 63,
+};
+
 function normalizePath(value) {
   return String(value)
     .replace(/\\/g, '/')
@@ -249,7 +259,10 @@ async function loadFuses() {
   if (typeof getCurrentFuseWire !== 'function' || !FuseV1Options) {
     throw new Error('@electron/fuses did not export getCurrentFuseWire and FuseV1Options');
   }
-  return { getCurrentFuseWire, FuseV1Options };
+  const FuseState = fuses?.FuseState
+    ?? loaded?.FuseState
+    ?? loaded?.default?.FuseState;
+  return { getCurrentFuseWire, FuseV1Options, FuseState };
 }
 
 function extractAsarFile(asar, archivePath, entry) {
@@ -290,18 +303,24 @@ function listAsarFromDisk(asar, archivePath) {
   const files = new Map();
   for (const entry of entries) {
     const name = normalizePath(entry);
+
+    // listPackage() returns folders and links as well as files.  A folder is
+    // covered by the files inside it, and a link has no bytes of its own, so
+    // neither may be passed to extractFile().
+    let stats = null;
+    if (typeof asar.statFile === 'function') {
+      try {
+        stats = statAsarFile(asar, archivePath, entry);
+      } catch {
+        // Without a stat we can still try to extract a real file below.
+      }
+    }
+    if (stats && (stats.files !== undefined || stats.link)) continue;
+
     try {
       files.set(name, extractAsarFile(asar, archivePath, entry));
     } catch (error) {
-      let stats = null;
-      if (typeof asar.statFile === 'function') {
-        try {
-          stats = statAsarFile(asar, archivePath, entry);
-        } catch {
-          // The stat error is less useful than the extract error below.
-        }
-      }
-      if (stats !== null && stats.unpacked === true) {
+      if (stats && stats.unpacked === true) {
         // An unpacked file (the native .node) has only its entry in the asar;
         // its bytes live in app.asar.unpacked and are compared by readTree().
         // Keep a stable placeholder so the asar comparison only checks presence.
@@ -335,84 +354,104 @@ function wireBytes(wire) {
   return null;
 }
 
-function readWireState(bytes, option) {
-  const raw = Number(option);
-  const fromNumber = (value) => {
-    if (value === 0) return false;
-    if (value === 1) return true;
-    if (value === 2) return false;
-    return null;
+function fuseStateValues(FuseState) {
+  const exported = FuseState !== null && typeof FuseState === 'object' ? FuseState : {};
+  return {
+    disable: exported.DISABLE ?? FUSE_STATE_BYTES.DISABLE,
+    enable: exported.ENABLE ?? FUSE_STATE_BYTES.ENABLE,
+    removed: exported.REMOVED ?? FUSE_STATE_BYTES.REMOVED,
+    invalid: exported.INVALID ?? FUSE_STATE_BYTES.INVALID,
   };
+}
 
-  // Electron's fuse wire stores each fuse as a 32-bit little-endian value,
-  // with the option number as its slot.  Try the two common offsets before
-  // falling back to a bit field.
-  for (const offset of [raw, raw - 1]) {
-    if (offset < 0 || bytes.length < (offset + 1) * 4) continue;
-    const view = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
-    const value = view.readUInt32LE(offset * 4);
-    const state = fromNumber(value);
-    if (state !== null) return state;
+function normalizeFuseState(value, states) {
+  if (value === true || value === false) return value;
+  if (value === undefined || value === null) return null;
+
+  if (typeof value === 'string') {
+    const text = value.trim().toLowerCase();
+    if (text === '0' || text === 'off' || text === 'disabled' || text === 'false') return false;
+    if (text === '1' || text === 'on' || text === 'enabled' || text === 'true') return true;
+    if (text === 'r' || text === 'removed') return 'removed';
+    if (text === '?' || text === 'invalid') return 'invalid';
+    return null;
   }
 
-  // A byte-per-fuse wire.
-  for (const offset of [raw, raw - 1]) {
-    if (offset < 0 || offset >= bytes.length) continue;
-    const value = bytes[offset];
-    const state = fromNumber(value);
-    if (state !== null) return state;
-  }
-
-  // A bit field with fuse 1 in bit 0.
-  const index = raw - 1;
-  const byte = bytes[Math.floor(index / 8)];
-  if (index >= 0 && byte !== undefined) {
-    return (byte & (1 << (index % 8))) !== 0;
-  }
-
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  if (numeric === states.enable) return true;
+  if (numeric === states.disable) return false;
+  if (numeric === states.removed) return 'removed';
+  if (numeric === states.invalid) return 'invalid';
+  // Also accept a plain 0/1 wire, for callers that already decoded the bytes.
+  if (numeric === 0) return false;
+  if (numeric === 1) return true;
   return null;
 }
 
-function readFuseState(wire, option, name) {
+function readWireState(bytes, option) {
+  const index = Number(option);
+  if (!Number.isInteger(index) || index < 0 || index >= bytes.length) return undefined;
+  return bytes[index];
+}
+
+function readFuseState(wire, option, name, states) {
+  const stateFor = (value) => normalizeFuseState(value, states);
+
   if (wire !== null && typeof wire === 'object' && typeof wire.getFuseState === 'function') {
     const value = wire.getFuseState(option);
-    if (typeof value === 'boolean') return value;
-    if (typeof value === 'number') return value !== 0;
-    if (typeof value === 'string') return /^(?:1|true|on|enabled)$/i.test(value);
+    const state = stateFor(value);
+    if (state !== null) return state;
+    throw new Error(`the ${name} fuse is missing or has an unrecognised state: ${String(value)}`);
   }
 
   if (wire !== null && typeof wire === 'object') {
     for (const container of [wire.fuses, wire.options, wire.states, wire]) {
       if (container === null || typeof container !== 'object') continue;
       for (const key of [option, String(option), name]) {
-        if (key in container) return Boolean(container[key]);
+        if (!Object.prototype.hasOwnProperty.call(container, key)) continue;
+        const state = stateFor(container[key]);
+        if (state !== null) return state;
+        throw new Error(
+          `the ${name} fuse has an unrecognised state: ${String(container[key])}`,
+        );
       }
     }
   }
 
   const bytes = wireBytes(wire);
   if (bytes !== null) {
-    const state = readWireState(Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes), option);
+    const state = stateFor(readWireState(Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes), option));
     if (state !== null) return state;
   }
 
-  throw new Error(`cannot read the ${name} fuse from the fuse wire`);
+  throw new Error(`the ${name} fuse is missing from the fuse wire`);
 }
 
-function checkFuseWire(wire, FuseV1Options, label = 'executable') {
+function checkFuseWire(wire, FuseV1Options, FuseStateOrLabel, maybeLabel) {
+  let FuseState = FuseStateOrLabel;
+  let label = maybeLabel ?? 'executable';
+  if (typeof FuseStateOrLabel === 'string') {
+    label = FuseStateOrLabel;
+    FuseState = maybeLabel !== null && typeof maybeLabel === 'object' ? maybeLabel : undefined;
+  }
+  const states = fuseStateValues(FuseState);
   const differences = [];
   for (const { name, option, value } of expectedFuseEntries(FuseV1Options)) {
     let actual;
     try {
-      actual = readFuseState(wire, option, name);
+      actual = readFuseState(wire, option, name, states);
     } catch (error) {
       differences.push(`${label}: cannot read fuse ${name}: ${error.message}`);
       continue;
     }
-    if (actual !== value) {
-      differences.push(
-        `${label}: fuse ${name} is ${actual ? 'on' : 'off'}, expected ${value ? 'on' : 'off'}`,
-      );
+    const expected = value ? 'on' : 'off';
+    if (actual === 'removed') {
+      differences.push(`${label}: fuse ${name} is removed, expected ${expected}`);
+    } else if (actual === 'invalid') {
+      differences.push(`${label}: fuse ${name} is invalid, expected ${expected}`);
+    } else if (actual !== value) {
+      differences.push(`${label}: fuse ${name} is ${actual ? 'on' : 'off'}, expected ${expected}`);
     }
   }
   return differences;
@@ -429,9 +468,9 @@ async function compareExecutableFuses(directory, tree, fuses) {
   if (rel === undefined) {
     return [`${EXE_PATH}: missing`];
   }
-  const { getCurrentFuseWire, FuseV1Options } = fuses;
+  const { getCurrentFuseWire, FuseV1Options, FuseState } = fuses;
   const wire = await getCurrentFuseWire(path.join(path.resolve(directory), rel));
-  return checkFuseWire(wire, FuseV1Options, rel);
+  return checkFuseWire(wire, FuseV1Options, FuseState, rel);
 }
 
 async function main(argv) {

@@ -205,6 +205,46 @@ test('listAsarFromDisk uses the unpacked placeholder only for unpacked entries',
   assert.equal(files.get('src/main/main.js').toString('utf8'), 'main bytes');
 });
 
+test('listAsarFromDisk skips folders and links without extracting them', () => {
+  const archive = path.join('C:', 'app', 'resources', 'app.asar');
+  const extracted = [];
+  const asarFile = {
+    listPackage: () => [
+      '/native',
+      '/src/link.js',
+      '/src/main/main.js',
+      '/native/pipe/rongroi_connect_pipe.node',
+    ],
+    statFile: (file, entry) => {
+      const name = String(entry).replace(/^\/+/, '');
+      if (name === 'native') return { files: { pipe: {} }, unpacked: false };
+      if (name === 'src/link.js') return { link: 'src/main/main.js', unpacked: false };
+      if (name.endsWith('.node')) return { unpacked: true };
+      return { unpacked: false };
+    },
+    extractFile: (file, entry) => {
+      const name = String(entry).replace(/^\/+/, '');
+      extracted.push(name);
+      if (name === 'native') throw new Error('cannot extract native');
+      if (name === 'src/link.js') throw new Error('cannot extract a link');
+      if (name.endsWith('.node')) throw new Error('the file is unpacked');
+      return Buffer.from('main bytes');
+    },
+  };
+
+  const files = listAsarFromDisk(asarFile, archive);
+
+  assert.equal(files.has('native'), false);
+  assert.equal(files.has('src/link.js'), false);
+  assert.equal(extracted.includes('native'), false);
+  assert.equal(extracted.includes('src/link.js'), false);
+  assert.equal(files.get('src/main/main.js').toString('utf8'), 'main bytes');
+  assert.equal(
+    files.get('native/pipe/rongroi_connect_pipe.node').toString('utf8'),
+    'unpacked:native/pipe/rongroi_connect_pipe.node',
+  );
+});
+
 test('listAsarFromDisk throws for an extract error that is not unpacked', () => {
   const asarFile = {
     listPackage: () => ['/src/broken.js'],
@@ -233,26 +273,73 @@ test('listAsarFromDisk throws for an empty archive', () => {
   );
 });
 
-test('the section 1 fuse values are enforced', () => {
-  const options = {
-    RunAsNode: 1,
-    EnableCookieEncryption: 2,
-    EnableNodeOptionsEnvironmentVariable: 3,
-    EnableNodeCliInspectArguments: 4,
-    EnableEmbeddedAsarIntegrityValidation: 5,
-    OnlyLoadAppFromAsar: 6,
-  };
+const FUSE_OPTIONS = {
+  RunAsNode: 1,
+  EnableCookieEncryption: 2,
+  EnableNodeOptionsEnvironmentVariable: 3,
+  EnableNodeCliInspectArguments: 4,
+  EnableEmbeddedAsarIntegrityValidation: 5,
+  OnlyLoadAppFromAsar: 6,
+};
+
+// The fuse wire holds the ASCII byte for '0' (off), '1' (on) or 'r' (removed).
+const FUSE_OFF = 48;
+const FUSE_ON = 49;
+const FUSE_REMOVED = 114;
+
+function fuseWire(overrides = {}) {
   const states = {};
-  for (const { name, value } of SECTION_1_FUSES) states[options[name]] = value;
+  for (const { name, value } of SECTION_1_FUSES) {
+    states[FUSE_OPTIONS[name]] = value ? FUSE_ON : FUSE_OFF;
+  }
+  for (const [name, value] of Object.entries(overrides)) states[FUSE_OPTIONS[name]] = value;
+  return { getFuseState: (option) => states[option] };
+}
 
-  const wire = { getFuseState: (option) => states[option] };
-  assert.deepEqual(checkFuseWire(wire, options), []);
+test('the section 1 fuse values are enforced', () => {
+  assert.deepEqual(checkFuseWire(fuseWire(), FUSE_OPTIONS), []);
 
-  const wrong = { ...states, [options.OnlyLoadAppFromAsar]: false };
-  const differences = checkFuseWire({ getFuseState: (option) => wrong[option] }, options);
+  // The raw wire is a byte per fuse, so an off fuse is the truthy byte 48.
+  const bytes = new Uint8Array(8);
+  for (const { name, value } of SECTION_1_FUSES) {
+    bytes[FUSE_OPTIONS[name]] = value ? FUSE_ON : FUSE_OFF;
+  }
+  assert.deepEqual(checkFuseWire(bytes, FUSE_OPTIONS), []);
+});
+
+test('a wrong fuse value fails and names the fuse', () => {
+  const differences = checkFuseWire(
+    fuseWire({ OnlyLoadAppFromAsar: FUSE_OFF }),
+    FUSE_OPTIONS,
+  );
 
   assert.equal(differences.length, 1);
   assert.match(differences[0], /OnlyLoadAppFromAsar/);
+});
+
+test('a removed fuse fails and names the fuse', () => {
+  const differences = checkFuseWire(
+    fuseWire({ EnableCookieEncryption: FUSE_REMOVED }),
+    FUSE_OPTIONS,
+  );
+
+  assert.equal(differences.length, 1);
+  assert.match(differences[0], /EnableCookieEncryption/);
+  assert.match(differences[0], /removed/i);
+});
+
+test('a fuse missing from the wire fails and names the fuse', () => {
+  const wire = fuseWire();
+  const missing = {
+    getFuseState: (option) => (
+      option === FUSE_OPTIONS.RunAsNode ? undefined : wire.getFuseState(option)
+    ),
+  };
+
+  const differences = checkFuseWire(missing, FUSE_OPTIONS);
+
+  assert.equal(differences.length, 1);
+  assert.match(differences[0], /RunAsNode/);
 });
 
 test('the staged package.json drops devDependencies without changing the input', () => {
