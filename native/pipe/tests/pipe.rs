@@ -44,8 +44,7 @@ fn read_line(pipe: HANDLE) -> String {
         let mut read = 0u32;
         // SAFETY: the client handle is synchronous and `byte` is valid.
         unsafe {
-            ReadFile(pipe, Some(byte.as_mut_ptr().cast()), 1, Some(&mut read), None)
-                .expect("client read");
+            ReadFile(pipe, Some(&mut byte[..]), Some(&mut read), None).expect("client read");
         }
         if read == 0 {
             break;
@@ -62,14 +61,7 @@ fn write_bytes(pipe: HANDLE, data: &[u8]) {
     let mut written = 0u32;
     // SAFETY: `data` is valid for the duration of the synchronous write.
     unsafe {
-        WriteFile(
-            pipe,
-            Some(data.as_ptr().cast()),
-            data.len() as u32,
-            Some(&mut written),
-            None,
-        )
-        .expect("client write");
+        WriteFile(pipe, Some(data), Some(&mut written), None).expect("client write");
     }
     assert_eq!(written as usize, data.len());
 }

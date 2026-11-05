@@ -227,7 +227,7 @@ mod platform {
             // SAFETY: the pointer came from an API that allocates with LocalAlloc
             // and is freed here once, on every return path.
             unsafe {
-                let _ = LocalFree(HLOCAL(self.0));
+                let _ = LocalFree(Some(HLOCAL(self.0)));
             }
         }
     }
@@ -330,7 +330,7 @@ mod platform {
         // parameters are valid for the duration of the call.
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                PCWSTR::from_raw(sddl.as_wide().as_ptr()),
+                PCWSTR(sddl.as_ptr()),
                 SDDL_REVISION_1,
                 &mut descriptor,
                 Some(&mut descriptor_size),
@@ -347,16 +347,16 @@ mod platform {
 
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor,
+            lpSecurityDescriptor: descriptor.0,
             bInheritHandle: Default::default(),
         };
 
         let name = HSTRING::from(name);
         // SAFETY: all arguments are valid for the call.  The descriptor stays
         // alive until CreateNamedPipeW has copied it.
-        let handle = match unsafe {
+        let handle = unsafe {
             CreateNamedPipeW(
-                PCWSTR::from_raw(name.as_wide().as_ptr()),
+                PCWSTR(name.as_ptr()),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
@@ -365,19 +365,18 @@ mod platform {
                 0,
                 Some(&attributes),
             )
-        } {
-            Ok(handle) if handle != INVALID_HANDLE_VALUE => handle,
-            Ok(_) => return Err(PipeError::Failed(hresult_from_win32(ERROR_INVALID_DATA.0))),
-            Err(error) => {
-                return Err(if win32_code(&error) == Some(ERROR_ACCESS_DENIED.0) {
-                    // FILE_FLAG_FIRST_PIPE_INSTANCE reports an existing instance
-                    // this way.
-                    PipeError::Exists
-                } else {
-                    map_error(error)
-                });
-            }
         };
+        if handle == INVALID_HANDLE_VALUE {
+            // SAFETY: reading the thread's last error has no preconditions.
+            let code = unsafe { GetLastError() }.0;
+            return Err(if code == ERROR_ACCESS_DENIED.0 {
+                // FILE_FLAG_FIRST_PIPE_INSTANCE reports an existing instance
+                // this way.
+                PipeError::Exists
+            } else {
+                PipeError::Failed(hresult_from_win32(code))
+            });
+        }
 
         let id = next_id();
         lock(registry()).insert(id, Arc::new(Mutex::new(Some(handle.0 as isize))));
@@ -508,8 +507,7 @@ mod platform {
             let result = unsafe {
                 WriteFile(
                     handle,
-                    Some(chunk.as_ptr().cast()),
-                    length,
+                    Some(&chunk[..length as usize]),
                     Some(&mut written),
                     Some(&mut overlapped),
                 )
@@ -605,8 +603,7 @@ mod platform {
             let result = unsafe {
                 ReadFile(
                     handle,
-                    Some(buffer.as_mut_ptr().cast()),
-                    chunk_size as u32,
+                    Some(buffer.as_mut_slice()),
                     Some(&mut read),
                     Some(&mut overlapped),
                 )
