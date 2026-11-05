@@ -73,6 +73,7 @@
       "error.sidecar_failed": "The scan program failed.",
       "error.record_refused": "The scanner report was not in the expected form.",
       "error.internal": "Something went wrong inside the app.",
+      "error.mayHaveSent": "Part of the report may have reached the server.",
       "error.sentYes": "The report was sent.",
       "error.sentNo": "Nothing was sent."
     },
@@ -143,6 +144,7 @@
       "error.sidecar_failed": "โปรแกรม Scan ล้มเหลว",
       "error.record_refused": "รายงานจาก Scan ไม่อยู่ในรูปแบบที่คาดไว้",
       "error.internal": "เกิดข้อผิดพลาดภายในแอป",
+      "error.mayHaveSent": "รายงานบางส่วนอาจถึงเซิร์ฟเวอร์แล้ว",
       "error.sentYes": "รายงานถูกส่งแล้ว",
       "error.sentNo": "ไม่มีอะไรถูกส่ง"
     }

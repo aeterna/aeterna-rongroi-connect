@@ -29,6 +29,17 @@ function drive(flow, options) {
   const deadline = Date.now() + STATE_TIMEOUT_MS;
   let settled = false;
 
+  // The proof build leaves exactly as a player's Quit does: the flow chooses
+  // the code, then Electron runs its before-quit/will-quit cleanup.
+  const end = () => {
+    try {
+      flow.quit();
+    } catch {
+      // Closing must still ask the app to quit.
+    }
+    if (app && typeof app.quit === 'function') app.quit();
+  };
+
   const stopWithFailure = (state) => {
     if (settled) return;
     settled = true;
@@ -38,9 +49,7 @@ function drive(flow, options) {
     } catch {
       line = '{"name":"error"}';
     }
-    process.stdout.write(`${line}\n`, () => {
-      if (app && typeof app.exit === 'function') app.exit(20);
-    });
+    process.stdout.write(`${line}\n`, end);
   };
 
   const timer = setTimeout(() => {
@@ -73,12 +82,7 @@ function drive(flow, options) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      try {
-        await invoke(() => flow.quit());
-      } catch {
-        // The report was already accepted; closing must still finish.
-      }
-      if (app && typeof app.quit === 'function') app.quit();
+      end();
     } catch {
       clearTimeout(timer);
       stopWithFailure(flow.state());

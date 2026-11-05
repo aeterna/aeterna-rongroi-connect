@@ -4,9 +4,12 @@
 
 const { canonicalize } = require('../core/canonical');
 const { ConnectError } = require('./net');
+const { KNOWN_COLLECTORS } = require('./collectors');
 
 const MAX_RECORD_BYTES = 2 * 1024 * 1024;
 const RETRYABLE_CODES = new Set(['network', 'timeout', 'server_error', 'upload_refused']);
+const POLICY_RETRY_CODES = new Set(['network', 'timeout', 'server_error']);
+const KNOWN_COLLECTOR_IDS = new Set(KNOWN_COLLECTORS);
 const COUNTDOWN_STATES = new Set(['consent', 'scanning', 'hash']);
 
 function noop() {}
@@ -84,7 +87,9 @@ function createFlow(options = {}) {
   let accepted = false;
   let exit = null;
   let busy = false;
-  let sent = null;
+  let expected = null;
+  let sent = false;
+  let quitRequested = false;
 
   function publish(state) {
     current = state;
@@ -125,19 +130,21 @@ function createFlow(options = {}) {
     return { ...state, secondsLeft: left };
   }
 
-  function fail(key, sentFlag, code, canRetry = false) {
+  function fail(key, code, canRetry = false) {
+    // Quit already chose the final code; a late rejection must not replace it.
+    if (quitRequested) return;
     exit = code;
     publish({
       name: 'error',
-      error: { key, sent: sentFlag === true },
+      error: { key, sent: sent === true ? 'maybe' : false },
       canRetry: canRetry === true,
     });
   }
 
-  function failConnect(error, exitCode, sentFlag) {
+  function failConnect(error, exitCode) {
     const key = errorKey(error);
     const retry = RETRYABLE_CODES.has(key) && hasTime();
-    fail(key, sentFlag, exitCode, retry);
+    fail(key, exitCode, retry);
   }
 
   function consentState() {
@@ -169,14 +176,16 @@ function createFlow(options = {}) {
   function validPolicy(value) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
     if (!Array.isArray(value.required_collectors)) return false;
-    if (value.required_collectors.some((collector) => typeof collector !== 'string')) return false;
+    if (value.required_collectors.some(
+      (collector) => typeof collector !== 'string' || !KNOWN_COLLECTOR_IDS.has(collector),
+    )) return false;
     return typeof value.server_name === 'string';
   }
 
   function checkRecord(text) {
     if (typeof text !== 'string') return { ok: false, key: 'record_refused' };
     if (Buffer.byteLength(text, 'utf8') > MAX_RECORD_BYTES) {
-      return { ok: false, key: 'record_refused' };
+      return { ok: false, key: 'too_large' };
     }
 
     let record;
@@ -189,9 +198,9 @@ function createFlow(options = {}) {
       return { ok: false, key: 'record_refused' };
     }
 
-    if (!sameCanonical(record.binding, sent.binding)
-        || !sameCanonical(record.policy, sent.policy)
-        || !sameCanonical(record.producer, sent.producer)) {
+    if (!sameCanonical(record.binding, expected.binding)
+        || !sameCanonical(record.policy, expected.policy)
+        || !sameCanonical(record.producer, expected.producer)) {
       return { ok: false, key: 'record_refused' };
     }
     if (typeof record.visual_hash !== 'string' || !/^[0-9a-f]{16}$/.test(record.visual_hash)) {
@@ -221,6 +230,31 @@ function createFlow(options = {}) {
     };
   }
 
+  async function fetchPolicy() {
+    try {
+      if (client === null) {
+        client = await makeClient({ origin: parsed.serverOrigin, ticket: parsed.ticket });
+      }
+      const received = await client.getPolicy(parsed.policyHash);
+      if (!validPolicy(received)) {
+        fail('policy_mismatch', 12, false);
+        return false;
+      }
+      policy = received;
+      return true;
+    } catch (error) {
+      if (isConnectError(error)) {
+        const key = errorKey(error);
+        const code = key === 'policy_mismatch' || key === 'bad_policy' ? 12 : 15;
+        const canRetry = POLICY_RETRY_CODES.has(key) && hasTime();
+        fail(key, code, canRetry);
+      } else {
+        fail('internal', 10, false);
+      }
+      return false;
+    }
+  }
+
   async function doSubmitCode(code) {
     busy = true;
     try {
@@ -228,14 +262,14 @@ function createFlow(options = {}) {
       try {
         candidate = parseCode(code);
       } catch (error) {
-        fail(isOriginError(error) ? 'bad_origin' : 'bad_code', false, 12, false);
+        fail(isOriginError(error) ? 'bad_origin' : 'bad_code', 12, false);
         return true;
       }
       if (candidate === null || candidate === undefined
           || typeof candidate !== 'object'
           || typeof candidate.serverOrigin !== 'string'
           || typeof candidate.ticket !== 'string') {
-        fail('bad_code', false, 12, false);
+        fail('bad_code', 12, false);
         return true;
       }
 
@@ -247,30 +281,12 @@ function createFlow(options = {}) {
       visualHash = null;
       accepted = false;
       exit = null;
-      sent = null;
+      sent = false;
+      expected = null;
 
       publish({ name: 'checking', serverOrigin: parsed.serverOrigin });
 
-      try {
-        client = await makeClient({ origin: parsed.serverOrigin, ticket: parsed.ticket });
-        const received = await client.getPolicy(parsed.policyHash);
-        if (!validPolicy(received)) {
-          fail('policy_mismatch', false, 12, false);
-          return true;
-        }
-        policy = received;
-      } catch (error) {
-        if (isConnectError(error)) {
-          const key = errorKey(error);
-          const code = key === 'policy_mismatch' || key === 'bad_policy' ? 12 : 15;
-          fail(key, false, code, false);
-        } else {
-          fail('internal', false, 10, false);
-        }
-        return true;
-      }
-
-      publish(consentState());
+      if (await fetchPolicy()) publish(consentState());
       return true;
     } finally {
       busy = false;
@@ -278,7 +294,7 @@ function createFlow(options = {}) {
   }
 
   function submitCode(code) {
-    if (busy) return false;
+    if (quitRequested || busy) return false;
     const retryingWithoutCode = current.name === 'error' && parsed === null;
     if (current.name !== 'paste' && !retryingWithoutCode) return false;
     return doSubmitCode(code);
@@ -289,7 +305,7 @@ function createFlow(options = {}) {
     try {
       const binding = { ticket: parsed.ticket, nonce: parsed.nonce };
       const producer = { name: 'rongroi-connect', version, mode: 'single-shot' };
-      sent = { binding, policy, producer };
+      expected = { binding, policy, producer };
       const elevate = policy.require_elevation === true;
 
       publish(scanningState(false));
@@ -307,12 +323,15 @@ function createFlow(options = {}) {
             }
           },
         });
-      } catch {
-        fail('sidecar_failed', false, 13, false);
+      } catch (error) {
+        const tooLarge = error !== null && error !== undefined
+          && (error.code === 'too_large'
+            || /too_large|too large/i.test(String(error.message ?? '')));
+        fail(tooLarge ? 'too_large' : 'sidecar_failed', tooLarge ? 14 : 13, false);
         return true;
       }
 
-      if (current.name !== 'scanning') return false;
+      if (quitRequested || current.name !== 'scanning') return false;
 
       if (answer !== null && answer !== undefined && answer.declined === true) {
         return doDecline(binding);
@@ -320,7 +339,7 @@ function createFlow(options = {}) {
 
       const checked = checkRecord(answer === null || answer === undefined ? undefined : answer.recordText);
       if (!checked.ok) {
-        fail(checked.key, false, 14, false);
+        fail(checked.key, 14, false);
         return true;
       }
 
@@ -335,7 +354,7 @@ function createFlow(options = {}) {
   }
 
   function consent() {
-    if (busy || current.name !== 'consent') return false;
+    if (quitRequested || busy || current.name !== 'consent') return false;
     return doConsent();
   }
 
@@ -348,30 +367,31 @@ function createFlow(options = {}) {
       try {
         envelope = sealEnvelope(recordText, parsed.kitPublicKey, parsed.ticket);
       } catch {
-        fail('internal', false, 10, false);
+        fail('internal', 10, false);
         return true;
       }
       let bytes;
       try {
         bytes = Buffer.from(JSON.stringify(envelope), 'utf8');
       } catch {
-        fail('internal', false, 10, false);
+        fail('internal', 10, false);
         return true;
       }
 
+      sent = true;
       try {
         await client.upload(bytes);
       } catch (error) {
         if (isConnectError(error)) {
-          failConnect(error, 15, false);
+          failConnect(error, 15);
         } else {
-          fail('internal', false, 10, false);
+          fail('internal', 10, false);
         }
         return true;
       }
 
       accepted = true;
-      exit = 0;
+      if (!quitRequested) exit = 0;
       publish({ name: 'done', serverOrigin: parsed.serverOrigin, visualHash });
       return true;
     } finally {
@@ -380,7 +400,7 @@ function createFlow(options = {}) {
   }
 
   function send() {
-    if (busy || current.name !== 'hash') return false;
+    if (quitRequested || busy || current.name !== 'hash') return false;
     return doSend();
   }
 
@@ -396,30 +416,31 @@ function createFlow(options = {}) {
       try {
         envelope = sealEnvelope(plaintext, parsed.kitPublicKey, parsed.ticket);
       } catch {
-        fail('internal', false, 10, false);
+        fail('internal', 10, false);
         return true;
       }
       let bytes;
       try {
         bytes = Buffer.from(JSON.stringify(envelope), 'utf8');
       } catch {
-        fail('internal', false, 10, false);
+        fail('internal', 10, false);
         return true;
       }
 
+      sent = true;
       try {
         await client.decline(bytes);
       } catch (error) {
         if (isConnectError(error)) {
-          fail(errorKey(error), false, 15, false);
+          fail(errorKey(error), 15, false);
         } else {
-          fail('internal', false, 10, false);
+          fail('internal', 10, false);
         }
         return true;
       }
 
       accepted = true;
-      exit = 0;
+      if (!quitRequested) exit = 0;
       publish({ name: 'declined', serverOrigin: parsed.serverOrigin });
       return true;
     } finally {
@@ -428,12 +449,25 @@ function createFlow(options = {}) {
   }
 
   function decline() {
-    if (busy || current.name !== 'consent') return false;
+    if (quitRequested || busy || current.name !== 'consent') return false;
     return doDecline({ ticket: parsed.ticket, nonce: parsed.nonce });
   }
 
+  async function doRetryPolicy() {
+    busy = true;
+    try {
+      exit = null;
+      publish({ name: 'checking', serverOrigin: parsed.serverOrigin });
+      if (await fetchPolicy()) publish(consentState());
+      return true;
+    } finally {
+      busy = false;
+    }
+  }
+
   function retry() {
-    if (busy || current.name !== 'error' || current.canRetry !== true) return false;
+    if (quitRequested || busy || current.name !== 'error' || current.canRetry !== true) return false;
+    if (parsed !== null && policy === null) return doRetryPolicy();
     if (parsed === null || recordText === null || visualHash === null) return false;
     exit = null;
     publish(hashState());
@@ -441,7 +475,19 @@ function createFlow(options = {}) {
   }
 
   function quit() {
-    const code = accepted ? 0 : 11;
+    if (quitRequested) return exit;
+    quitRequested = true;
+
+    let code;
+    if (accepted) {
+      code = 0;
+    } else if (exit !== null && exit !== 0) {
+      code = exit;
+    } else if (sent === true || current.name === 'uploading') {
+      code = 15;
+    } else {
+      code = 11;
+    }
     exit = code;
     return code;
   }
@@ -453,7 +499,7 @@ function createFlow(options = {}) {
 
     const left = Math.ceil((expiry - now()) / 1000);
     if (left <= 0) {
-      fail('expired', false, 15, false);
+      fail('expired', 15, false);
       return true;
     }
 

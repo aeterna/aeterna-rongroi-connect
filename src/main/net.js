@@ -8,6 +8,9 @@ const { actionForStatus, planUpload } = require('../core/upload-plan');
 const PATH_PREFIX = '/nakara_rongroi/';
 const MAX_RATE_LIMIT_WAITS = 4;
 const MAX_RESPONSE_BYTES = 64 * 1024;
+const POLICY_TIMEOUT_MS = 10_000;
+const UPLOAD_TIMEOUT_MS = 15_000;
+const MAX_CLOCK_OFFSET_MS = 24 * 60 * 60 * 1000;
 const STATUS_CODES = Object.freeze({
   400: 'bad_request',
   404: 'unknown_ticket',
@@ -165,7 +168,9 @@ class PairedClient {
     fetchImpl,
     now,
     sleep = defaultSleep,
-    timeoutMs = 15000,
+    timeoutMs,
+    policyTimeoutMs,
+    uploadTimeoutMs,
     expiresAt,
     expires_at,
   } = {}) {
@@ -180,8 +185,20 @@ class PairedClient {
     const clock = now === undefined ? () => Date.now() : now;
     if (typeof clock !== 'function') fail('bad_clock', 'now must be a function');
     if (typeof sleep !== 'function') fail('bad_sleep', 'sleep must be a function');
-    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-      fail('bad_timeout', 'timeoutMs must be a positive number');
+
+    // Section 4's table: a policy GET gets 10 s, each upload POST gets 15 s.
+    // `timeoutMs` remains the single override used by older callers and tests.
+    const policyTimeout = policyTimeoutMs === undefined
+      ? (timeoutMs === undefined ? POLICY_TIMEOUT_MS : timeoutMs)
+      : policyTimeoutMs;
+    const uploadTimeout = uploadTimeoutMs === undefined
+      ? (timeoutMs === undefined ? UPLOAD_TIMEOUT_MS : timeoutMs)
+      : uploadTimeoutMs;
+    if (!Number.isFinite(policyTimeout) || policyTimeout <= 0) {
+      fail('bad_timeout', 'policyTimeoutMs must be a positive number');
+    }
+    if (!Number.isFinite(uploadTimeout) || uploadTimeout <= 0) {
+      fail('bad_timeout', 'uploadTimeoutMs must be a positive number');
     }
 
     this.ticket = ticket;
@@ -189,7 +206,9 @@ class PairedClient {
     this.now = clock;
     this.correctClockFromServer = now === undefined;
     this.sleep = sleep;
-    this.timeoutMs = timeoutMs;
+    this.policyTimeoutMs = policyTimeout;
+    this.uploadTimeoutMs = uploadTimeout;
+    this.timeoutMs = uploadTimeout;
 
     const suppliedExpiry = expiresAt ?? expires_at
       ?? (origin !== null && typeof origin === 'object' ? origin.expiresAt ?? origin.expires_at : undefined);
@@ -208,14 +227,14 @@ class PairedClient {
     return this.expiresAtMs === null || at < this.expiresAtMs;
   }
 
-  async request(path, init) {
+  async request(path, init, timeoutMs = this.timeoutMs) {
     const url = this.urlFor(path);
     const controller = new AbortController();
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
       controller.abort();
-    }, this.timeoutMs);
+    }, timeoutMs);
 
     try {
       const options = {
@@ -254,7 +273,11 @@ class PairedClient {
   }
 
   async getPolicy(expectedPolicyHash) {
-    const response = await this.request(`policy/${this.ticket}`, { method: 'GET' });
+    const response = await this.request(
+      `policy/${this.ticket}`,
+      { method: 'GET' },
+      this.policyTimeoutMs,
+    );
     if (response.status === 404) fail('unknown_ticket', 'the server does not know this ticket');
     if (response.status === 410) fail('expired', 'the ticket expired');
     if (response.status !== 200) {
@@ -316,7 +339,12 @@ class PairedClient {
     let offset = 0;
     if (this.correctClockFromServer && typeof dateHeader === 'string') {
       const serverNow = Date.parse(dateHeader);
-      if (Number.isFinite(serverNow)) offset = serverNow - this.now();
+      if (Number.isFinite(serverNow)) {
+        offset = serverNow - this.now();
+        // A header that disagrees by more than a day is more likely a wrong
+        // server clock or a proxy than a useful correction.
+        if (Math.abs(offset) > MAX_CLOCK_OFFSET_MS) offset = 0;
+      }
     }
     this.expiresAtMs = expires - offset;
   }
@@ -344,7 +372,7 @@ class PairedClient {
           method: 'POST',
           headers: { 'Content-Type': 'application/octet-stream', ...headers },
           body,
-        });
+        }, this.uploadTimeoutMs);
       } catch (error) {
         const retryable = error instanceof ConnectError
           && (error.code === 'network' || error.code === 'timeout');
@@ -408,3 +436,6 @@ module.exports.PairedClient = PairedClient;
 module.exports.ConnectError = ConnectError;
 module.exports.buildUrl = buildUrl;
 module.exports.MAX_RESPONSE_BYTES = MAX_RESPONSE_BYTES;
+module.exports.POLICY_TIMEOUT_MS = POLICY_TIMEOUT_MS;
+module.exports.UPLOAD_TIMEOUT_MS = UPLOAD_TIMEOUT_MS;
+module.exports.MAX_CLOCK_OFFSET_MS = MAX_CLOCK_OFFSET_MS;

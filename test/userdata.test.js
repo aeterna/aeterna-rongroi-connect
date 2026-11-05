@@ -149,7 +149,7 @@ test('removeTempUserData accepts a Windows-style path by its base name only', ()
   assert.equal(result, true);
   assert.deepEqual(seen, [[
     'C:\\Temp\\rongroi-connect-12-0123456789abcdef',
-    { recursive: true, force: true },
+    { force: true, recursive: true, maxRetries: 5, retryDelay: 100 },
   ]]);
 });
 

@@ -7,7 +7,13 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const { createHash } = require('node:crypto');
 const { policyHash } = require('../src/core/canonical');
-const { PairedClient, ConnectError, MAX_RESPONSE_BYTES } = require('../src/main/net');
+const {
+  PairedClient,
+  ConnectError,
+  MAX_RESPONSE_BYTES,
+  POLICY_TIMEOUT_MS,
+  UPLOAD_TIMEOUT_MS,
+} = require('../src/main/net');
 
 const TICKET = '9f82c4e1b07a412891d604e38a291bf0';
 const POLICY = {
@@ -471,4 +477,67 @@ test('refuses a policy holding a non-integer number', async () => {
     const client = makeClient(origin);
     await assert.rejects(client.getPolicy(POLICY_HASH), isCode('bad_policy'));
   });
+});
+
+test('the policy GET uses 10 s and upload POSTs use 15 s', async () => {
+  assert.equal(POLICY_TIMEOUT_MS, 10_000);
+  assert.equal(UPLOAD_TIMEOUT_MS, 15_000);
+
+  const client = new PairedClient({
+    origin: 'http://127.0.0.1:9',
+    ticket: TICKET,
+    fetchImpl: async () => ({}),
+  });
+  assert.equal(client.policyTimeoutMs, POLICY_TIMEOUT_MS);
+  assert.equal(client.uploadTimeoutMs, UPLOAD_TIMEOUT_MS);
+
+  const seen = [];
+  client.request = async (path, init, timeoutMs) => {
+    seen.push({ path, method: init.method, timeoutMs });
+    if (init.method === 'GET') {
+      return {
+        status: 200,
+        headers: new Headers({ date: new Date().toUTCString() }),
+        bytes: Buffer.from(JSON.stringify(policyBody())),
+      };
+    }
+    return { status: 200, headers: new Headers(), bytes: Buffer.alloc(0) };
+  };
+
+  await client.getPolicy(POLICY_HASH);
+  await client.upload(Buffer.from('small envelope'));
+
+  assert.deepEqual(seen.map((entry) => entry.timeoutMs), [
+    POLICY_TIMEOUT_MS,
+    UPLOAD_TIMEOUT_MS,
+  ]);
+});
+
+test('a Date header offset over 24 hours in either direction is ignored', () => {
+  const nowMs = Date.parse('2026-01-01T00:00:00Z');
+  const expiresAt = '2026-01-01T00:10:00Z';
+  const expiresMs = Date.parse(expiresAt);
+
+  function clientWithServerDate(headerMs) {
+    const client = new PairedClient({
+      origin: 'http://127.0.0.1:9',
+      ticket: TICKET,
+      fetchImpl: async () => ({}),
+    });
+    client.now = () => nowMs;
+    client.rememberExpiry({ expires_at: expiresAt }, new Date(headerMs).toUTCString());
+    return client;
+  }
+
+  const oneHour = 60 * 60 * 1000;
+  const oneDay = 24 * oneHour;
+
+  assert.equal(clientWithServerDate(nowMs + oneHour).expiresAtMs, expiresMs - oneHour);
+  assert.equal(clientWithServerDate(nowMs - oneHour).expiresAtMs, expiresMs + oneHour);
+  assert.equal(clientWithServerDate(nowMs + oneDay).expiresAtMs, expiresMs - oneDay);
+  assert.equal(clientWithServerDate(nowMs - oneDay).expiresAtMs, expiresMs + oneDay);
+
+  // Over the clamp: the header is treated as a bad clock and ignored.
+  assert.equal(clientWithServerDate(nowMs + oneDay + 1000).expiresAtMs, expiresMs);
+  assert.equal(clientWithServerDate(nowMs - oneDay - 1000).expiresAtMs, expiresMs);
 });

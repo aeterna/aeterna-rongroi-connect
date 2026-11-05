@@ -262,12 +262,13 @@
   function renderError(state, t) {
     var error = state.error || {};
     var key = ERROR_KEYS.indexOf(error.key) === -1 ? 'internal' : error.key;
+    var sentKey = error.sent === 'maybe'
+      ? 'error.mayHaveSent'
+      : error.sent === true ? 'error.sentYes' : 'error.sentNo';
     var children = [
       title(t, 'error.title'),
       element('p', { class: 'lede' }, [textNode(t('error.' + key))]),
-      element('p', { class: 'hint' }, [
-        textNode(error.sent === true ? t('error.sentYes') : t('error.sentNo')),
-      ]),
+      element('p', { class: 'hint' }, [textNode(t(sentKey))]),
     ];
     var buttons = [];
     if (state.canRetry) {

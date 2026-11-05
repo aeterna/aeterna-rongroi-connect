@@ -65,6 +65,7 @@
   "error.sidecar_failed": "The scan program failed.",
   "error.record_refused": "The scanner report was not in the expected form.",
   "error.internal": "Something went wrong inside the app.",
+  "error.mayHaveSent": "Part of the report may have reached the server.",
   "error.sentYes": "The report was sent.",
   "error.sentNo": "Nothing was sent."
 }

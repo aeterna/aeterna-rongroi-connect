@@ -4,6 +4,14 @@
 
 const MAX_RECORD_BYTES = 2 * 1024 * 1024;
 
+class SidecarError extends Error {
+  constructor(code, message, options) {
+    super(message === undefined ? code : message, options);
+    this.name = 'SidecarError';
+    this.code = code;
+  }
+}
+
 // Lane 3c replaces this with the bundled-sidecar SHA-256 check. Keeping it a
 // named hook now means the flow has one obvious place to put that check and a
 // test can see that it runs before the process is spawned.
@@ -15,10 +23,21 @@ function isTimeout(error) {
   return /timeout/i.test(String(error.message ?? ''));
 }
 
+function isTooLarge(error) {
+  if (error === null || error === undefined) return false;
+  if (error.code === 'too_large') return true;
+  return /too_large|too large/i.test(String(error.message ?? error));
+}
+
 function recordText(value) {
   if (Buffer.isBuffer(value)) return value.toString('utf8');
   if (value instanceof Uint8Array) return Buffer.from(value).toString('utf8');
   return String(value);
+}
+
+function recordBytes(value) {
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) return value.length;
+  return Buffer.byteLength(String(value), 'utf8');
 }
 
 function createSidecarRunner(options = {}) {
@@ -46,9 +65,13 @@ function createSidecarRunner(options = {}) {
     let connected = false;
     let closed = false;
     let signalExit = null;
+    let signalError = null;
 
     const exitSignal = new Promise((resolve) => {
       signalExit = resolve;
+    });
+    const errorSignal = new Promise((resolve) => {
+      signalError = resolve;
     });
 
     async function close() {
@@ -103,6 +126,17 @@ function createSidecarRunner(options = {}) {
         }
       });
 
+      // A missing or quarantined executable arrives as an `error` event, not
+      // as a thrown spawn call.  Treat it as the sidecar failing so the flow
+      // reaches `sidecar_failed` instead of the process-level handler.
+      child.on('error', (error) => {
+        if (exited) return;
+        exited = true;
+        const failure = error instanceof Error ? error : new Error('sidecar process failed');
+        signalExit({ error: failure });
+        signalError({ error: failure });
+      });
+
       const acceptResult = Promise.resolve()
         .then(() => pipe.accept(handle, connectTimeout))
         .then(
@@ -130,15 +164,38 @@ function createSidecarRunner(options = {}) {
       }
 
       try {
-        const line = JSON.stringify({ binding, policy, producer });
-        await pipe.writeLine(handle, line, writeTimeout);
-        const record = await pipe.readUntilClose(handle, MAX_RECORD_BYTES, recordTimeout);
-        const text = recordText(record);
+        const exchange = (async () => {
+          const line = JSON.stringify({ binding, policy, producer });
+          await pipe.writeLine(handle, line, writeTimeout);
+          const record = await pipe.readUntilClose(handle, MAX_RECORD_BYTES, recordTimeout);
+          if (recordBytes(record) > MAX_RECORD_BYTES) {
+            throw new SidecarError(
+              'too_large',
+              `the sidecar record exceeds ${MAX_RECORD_BYTES} bytes`,
+            );
+          }
+          return { recordText: recordText(record) };
+        })().then(
+          (value) => ({ value }),
+          (error) => ({ exchangeError: error }),
+        );
+
+        const outcome = await Promise.race([exchange, errorSignal]);
+        if (outcome.error !== undefined) throw outcome.error;
+        if (outcome.exchangeError !== undefined) throw outcome.exchangeError;
+
         await close();
-        return { recordText: text };
+        return outcome.value;
       } catch (error) {
         if (isTimeout(error)) killIfOurs();
         await close();
+        if (isTooLarge(error)) {
+          throw new SidecarError(
+            'too_large',
+            `the sidecar record exceeds ${MAX_RECORD_BYTES} bytes`,
+            { cause: error },
+          );
+        }
         throw error;
       }
     } catch (error) {
@@ -150,5 +207,6 @@ function createSidecarRunner(options = {}) {
 
 module.exports = createSidecarRunner;
 module.exports.createSidecarRunner = createSidecarRunner;
+module.exports.SidecarError = SidecarError;
 module.exports.verifySidecar = verifySidecar;
 module.exports.MAX_RECORD_BYTES = MAX_RECORD_BYTES;

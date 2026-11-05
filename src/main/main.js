@@ -26,15 +26,81 @@ const testHook = require('../test-hook');
 const { createFlow } = require('./flow');
 const { createSidecarRunner } = require('./sidecar');
 
+let userDataDirectory = null;
+let flow = null;
+let ticker = null;
+let finishStarted = false;
+let inBeforeQuit = false;
+let tempRemoved = false;
+let desiredExitCode = null;
+
+// Every exit path asks here for its final code.  Without an explicit code the
+// flow decides, so an earlier error survives a later Quit.  The folder itself
+// is removed once, in `will-quit`, because `app.exit()` skips that event.
+function finish(code) {
+  if (finishStarted) return;
+  finishStarted = true;
+
+  if (ticker !== null) {
+    clearInterval(ticker);
+    ticker = null;
+  }
+
+  let finalCode = code;
+  if (typeof finalCode !== 'number') {
+    finalCode = 11;
+    if (flow !== null && typeof flow.quit === 'function') {
+      try {
+        const result = flow.quit();
+        if (typeof result === 'number') {
+          finalCode = result;
+        } else if (typeof flow.exitCode === 'function') {
+          const earlier = flow.exitCode();
+          if (typeof earlier === 'number') finalCode = earlier;
+        }
+      } catch {
+        finalCode = 10;
+      }
+    }
+  }
+
+  desiredExitCode = finalCode;
+  // When Electron is already in `before-quit`, let that quit continue; asking
+  // again from inside the event would re-enter it.
+  if (!inBeforeQuit) app.quit();
+}
+
 process.on('uncaughtException', () => {
-  app.exit(10);
+  finish(10);
 });
 
 // ADR 0001 sections 2 and 3: the temporary userData comes first, then the
 // stale sweep, then the Chromium switches and the sandbox, all before ready.
-const userDataDirectory = createTempUserData(app);
+userDataDirectory = createTempUserData(app);
 sweepStale();
 applySwitches(app);
+
+app.on('before-quit', () => {
+  inBeforeQuit = true;
+  try {
+    finish();
+  } finally {
+    inBeforeQuit = false;
+  }
+});
+
+app.on('will-quit', () => {
+  if (tempRemoved) return;
+  tempRemoved = true;
+  if (typeof userDataDirectory === 'string' && userDataDirectory.length > 0) {
+    removeTempUserData(userDataDirectory);
+  }
+  if (typeof desiredExitCode === 'number') app.exit(desiredExitCode);
+});
+
+app.on('window-all-closed', () => {
+  finish();
+});
 
 const PAGE_PATH = path.join(__dirname, '..', 'renderer', 'index.html');
 const PAGE_URL = pathToFileURL(PAGE_PATH).href;
@@ -76,9 +142,6 @@ function runSidecar(...args) {
   }
   return sidecarRunner(...args);
 }
-
-let exiting = false;
-let ticker = null;
 
 function isOwnPage(url) {
   if (typeof url !== 'string') return false;
@@ -155,7 +218,7 @@ async function start() {
     if (typeof contents.send === 'function') contents.send('connect:state', state);
   };
 
-  const flow = createFlow({
+  flow = createFlow({
     parseCode: parsePairingCode,
     makeClient,
     sealEnvelope,
@@ -172,20 +235,6 @@ async function start() {
     });
   };
 
-  async function finish() {
-    if (exiting) return;
-    exiting = true;
-    clearInterval(ticker);
-    try {
-      const result = flow.quit();
-      if (result && typeof result.then === 'function') await result;
-    } catch {
-      // Closing must still remove the folder and exit.
-    }
-    removeTempUserData(userDataDirectory);
-    app.exit(flow.exitCode());
-  }
-
   handle('connect:submitCode', (code) => {
     if (typeof code !== 'string' || code.length > 4096) {
       throw new TypeError('submitCode takes a string of at most 4096 characters');
@@ -200,10 +249,6 @@ async function start() {
 
   ticker = setInterval(() => flow.tick(), 1000);
 
-  app.on('window-all-closed', () => {
-    finish();
-  });
-
   await win.loadFile(PAGE_PATH);
 
   // The renderer subscribes while loading, so a state emitted during
@@ -215,14 +260,14 @@ async function start() {
     try {
       const result = testHook.drive(flow, { app });
       if (result && typeof result.then === 'function') {
-        Promise.resolve(result).catch(() => app.exit(20));
+        Promise.resolve(result).catch(() => finish(10));
       }
     } catch {
-      app.exit(20);
+      finish(10);
     }
   }
 }
 
 app.whenReady().then(start).catch(() => {
-  app.exit(10);
+  finish(10);
 });

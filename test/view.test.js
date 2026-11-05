@@ -429,6 +429,22 @@ test('error states say what failed and whether anything was sent', function () {
   assert.equal(primaryCount(retry), 1);
 });
 
+test('the maybe-sent error sentence is shown in both locales', function () {
+  for (const [locale, messages] of Object.entries(LOCALES)) {
+    const tree = view.render({
+      name: 'error',
+      error: { key: 'server_error', sent: 'maybe' },
+      canRetry: true,
+    }, makeT(messages));
+
+    assert.match(flatText(tree), new RegExp(messages['error.mayHaveSent'].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), locale);
+    assert.equal(flatText(tree).includes(messages['error.sentNo']), false, locale);
+    assert.equal(flatText(tree).includes(messages['error.sentYes']), false, locale);
+  }
+  assert.equal(en['error.mayHaveSent'], 'Part of the report may have reached the server.');
+  assert.equal(th['error.mayHaveSent'], 'รายงานบางส่วนอาจถึงเซิร์ฟเวอร์แล้ว');
+});
+
 test('unknown error keys fall back to the internal sentence', function () {
   const tree = view.render({
     name: 'error',
@@ -518,7 +534,7 @@ test('the app locale mirror carries the collector names and hash lines for both 
       `app mirror is missing an en or th entry for collector.${id}`,
     );
   }
-  for (const key of ['hash.label', 'hash.hint']) {
+  for (const key of ['hash.label', 'hash.hint', 'error.mayHaveSent']) {
     const marker = `"${key}":`;
     assert.equal(
       source.split(marker).length - 1,

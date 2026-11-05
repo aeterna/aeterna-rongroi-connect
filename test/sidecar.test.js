@@ -4,7 +4,11 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createSidecarRunner, verifySidecar } = require('../src/main/sidecar');
+const {
+  createSidecarRunner,
+  verifySidecar,
+  SidecarError,
+} = require('../src/main/sidecar');
 
 const PIPE_NAME = '\\\\.\\pipe\\rongroi-0123456789abcdef0123456789abcdef';
 const TICKET = '9f82c4e1b07a412891d604e38a291bf0';
@@ -300,11 +304,60 @@ test('a read timeout kills the child and closes the pipe', async () => {
 
 test('a non-timeout read failure closes the pipe and rejects without killing', async () => {
   const h = makeHarness({
-    pipeBehaves: { readError: new Error('too_large') },
+    pipeBehaves: { readError: new Error('connection closed') },
   });
 
-  await assert.rejects(h.call(), /too_large/);
+  await assert.rejects(h.call(), /connection closed/);
   assert.equal(h.child.killed, 0);
+  assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
+});
+
+test('a too-large read error becomes a typed SidecarError and does not kill', async () => {
+  const error = Object.assign(new Error('too_large'), { code: 'too_large' });
+  const h = makeHarness({
+    pipeBehaves: { readError: error },
+  });
+
+  await assert.rejects(h.call(), (failure) => {
+    assert.equal(failure instanceof SidecarError, true);
+    assert.equal(failure.code, 'too_large');
+    assert.match(failure.message, /2 MiB|2097152|exceeds/i);
+    return true;
+  });
+  assert.equal(h.child.killed, 0);
+  assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
+});
+
+test('a record returned over 2 MiB rejects as too_large', async () => {
+  const h = makeHarness({
+    pipe: (child) => makePipe(child, {
+      readUntilClose({ maxBytes }) {
+        return Buffer.alloc(maxBytes + 1, 0x7b);
+      },
+    }),
+  });
+
+  await assert.rejects(h.call(), (failure) => {
+    assert.equal(failure instanceof SidecarError, true);
+    assert.equal(failure.code, 'too_large');
+    return true;
+  });
+  assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
+});
+
+test('a child error event before connecting closes the pipe and rejects', async () => {
+  const h = makeHarness({
+    pipe: (child) => makePipe(child, {
+      accept() {
+        queueMicrotask(() => child.emit('error', new Error('spawn ENOENT')));
+        return new Promise(() => {});
+      },
+    }),
+  });
+
+  await assert.rejects(h.call(), /spawn ENOENT/);
+  assert.equal(callNames(h.pipe).includes('writeLine'), false);
+  assert.equal(callNames(h.pipe).includes('readUntilClose'), false);
   assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
 });
 

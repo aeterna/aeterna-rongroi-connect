@@ -7,6 +7,8 @@ const assert = require('node:assert/strict');
 const { canonicalize } = require('../src/core/canonical');
 const { ConnectError } = require('../src/main/net');
 const { createFlow } = require('../src/main/flow');
+const { KNOWN_COLLECTORS } = require('../src/main/collectors');
+const { SidecarError } = require('../src/main/sidecar');
 
 const TICKET = '9f82c4e1b07a412891d604e38a291bf0';
 const NONCE = 'nonce-abc-123';
@@ -233,6 +235,7 @@ test('a policy with a bad collectors list or server name is refused before conse
   const cases = [
     { ...POLICY, required_collectors: 'posture' },
     { ...POLICY, required_collectors: ['posture', 7] },
+    { ...POLICY, required_collectors: ['posture', 'not_a_collector'] },
     { ...POLICY, server_name: 7 },
   ];
 
@@ -246,26 +249,75 @@ test('a policy with a bad collectors list or server name is refused before conse
   }
 });
 
-test('ConnectError from makeClient and getPolicy maps by code and exit code', async () => {
+test('the known collector list is frozen and holds every locale collector id', () => {
+  const en = require('../src/locales/en.json');
+  const localeIds = Object.keys(en)
+    .filter((key) => key.startsWith('collector.'))
+    .map((key) => key.slice('collector.'.length))
+    .sort();
+
+  assert.equal(Object.isFrozen(KNOWN_COLLECTORS), true);
+  assert.deepEqual([...KNOWN_COLLECTORS].sort(), localeIds);
+});
+
+test('ConnectError from makeClient and getPolicy maps by code, exit code and retry', async () => {
   const cases = [
-    ['makeClient', 'bad_ticket', 15],
-    ['makeClient', 'policy_mismatch', 12],
-    ['policy', 'bad_policy', 12],
-    ['policy', 'policy_mismatch', 12],
-    ['policy', 'unknown_ticket', 15],
-    ['policy', 'network', 15],
+    ['makeClient', 'bad_ticket', 15, false],
+    ['makeClient', 'policy_mismatch', 12, false],
+    ['policy', 'bad_policy', 12, false],
+    ['policy', 'policy_mismatch', 12, false],
+    ['policy', 'unknown_ticket', 15, false],
+    ['policy', 'network', 15, true],
+    ['policy', 'timeout', 15, true],
+    ['policy', 'server_error', 15, true],
   ];
 
-  for (const [where, code, exit] of cases) {
+  for (const [where, code, exit, canRetry] of cases) {
     const error = new ConnectError(code, code);
     const h = makeHarness(where === 'makeClient' ? { makeClientError: error } : { policyError: error });
     await h.flow.submitCode('rr1.test');
     assert.equal(h.flow.state().name, 'error');
     assert.deepEqual(lastState(h).error, { key: code, sent: false });
-    assert.equal(lastState(h).canRetry, false);
+    assert.equal(lastState(h).canRetry, canRetry, code);
     assert.equal(h.flow.exitCode(), exit);
     assert.equal(h.emitted.some((state) => state.name === 'consent'), false);
   }
+});
+
+test('a retryable policy failure repeats the policy request and reaches consent', async () => {
+  let attempts = 0;
+  const h = makeHarness({
+    policyError: new ConnectError('timeout', 'slow'),
+  });
+  h.client.getPolicy = async () => {
+    attempts += 1;
+    if (attempts === 1) throw new ConnectError('timeout', 'slow');
+    return POLICY;
+  };
+
+  await h.flow.submitCode('rr1.test');
+  assert.equal(h.flow.state().name, 'error');
+  assert.equal(lastState(h).canRetry, true);
+  assert.equal(lastState(h).error.sent, false);
+  assert.equal(h.flow.exitCode(), 15);
+
+  assert.equal(await h.flow.retry(), true);
+  assert.equal(attempts, 2);
+  assert.equal(h.flow.state().name, 'consent');
+  assert.equal(h.flow.exitCode(), null);
+});
+
+test('a policy retry at the ticket expiry is refused', async () => {
+  const h = makeHarness({
+    startNow: 1_700_000_000_000,
+    expiresAtMs: 1_700_000_001_000,
+    policyError: new ConnectError('network', 'offline'),
+  });
+  h.setNow(1_700_000_002_000);
+  await h.flow.submitCode('rr1.test');
+  assert.equal(h.flow.state().name, 'error');
+  assert.equal(lastState(h).canRetry, false);
+  assert.equal(h.flow.retry(), false);
 });
 
 test('an unexpected internal failure becomes internal with exit code 10', async () => {
@@ -279,13 +331,13 @@ test('an unexpected internal failure becomes internal with exit code 10', async 
   await reachHash(uploadFailure);
   await uploadFailure.flow.send();
   assert.equal(uploadFailure.flow.state().name, 'error');
-  assert.deepEqual(lastState(uploadFailure).error, { key: 'internal', sent: false });
+  assert.deepEqual(lastState(uploadFailure).error, { key: 'internal', sent: 'maybe' });
   assert.equal(uploadFailure.flow.exitCode(), 10);
 
   const declineFailure = makeHarness({ declineError: new Error('boom') });
   await reachConsent(declineFailure);
   await declineFailure.flow.decline();
-  assert.deepEqual(lastState(declineFailure).error, { key: 'internal', sent: false });
+  assert.deepEqual(lastState(declineFailure).error, { key: 'internal', sent: 'maybe' });
   assert.equal(declineFailure.flow.exitCode(), 10);
 });
 
@@ -333,7 +385,6 @@ test('a sidecar rejection becomes sidecar_failed with exit code 13 and sends not
 });
 
 test('a record that is not in the expected form is refused before the hash', async () => {
-  const big = { ...makeRecord(), pad: 'x'.repeat(MAX_RECORD_BYTES) };
   const cases = [
     { recordText: 'not json' },
     { recordText: 7 },
@@ -342,7 +393,6 @@ test('a record that is not in the expected form is refused before the hash', asy
     { recordText: JSON.stringify(makeRecord({ producer: { ...PRODUCER, version: '9.9.9' } })) },
     { recordText: JSON.stringify(makeRecord({ visual_hash: '0123456789ABCDEF' })) },
     { recordText: JSON.stringify(makeRecord({ visual_hash: '0123456789abcde' })) },
-    { recordText: JSON.stringify(big) },
   ];
 
   for (const sidecarResult of cases) {
@@ -357,6 +407,33 @@ test('a record that is not in the expected form is refused before the hash', asy
     assert.equal(h.uploadCalls.length, 0);
     assert.equal(h.declineCalls.length, 0);
   }
+});
+
+test('a raw record over 2 MiB becomes too_large with exit code 14', async () => {
+  const big = { ...makeRecord(), pad: 'x'.repeat(MAX_RECORD_BYTES) };
+  const h = makeHarness({ sidecarResult: { recordText: JSON.stringify(big) } });
+  await reachConsent(h);
+  assert.equal(await h.flow.consent(), true);
+  assert.equal(h.flow.state().name, 'error');
+  assert.deepEqual(lastState(h).error, { key: 'too_large', sent: false });
+  assert.equal(lastState(h).canRetry, false);
+  assert.equal(h.flow.exitCode(), 14);
+  assert.equal(h.emitted.some((state) => state.name === 'hash'), false);
+  assert.equal(h.uploadCalls.length, 0);
+  assert.equal(h.declineCalls.length, 0);
+});
+
+test('a typed too-large sidecar failure becomes too_large, not sidecar_failed', async () => {
+  const h = makeHarness({
+    sidecarError: new SidecarError('too_large', 'the sidecar record exceeds 2 MiB'),
+  });
+  await reachConsent(h);
+  assert.equal(await h.flow.consent(), true);
+  assert.equal(h.flow.state().name, 'error');
+  assert.deepEqual(lastState(h).error, { key: 'too_large', sent: false });
+  assert.equal(lastState(h).canRetry, false);
+  assert.equal(h.flow.exitCode(), 14);
+  assert.equal(h.uploadCalls.length, 0);
 });
 
 test('a record whose sealed envelope is over 2 MiB becomes too_large with exit code 14', async () => {
@@ -411,7 +488,7 @@ test('a declined answer the server refuses becomes an upload error with exit cod
   await reachConsent(h);
   assert.equal(await h.flow.decline(), true);
   assert.equal(h.flow.state().name, 'error');
-  assert.deepEqual(lastState(h).error, { key: 'server_error', sent: false });
+  assert.deepEqual(lastState(h).error, { key: 'server_error', sent: 'maybe' });
   assert.equal(h.flow.exitCode(), 15);
 });
 
@@ -438,7 +515,7 @@ test('a retryable upload error can retry through hash and send again', async () 
 
   assert.equal(await h.flow.send(), true);
   assert.equal(h.flow.state().name, 'error');
-  assert.deepEqual(lastState(h).error, { key: 'network', sent: false });
+  assert.deepEqual(lastState(h).error, { key: 'network', sent: 'maybe' });
   assert.equal(lastState(h).canRetry, true);
   assert.equal(h.flow.exitCode(), 15);
 
@@ -461,7 +538,7 @@ test('retry is allowed for the four recoverable codes and never for the rest', a
     await reachHash(h);
     assert.equal(await h.flow.send(), true);
     assert.equal(h.flow.state().name, 'error');
-    assert.deepEqual(lastState(h).error, { key: code, sent: false });
+    assert.deepEqual(lastState(h).error, { key: code, sent: 'maybe' });
     assert.equal(lastState(h).canRetry, recoverable.includes(code), code);
     assert.equal(h.flow.exitCode(), 15);
     assert.equal(h.flow.retry(), recoverable.includes(code), code);
@@ -533,8 +610,8 @@ test('tick expires a scanning state and a hash state', async () => {
   assert.equal(hashing.flow.exitCode(), 15);
 });
 
-test('quit returns 11 in every state before an accepted answer and sends nothing', async () => {
-  const cases = ['paste', 'checking', 'consent', 'scanning', 'hash', 'uploading', 'error'];
+test('quit returns 11 in every state before anything failed or was sent', async () => {
+  const cases = ['paste', 'checking', 'consent', 'scanning', 'hash'];
 
   for (const state of cases) {
     let harness;
@@ -572,33 +649,66 @@ test('quit returns 11 in every state before an accepted answer and sends nothing
       await reachConsent(harness);
       pending = harness.flow.consent();
       assert.equal(harness.flow.state().name, 'scanning');
-    } else if (state === 'hash') {
+    } else {
       harness = makeHarness();
       await reachHash(harness);
-    } else if (state === 'uploading') {
-      harness = makeHarness({ pendingUpload: true });
-      await reachHash(harness);
-      pending = harness.flow.send();
-      assert.equal(harness.flow.state().name, 'uploading');
-    } else {
-      harness = makeHarness({ parseError: new Error('bad') });
-      await harness.flow.submitCode('rr1.test');
-      assert.equal(harness.flow.state().name, 'error');
     }
 
     assert.equal(harness.flow.quit(), 11, state);
-    assert.equal(harness.uploadCalls.length, state === 'uploading' ? 1 : 0, state);
+    assert.equal(harness.uploadCalls.length, 0, state);
     assert.equal(harness.declineCalls.length, 0, state);
 
     if (state === 'scanning') {
       release({ recordText: JSON.stringify(makeRecord()) });
       await pending;
     }
-    if (state === 'uploading') {
-      harness.releasePendingUpload();
-      await pending;
-    }
   }
+});
+
+test('quit during an upload returns 15 because part may have gone out', async () => {
+  const h = makeHarness({ pendingUpload: true });
+  await reachHash(h);
+  const pending = h.flow.send();
+  assert.equal(h.flow.state().name, 'uploading');
+  assert.equal(h.uploadCalls.length, 1);
+
+  assert.equal(h.flow.quit(), 15);
+
+  h.releasePendingUpload();
+  await pending;
+  assert.equal(h.flow.state().name, 'done');
+  assert.equal(h.flow.exitCode(), 15);
+  assert.equal(h.flow.quit(), 15);
+});
+
+test('quit keeps an exit code an earlier error set, from 12 to 15', async () => {
+  const parse = makeHarness({ parseError: new Error('bad') });
+  await parse.flow.submitCode('rr1.test');
+  assert.equal(parse.flow.exitCode(), 12);
+  assert.equal(parse.flow.quit(), 12);
+
+  const sidecar = makeHarness({ sidecarError: new Error('scan failed') });
+  await reachConsent(sidecar);
+  await sidecar.flow.consent();
+  assert.equal(sidecar.flow.exitCode(), 13);
+  assert.equal(sidecar.flow.quit(), 13);
+
+  const record = makeHarness({ sidecarResult: { recordText: 'not json' } });
+  await reachConsent(record);
+  await record.flow.consent();
+  assert.equal(record.flow.exitCode(), 14);
+  assert.equal(record.flow.quit(), 14);
+
+  const upload = makeHarness({ uploadError: new ConnectError('ticket_used', 'used') });
+  await reachHash(upload);
+  await upload.flow.send();
+  assert.equal(upload.flow.exitCode(), 15);
+  assert.equal(upload.flow.quit(), 15);
+
+  const policy = makeHarness({ policyError: new ConnectError('network', 'offline') });
+  await policy.flow.submitCode('rr1.test');
+  assert.equal(policy.flow.exitCode(), 15);
+  assert.equal(policy.flow.quit(), 15);
 });
 
 test('quit returns 0 after a report or a declined answer was accepted', async () => {

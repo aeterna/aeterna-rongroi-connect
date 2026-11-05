@@ -100,7 +100,12 @@ function removeTempUserData(directory, options = {}) {
   try {
     if (!TEMP_NAME.test(baseName(directory))) return false;
     if (typeof fs.rmSync === 'function') {
-      fs.rmSync(directory, { recursive: true, force: true });
+      fs.rmSync(directory, {
+        force: true,
+        recursive: true,
+        maxRetries: 5,
+        retryDelay: 100,
+      });
       return true;
     }
     if (typeof fs.rmdirSync === 'function') {
