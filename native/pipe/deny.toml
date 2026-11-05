@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 aeterna-rongroi contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    "reqwest",
+    "hyper",
+    "tokio",
+    "socket2",
+    "rustls",
+    "native-tls",
+]

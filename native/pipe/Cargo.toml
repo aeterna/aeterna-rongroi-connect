@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 aeterna-rongroi contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "rongroi-connect-pipe"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+description = "The Rongroi Connect named-pipe server for Windows."
+
+# This crate is deliberately standalone: it is not a member of any workspace.
+[workspace]
+resolver = "2"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+napi = { version = "=2.16.17", default-features = false, features = ["napi6"] }
+napi-derive = "=2.16.13"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+napi-build = "=2.2.3"
