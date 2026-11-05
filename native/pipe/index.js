@@ -4,11 +4,11 @@
 
 const path = require('node:path');
 
-const primaryPath = path.join(__dirname, 'rongroi-connect-pipe.node');
+const primaryPath = path.join(__dirname, 'rongroi_connect_pipe.node');
 const candidates = [
   primaryPath,
+  path.join(__dirname, 'rongroi-connect-pipe.node'),
   path.join(__dirname, `rongroi-connect-pipe.${process.platform}-${process.arch}.node`),
-  path.join(__dirname, 'rongroi_connect_pipe.node'),
   path.join(__dirname, 'index.node'),
 ];
 

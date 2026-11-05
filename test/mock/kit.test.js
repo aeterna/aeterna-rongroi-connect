@@ -61,7 +61,7 @@ test('issues a parseable code and serves the policy it hashes', async () => {
     const client = clientFor(kit);
     const policy = await client.getPolicy(parsed.policyHash);
     assert.equal(policy.server_name, kit.policy.server_name);
-    assert.equal(policy.expires_at, kit.expires_at);
+    assert.equal(policy.expires_at, kit.expiresAt);
     assert.equal(kit.requests, 0);
   } finally {
     await kit.close();

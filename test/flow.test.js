@@ -301,12 +301,13 @@ test('the policy elevation flag and local-address warning are shown as received'
 });
 
 test('the scanning state reports a pending elevation prompt', async () => {
+  const policy = { ...POLICY, require_elevation: true };
   const h = makeHarness({
-    policy: { ...POLICY, require_elevation: true },
+    policy,
     sidecar(input) {
       assert.equal(input.elevate, true);
       input.onElevationPending();
-      return { recordText: JSON.stringify(makeRecord()) };
+      return { recordText: JSON.stringify(makeRecord({ policy })) };
     },
   });
   await reachConsent(h);

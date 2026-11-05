@@ -11,9 +11,16 @@
   },
   "scripts": {
     "test": "node --test",
-    "lint": "eslint src test"
+    "lint": "eslint src test",
+    "build:native": "node scripts/build-native.js",
+    "build": "node scripts/build.js dist/release",
+    "build:test": "node scripts/build.js dist/test --test",
+    "e2e": "node scripts/run-e2e.js dist/test"
   },
   "devDependencies": {
+    "@electron/asar": "4.0.1",
+    "@electron/fuses": "2.0.0",
+    "@electron/packager": "19.0.1",
     "@eslint/js": "9.39.1",
     "electron": "44.7.1",
     "eslint": "9.39.1"
