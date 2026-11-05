@@ -155,10 +155,7 @@ mod napi_api {
     /// Wait for the sidecar to connect, with a timeout.
     #[napi(js_name = "accept")]
     pub fn accept(handle: u32, timeout_ms: u32) -> AsyncTask<AcceptTask> {
-        AsyncTask::new(AcceptTask {
-            handle,
-            timeout_ms,
-        })
+        AsyncTask::new(AcceptTask { handle, timeout_ms })
     }
 
     /// Read the client's executable path, or `null` when it cannot be read.

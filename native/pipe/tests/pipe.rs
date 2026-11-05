@@ -15,7 +15,7 @@ use rongroi_connect_pipe::pipe::{
     PipeError,
 };
 
-use windows::core::{PCWSTR, Result as WindowsResult};
+use windows::core::{Result as WindowsResult, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING,
@@ -89,7 +89,10 @@ fn real_client_round_trip() {
 
     // The first client is still connected, so the only instance is busy and a
     // second client must not get in.
-    assert!(open_client(&name).is_err(), "a second client must be refused");
+    assert!(
+        open_client(&name).is_err(),
+        "a second client must be refused"
+    );
 
     // Reading the image may fail across integrity levels; it must not fail the
     // connection.
@@ -121,10 +124,7 @@ fn real_client_round_trip() {
         }
     });
     accept(large, 5_000).expect("the client is accepted");
-    assert_eq!(
-        read_until_close(large, 16, 5_000),
-        Err(PipeError::TooLarge)
-    );
+    assert_eq!(read_until_close(large, 16, 5_000), Err(PipeError::TooLarge));
     writer.join().expect("the writer thread finishes");
     close(large).expect("the pipe closes");
 

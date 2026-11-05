@@ -130,7 +130,6 @@ mod platform {
         ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
         PIPE_ACCESS_DUPLEX,
     };
-    use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
         PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -139,6 +138,7 @@ mod platform {
         CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
         WaitForSingleObject, INFINITE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     };
+    use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
     // A `HANDLE` wraps a raw pointer and is therefore not `Send`, so it cannot
     // live in the process-wide registry.  The registry stores only the opaque
@@ -160,7 +160,9 @@ mod platform {
     fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         // A panic while an operation is in flight must not turn every later
         // call into a panic as well.  The handle entry stays consistent.
-        mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn entry_for(id: u32) -> Result<HandleEntry, PipeError> {
@@ -237,8 +239,7 @@ mod platform {
         // SAFETY: GetCurrentProcess returns a pseudo-handle that must not be
         // closed; OpenProcessToken writes a real token handle into `token`.
         unsafe {
-            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
-                .map_err(map_error)?;
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(map_error)?;
         }
         let _token = HandleGuard(token);
 
@@ -307,12 +308,7 @@ mod platform {
             let _ = CancelIoEx(handle, Some(overlapped));
             let _ = WaitForSingleObject(event, INFINITE);
             let mut transferred = 0u32;
-            let _ = GetOverlappedResult(
-                handle,
-                overlapped,
-                &mut transferred,
-                Default::default(),
-            );
+            let _ = GetOverlappedResult(handle, overlapped, &mut transferred, Default::default());
         }
     }
 
@@ -341,8 +337,7 @@ mod platform {
         // raw-pointer alias), so this preserves the allocation that
         // `LocalFreeGuard` must release.
         #[allow(clippy::useless_transmute, clippy::transmute_ptr_to_ptr)]
-        let descriptor_raw: *mut core::ffi::c_void =
-            unsafe { core::mem::transmute(descriptor) };
+        let descriptor_raw: *mut core::ffi::c_void = unsafe { core::mem::transmute(descriptor) };
         let _descriptor = LocalFreeGuard(descriptor_raw);
 
         let attributes = SECURITY_ATTRIBUTES {
@@ -413,7 +408,8 @@ mod platform {
 
                 let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
                 // SAFETY: the event belongs to `overlapped`.
-                let wait = unsafe { WaitForSingleObject(event, wait_timeout_ms(deadline, timeout_ms)) };
+                let wait =
+                    unsafe { WaitForSingleObject(event, wait_timeout_ms(deadline, timeout_ms)) };
                 if wait == WAIT_OBJECT_0 {
                     let mut transferred = 0u32;
                     // SAFETY: the operation completed; reaping it here is safe.
@@ -459,12 +455,16 @@ mod platform {
         }
 
         // SAFETY: opening for a limited query never grants write access.
-        let process =
-            match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, Default::default(), process_id) }
-            {
-                Ok(process) => process,
-                Err(_) => return Ok(None),
-            };
+        let process = match unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION,
+                Default::default(),
+                process_id,
+            )
+        } {
+            Ok(process) => process,
+            Err(_) => return Ok(None),
+        };
         let _process = HandleGuard(process);
 
         // The API takes a size in UTF-16 code units and writes back the number
@@ -486,9 +486,7 @@ mod platform {
             return Ok(None);
         }
 
-        Ok(Some(String::from_utf16_lossy(
-            &buffer[..size as usize],
-        )))
+        Ok(Some(String::from_utf16_lossy(&buffer[..size as usize])))
     }
 
     fn write_all(handle: HANDLE, data: &[u8], timeout_ms: u32) -> Result<(), PipeError> {
@@ -717,9 +715,7 @@ mod platform {
     }
 }
 
-pub use platform::{
-    accept, client_image, close, create, read_until_close, write_line,
-};
+pub use platform::{accept, client_image, close, create, read_until_close, write_line};
 
 #[cfg(test)]
 mod tests {
@@ -809,10 +805,7 @@ mod tests {
         assert_eq!(accept(1, 1), Err(PipeError::Unsupported));
         assert_eq!(client_image(1), Err(PipeError::Unsupported));
         assert_eq!(write_line(1, "x", 1), Err(PipeError::Unsupported));
-        assert_eq!(
-            read_until_close(1, 1, 1),
-            Err(PipeError::Unsupported)
-        );
+        assert_eq!(read_until_close(1, 1, 1), Err(PipeError::Unsupported));
         assert_eq!(close(1), Err(PipeError::Unsupported));
     }
 
@@ -833,13 +826,7 @@ mod tests {
             assert_eq!(error.to_string(), code);
         }
 
-        assert_eq!(
-            PipeError::Failed(0x8007_0005).code(),
-            "failed:80070005"
-        );
-        assert_eq!(
-            PipeError::Failed(0x0000_0000).code(),
-            "failed:00000000"
-        );
+        assert_eq!(PipeError::Failed(0x8007_0005).code(), "failed:80070005");
+        assert_eq!(PipeError::Failed(0x0000_0000).code(), "failed:00000000");
     }
 }
