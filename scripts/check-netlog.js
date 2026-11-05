@@ -196,24 +196,28 @@ function endpointName(value, port) {
   return hostName(text, port);
 }
 
-function eventTypeName(constants, type) {
-  if (typeof type === 'string') return type;
-  const types = constants && constants.logEventTypes;
+function constantTypeName(types, type) {
   if (Array.isArray(types)) return types[type] ?? String(type);
   if (types !== null && typeof types === 'object') {
+    // Chromium writes these constants as NAME -> number.  Build the reverse
+    // lookup so a numeric event or source type resolves to its name.
+    for (const [name, value] of Object.entries(types)) {
+      if (String(value) === String(type)) return name;
+    }
+    // Keep accepting number -> NAME maps as well.
     return types[type] ?? types[String(type)] ?? String(type);
   }
   return String(type);
 }
 
+function eventTypeName(constants, type) {
+  if (typeof type === 'string') return type;
+  return constantTypeName(constants && constants.logEventTypes, type);
+}
+
 function sourceTypeName(constants, type) {
   if (typeof type === 'string') return type;
-  const types = constants && constants.logSourceType;
-  if (Array.isArray(types)) return types[type] ?? String(type);
-  if (types !== null && typeof types === 'object') {
-    return types[type] ?? types[String(type)] ?? String(type);
-  }
-  return String(type);
+  return constantTypeName(constants && constants.logSourceType, type);
 }
 
 function sourceKey(source) {

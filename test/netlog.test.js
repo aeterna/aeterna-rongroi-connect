@@ -32,9 +32,9 @@ function netlog(events) {
   return JSON.stringify({
     constants: {
       logEventTypes: {
-        1: 'URL_REQUEST_START_JOB',
-        2: 'HOST_RESOLVER_IMPL_REQUEST',
-        3: 'TCP_CONNECT',
+        URL_REQUEST_START_JOB: 1,
+        HOST_RESOLVER_IMPL_REQUEST: 2,
+        TCP_CONNECT: 3,
       },
     },
     events,
@@ -420,15 +420,15 @@ test('numeric source and event types resolve through the netlog constants', () =
   const result = checkNetlog(JSON.stringify({
     constants: {
       logEventTypes: {
-        1: 'URL_REQUEST_START_JOB',
-        2: 'HOST_RESOLVER_IMPL_REQUEST',
-        3: 'TCP_CONNECT',
-        10: 'UDP_CONNECT',
-        11: 'HOST_RESOLVER_MANAGER_IPV6_REACHABILITY_CHECK',
+        URL_REQUEST_START_JOB: 1,
+        HOST_RESOLVER_IMPL_REQUEST: 2,
+        TCP_CONNECT: 3,
+        UDP_CONNECT: 10,
+        HOST_RESOLVER_MANAGER_IPV6_REACHABILITY_CHECK: 11,
       },
       logSourceType: {
-        1: 'UDP_SOCKET',
-        2: 'HOST_RESOLVER_MANAGER',
+        UDP_SOCKET: 1,
+        HOST_RESOLVER_MANAGER: 2,
       },
     },
     events: [
@@ -442,6 +442,43 @@ test('numeric source and event types resolve through the netlog constants', () =
 
   assert.equal(result.ok, true);
   assert.deepEqual(result.acceptedIpv6Check, { sources: 1, connected: true });
+});
+
+test('a numeric UDP_SOCKET source is accepted but a numeric TCP_SOCKET source is not', () => {
+  const events = [
+    event(1, { url: POLICY_URL }),
+    event(1, { url: REPORT_URL }),
+    event(3, { address: '127.0.0.1', port: 30120 }),
+    event(11, {}, { id: 2, type: 2 }),
+    event(10, { address: '2001:4860:4860::8888', port: 443 }, { id: 1, type: 1 }),
+  ];
+  const constants = (sourceTypeName) => ({
+    logEventTypes: {
+      URL_REQUEST_START_JOB: 1,
+      TCP_CONNECT: 3,
+      UDP_CONNECT: 10,
+      HOST_RESOLVER_MANAGER_IPV6_REACHABILITY_CHECK: 11,
+    },
+    logSourceType: {
+      [sourceTypeName]: 1,
+      HOST_RESOLVER_MANAGER: 2,
+    },
+  });
+
+  const udp = checkNetlog(JSON.stringify({
+    constants: constants('UDP_SOCKET'),
+    events,
+  }), ALLOWED, REQUIRED_PATHS);
+  assert.equal(udp.ok, true);
+  assert.deepEqual(udp.acceptedIpv6Check, { sources: 1, connected: true });
+
+  const tcp = checkNetlog(JSON.stringify({
+    constants: constants('TCP_SOCKET'),
+    events,
+  }), ALLOWED, REQUIRED_PATHS);
+  assert.equal(tcp.ok, false);
+  assert.deepEqual(tcp.acceptedIpv6Check, { sources: 0, connected: false });
+  assert.ok(tcp.unexpected.includes('2001:4860:4860::8888:443'));
 });
 
 test('the leftover search reads UTF-8 and UTF-16LE and skips files over 1 MiB', () => {
