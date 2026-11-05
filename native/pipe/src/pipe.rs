@@ -115,7 +115,7 @@ mod platform {
     use windows::Win32::Foundation::{
         CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE,
         ERROR_INVALID_DATA, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
-        ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, TRUE,
+        ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
         WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows::Win32::Security::Authorization::{
@@ -348,8 +348,8 @@ mod platform {
     fn create_event() -> Result<HANDLE, PipeError> {
         // SAFETY: the arguments request an auto-reset, non-signalled, unnamed
         // event.  An auto-reset event is enough because each operation waits
-        // exactly once.  `Default::default()` works for the Windows BOOL type
-        // and expresses false in both the old and new windows-rs bindings.
+        // exactly once.  `Default::default()` works for the bool parameter
+        // and expresses false in this windows-rs binding.
         unsafe {
             CreateEventW(None, Default::default(), Default::default(), PCWSTR::null())
                 .map_err(map_error)
@@ -367,7 +367,7 @@ mod platform {
     /// Cancel a pending overlapped operation and wait until the kernel has
     /// finished with the `OVERLAPPED`, its event and its buffer.
     ///
-    /// `GetOverlappedResult(..., TRUE)` is required here: after
+    /// `GetOverlappedResult(..., true)` is required here: after
     /// `ERROR_IO_PENDING` the stack objects must not be freed while the I/O
     /// manager could still write to them.
     fn cancel_pending(handle: HANDLE, overlapped: &OVERLAPPED) {
@@ -376,7 +376,7 @@ mod platform {
         unsafe {
             let _ = CancelIoEx(handle, Some(overlapped));
             let mut transferred = 0u32;
-            let _ = GetOverlappedResult(handle, overlapped, &mut transferred, TRUE);
+            let _ = GetOverlappedResult(handle, overlapped, &mut transferred, true);
         }
     }
 
@@ -404,7 +404,7 @@ mod platform {
             let mut transferred = 0u32;
             // SAFETY: the event is signalled, so the operation has completed.
             // Waiting is harmless here and reaps the completion.
-            return match unsafe { GetOverlappedResult(handle, overlapped, &mut transferred, TRUE) }
+            return match unsafe { GetOverlappedResult(handle, overlapped, &mut transferred, true) }
             {
                 Ok(()) => PendingOutcome::Completed(transferred),
                 Err(error) => PendingOutcome::Io(error),
