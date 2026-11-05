@@ -569,9 +569,12 @@ function checkNetlog(json, host, requiredPaths) {
       if (hasParams) {
         // Only the fixed reachability address may appear in an exempted
         // source's address members.  A different address, or the same address
-        // on a different port, means this is not the silent probe.
+        // on a different port, means this is not the silent probe.  The one
+        // exception is UDP_LOCAL_ADDRESS, whose address member is the socket's
+        // own local address rather than the destination it connected to.
         const eventPort = params.port ?? params.remote_port ?? null;
-        if (typeof params.address === 'string' && params.address.trim() !== '') {
+        if (typeName !== 'UDP_LOCAL_ADDRESS'
+            && typeof params.address === 'string' && params.address.trim() !== '') {
           const endpoint = endpointFromValue(params.address, eventPort);
           if (!isKnownIpv6Endpoint(endpoint)) entry.foreignAddress = true;
         }

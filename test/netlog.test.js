@@ -422,6 +422,59 @@ test('the IPv6 source allowlist keeps only the silent probe event types', () => 
   assert.deepEqual(result.acceptedIpv6Check, { sources: 1, connected: true });
 });
 
+test('a connected probe is accepted when UDP_LOCAL_ADDRESS names the socket local address', () => {
+  const result = checkNetlog(netlog(ipv6CheckEvents({
+    connect: { address: IPV6_CHECK },
+    phase: 2,
+    extraEvents: [{
+      type: 'UDP_LOCAL_ADDRESS',
+      params: { address: '[2600:1f18::5]:50000' },
+      source: { id: 77, type: 'UDP_SOCKET' },
+    }],
+  })), ALLOWED, REQUIRED_PATHS);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.unexpected, []);
+  assert.deepEqual(result.acceptedIpv6Check, { sources: 1, connected: true });
+});
+
+test('a UDP_CONNECT to another address on the same source is still rejected', () => {
+  const result = checkNetlog(netlog(ipv6CheckEvents({
+    connect: { address: IPV6_CHECK },
+    phase: 2,
+    extraEvents: [{
+      type: 'UDP_CONNECT',
+      params: { address: '[2600:1f18::5]:443' },
+      source: { id: 77, type: 'UDP_SOCKET' },
+      phase: 2,
+    }],
+  })), ALLOWED, REQUIRED_PATHS);
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.acceptedIpv6Check, { sources: 0, connected: false });
+  assert.ok(result.unexpected.includes('2600:1f18::5:443'));
+});
+
+test('a foreign remote_address on UDP_LOCAL_ADDRESS is still rejected', () => {
+  const result = checkNetlog(netlog(ipv6CheckEvents({
+    connect: { address: IPV6_CHECK },
+    phase: 2,
+    extraEvents: [{
+      type: 'UDP_LOCAL_ADDRESS',
+      params: {
+        address: '[2600:1f18::5]:50000',
+        remote_address: '198.51.100.7',
+        remote_port: 443,
+      },
+      source: { id: 77, type: 'UDP_SOCKET' },
+    }],
+  })), ALLOWED, REQUIRED_PATHS);
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.acceptedIpv6Check, { sources: 0, connected: false });
+  assert.ok(result.unexpected.includes('198.51.100.7:443'));
+});
+
 test('IPv6 socket error events are not accepted and are marked as byte transfers', () => {
   for (const type of [
     'UDP_SEND_ERROR',
