@@ -4,6 +4,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -11,6 +12,9 @@ const path = require('node:path');
 const {
   SECTION_1_FUSES,
   compareTrees,
+  compareExecutables,
+  compareFuseWires,
+  compareExecutableFuses,
   readTree,
   listAsarFromDisk,
   repositoryHookCopies,
@@ -22,9 +26,19 @@ const HOOKS = repositoryHookCopies();
 const RELEASE_HOOK = HOOKS.release;
 const TEST_HOOK = HOOKS.test;
 
+function sha256Hex(value) {
+  return crypto.createHash('sha256').update(String(value)).digest('hex');
+}
+
+// The exe embeds the 64-character asar integrity hash.  Deriving it from the
+// asar bytes gives every pair of different builds a realistic differing hash.
+function executableFor(asarBytes) {
+  return Buffer.from(`exe header ${sha256Hex(asarBytes)} exe footer`, 'utf8');
+}
+
 function baseTree(asarBytes = 'release asar bytes') {
   return {
-    'rongroi-connect.exe': 'release executable',
+    'rongroi-connect.exe': executableFor(asarBytes),
     'resources/app.asar': asarBytes,
     'resources/other.pak': 'the same pak',
     LICENSE: 'the same license',
@@ -54,15 +68,92 @@ function asarPair(releaseFiles = {}, testFiles = {}) {
   );
 }
 
-test('identical builds pass, including a differing exe and test hook', () => {
+test('identical builds pass, including a differing exe hash and test hook', () => {
   const release = baseTree('release asar bytes');
-  const testTree = { ...baseTree('test asar bytes'), 'rongroi-connect.exe': 'test executable' };
+  const testTree = {
+    ...baseTree('test asar bytes'),
+    'rongroi-connect.exe': executableFor('the test executable'),
+  };
 
   const result = compareTrees(release, testTree, asarPair(), HOOKS);
 
   assert.equal(result.ok, true);
   assert.deepEqual(result.differences, []);
-  assert.ok(result.notes.some((note) => note.includes('rongroi-connect.exe')));
+  assert.ok(result.notes.some(
+    (note) => note.includes('rongroi-connect.exe') && note.includes('compared'),
+  ));
+  assert.equal(result.notes.some((note) => note.includes('allowed to differ')), false);
+});
+
+test('compareExecutables allows only the 64-character asar hash to differ', () => {
+  const left = Buffer.from(`head:${'a'.repeat(64)}:tail`, 'utf8');
+  const right = Buffer.from(`head:${'b'.repeat(64)}:tail`, 'utf8');
+
+  assert.deepEqual(compareExecutables(left, right), []);
+});
+
+test('compareExecutables reports a differing byte outside the asar hash', () => {
+  const differences = compareExecutables(
+    Buffer.from('0123456789', 'utf8'),
+    Buffer.from('012345678X', 'utf8'),
+  );
+
+  assert.equal(differences.length, 1);
+  assert.match(differences[0], /offset 9/);
+  assert.match(differences[0], /length 1/);
+});
+
+test('compareExecutables requires the asar hash run to be exactly 64 hex characters', () => {
+  const left = Buffer.from('a'.repeat(63), 'utf8');
+  const right = Buffer.from('b'.repeat(63), 'utf8');
+
+  const differences = compareExecutables(left, right);
+
+  assert.equal(differences.length, 1);
+  assert.match(differences[0], /offset 0/);
+  assert.match(differences[0], /length 63/);
+});
+
+test('compareExecutables reports a length difference', () => {
+  const differences = compareExecutables(Buffer.from('abc'), Buffer.from('ab'));
+
+  assert.equal(differences.length, 1);
+  assert.match(differences[0], /lengths differ/i);
+});
+
+test('compareExecutables treats identical executables as a failed comparison', () => {
+  const exe = Buffer.from(`head:${'a'.repeat(64)}:tail`, 'utf8');
+
+  const differences = compareExecutables(exe, Buffer.from(exe));
+
+  assert.equal(differences.length, 1);
+  assert.match(differences[0], /identical/);
+});
+
+test('compareExecutables reports at most the first 10 differing byte ranges', () => {
+  const left = Buffer.alloc(24);
+  const right = Buffer.alloc(24);
+  for (let index = 0; index < right.length; index += 2) right[index] = 1;
+
+  const differences = compareExecutables(left, right);
+
+  assert.equal(differences.length, 10);
+  assert.match(differences[0], /offset 0/);
+  assert.match(differences[9], /offset 18/);
+});
+
+test('a differing exe byte outside the asar hash fails the comparison', () => {
+  const release = baseTree('release asar bytes');
+  const changedExe = Buffer.from(baseTree('test asar bytes')['rongroi-connect.exe']);
+  changedExe[0] ^= 0xff;
+  const testTree = { ...baseTree('test asar bytes'), 'rongroi-connect.exe': changedExe };
+
+  const result = compareTrees(release, testTree, asarPair(), HOOKS);
+
+  assert.equal(result.ok, false);
+  assert.ok(result.differences.some(
+    (entry) => entry.includes('rongroi-connect.exe') && /offset 0/.test(entry),
+  ));
 });
 
 test('a file in only one tree fails', () => {
@@ -141,6 +232,81 @@ test('the test test hook must equal test/hook/test-hook.js byte for byte', () =>
   assert.ok(result.differences.some(
     (entry) => entry.includes('test copy differs from test/hook/test-hook.js'),
   ));
+});
+
+test('a differing symlink target inside an asar fails', () => {
+  const result = compareTrees(
+    baseTree('release asar bytes'),
+    baseTree('test asar bytes'),
+    asarPair(
+      { 'src/link.js': { link: 'src/release-target.js' } },
+      { 'src/link.js': { link: 'src/test-target.js' } },
+    ),
+    HOOKS,
+  );
+
+  assert.equal(result.ok, false);
+  assert.ok(result.differences.some(
+    (entry) => entry.includes('src/link.js') && entry.includes('link target'),
+  ));
+});
+
+test('the same symlink target inside both asars passes', () => {
+  const result = compareTrees(
+    baseTree('release asar bytes'),
+    baseTree('test asar bytes'),
+    asarPair(
+      { 'src/link.js': { link: 'src/main/main.js' } },
+      { 'src/link.js': { link: 'src/main/main.js' } },
+    ),
+    HOOKS,
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.differences, []);
+});
+
+test('a symlink in only one asar fails', () => {
+  const result = compareTrees(
+    baseTree('release asar bytes'),
+    baseTree('test asar bytes'),
+    asarPair({ 'src/link.js': { link: 'src/main/main.js' } }, {}),
+    HOOKS,
+  );
+
+  assert.equal(result.ok, false);
+  assert.ok(result.differences.some(
+    (entry) => entry.includes('src/link.js') && entry.includes('only in release'),
+  ));
+});
+
+test('a directory in only one asar fails', () => {
+  const result = compareTrees(
+    baseTree('release asar bytes'),
+    baseTree('test asar bytes'),
+    asarPair({ 'src/empty': { directory: true } }, {}),
+    HOOKS,
+  );
+
+  assert.equal(result.ok, false);
+  assert.ok(result.differences.some(
+    (entry) => entry.includes('src/empty') && entry.includes('only in release'),
+  ));
+});
+
+test('the same empty directory in both asars passes', () => {
+  const result = compareTrees(
+    baseTree('release asar bytes'),
+    baseTree('test asar bytes'),
+    asarPair(
+      { 'src/empty': { directory: true } },
+      { 'src/empty': { directory: true } },
+    ),
+    HOOKS,
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.differences, []);
 });
 
 test('two identical app.asar files fail because the builds did not differ', () => {
@@ -234,7 +400,7 @@ test('listAsarFromDisk strips the leading separator listPackage returns', () => 
   assert.equal(files.get('src/a.js').toString('utf8'), 'a bytes');
 });
 
-test('listAsarFromDisk skips folders and links without extracting them', () => {
+test('listAsarFromDisk records folders and links without extracting them', () => {
   const archive = path.join('C:', 'app', 'resources', 'app.asar');
   const extracted = [];
   const asarFile = {
@@ -263,8 +429,8 @@ test('listAsarFromDisk skips folders and links without extracting them', () => {
 
   const files = listAsarFromDisk(asarFile, archive);
 
-  assert.equal(files.has('native'), false);
-  assert.equal(files.has('src/link.js'), false);
+  assert.equal(files.get('native').directory, true);
+  assert.equal(files.get('src/link.js').link, 'src/main/main.js');
   assert.equal(extracted.includes('native'), false);
   assert.equal(extracted.includes('src/link.js'), false);
   assert.equal(files.get('src/main/main.js').toString('utf8'), 'main bytes');
@@ -369,6 +535,44 @@ test('a fuse missing from the wire fails and names the fuse', () => {
 
   assert.equal(differences.length, 1);
   assert.match(differences[0], /RunAsNode/);
+});
+
+function rawFuseWire(overrides = {}) {
+  const bytes = Buffer.alloc(16, FUSE_OFF);
+  for (const { name, value } of SECTION_1_FUSES) {
+    bytes[FUSE_OPTIONS[name]] = value ? FUSE_ON : FUSE_OFF;
+  }
+  for (const [index, value] of Object.entries(overrides)) bytes[Number(index)] = value;
+  return bytes;
+}
+
+test('the two executable fuse wires must be equal byte for byte', () => {
+  assert.deepEqual(compareFuseWires(rawFuseWire(), rawFuseWire()), []);
+
+  const differences = compareFuseWires(rawFuseWire(), rawFuseWire({ 12: FUSE_ON }));
+
+  assert.equal(differences.length, 1);
+  assert.match(differences[0], /byte 12/);
+});
+
+test('compareExecutableFuses compares both whole fuse wires', async () => {
+  const releaseWire = rawFuseWire();
+  const testWire = rawFuseWire({ 12: FUSE_ON });
+  const fuses = {
+    getCurrentFuseWire: async (file) => (
+      file.includes('release-build') ? releaseWire : testWire
+    ),
+    FuseV1Options: FUSE_OPTIONS,
+    FuseState: undefined,
+  };
+  const tree = new Map([['rongroi-connect.exe', Buffer.from('exe')]]);
+  const releaseDir = path.join(os.tmpdir(), 'release-build');
+  const testDir = path.join(os.tmpdir(), 'test-build');
+
+  const differences = await compareExecutableFuses(releaseDir, tree, testDir, tree, fuses);
+
+  assert.equal(differences.length, 1);
+  assert.match(differences[0], /byte 12/);
 });
 
 test('the staged package.json drops devDependencies without changing the input', () => {

@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 'use strict';
 
-// Compare the release and test builds of ADR 0001 section 2.  The pure part is
-// compareTrees(); the command line turns two folders into file maps, gives
-// compareTrees a way to read the two app.asar archives, and reads the fuses of
-// both executables.
+// Compare the release and test builds of ADR 0001 section 2.  The pure parts are
+// compareExecutables() and compareTrees(); the command line turns two folders
+// into file maps, gives compareTrees a way to read the two app.asar archives,
+// and reads the fuses of both executables.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -49,6 +49,34 @@ function toBuffer(value) {
   return Buffer.from(String(value), 'utf8');
 }
 
+const ASAR_LINK = Symbol('asar-link');
+const ASAR_DIRECTORY = Symbol('asar-directory');
+
+function asarLink(target) {
+  const value = String(target);
+  return { [ASAR_LINK]: true, kind: 'link', link: value, target: value };
+}
+
+function asarDirectory() {
+  return { [ASAR_DIRECTORY]: true, kind: 'directory', directory: true };
+}
+
+function isAsarLink(value) {
+  return value !== null && typeof value === 'object'
+    && (value[ASAR_LINK] === true || typeof value.link === 'string');
+}
+
+function isAsarDirectory(value) {
+  return value !== null && typeof value === 'object'
+    && (value[ASAR_DIRECTORY] === true || value.directory === true || value.files !== undefined);
+}
+
+function normalizeAsarValue(value) {
+  if (isAsarLink(value)) return asarLink(value.target ?? value.link);
+  if (isAsarDirectory(value)) return asarDirectory();
+  return toBuffer(value);
+}
+
 function normalizeTree(tree) {
   const files = new Map();
   if (tree === null || tree === undefined) return files;
@@ -63,7 +91,9 @@ function normalizeAsarList(list) {
   if (list === null || list === undefined) return files;
 
   if (list instanceof Map) {
-    for (const [name, value] of list) files.set(normalizePath(name), toBuffer(value));
+    for (const [name, value] of list) {
+      files.set(normalizePath(name), normalizeAsarValue(value));
+    }
     return files;
   }
 
@@ -72,18 +102,27 @@ function normalizeAsarList(list) {
       if (typeof entry === 'string') {
         files.set(normalizePath(entry), Buffer.alloc(0));
       } else if (Array.isArray(entry) && entry.length >= 1) {
-        files.set(normalizePath(entry[0]), toBuffer(entry[1]));
+        files.set(normalizePath(entry[0]), normalizeAsarValue(entry[1]));
       } else if (entry !== null && typeof entry === 'object') {
         const name = entry.path ?? entry.name ?? entry.file;
+        if (name === undefined) continue;
+        if (typeof entry.link === 'string') {
+          files.set(normalizePath(name), asarLink(entry.link));
+          continue;
+        }
+        if (entry.directory === true || entry.files !== undefined) {
+          files.set(normalizePath(name), asarDirectory());
+          continue;
+        }
         const data = entry.data ?? entry.contents ?? entry.bytes;
-        if (name !== undefined) files.set(normalizePath(name), toBuffer(data));
+        files.set(normalizePath(name), normalizeAsarValue(data));
       }
     }
     return files;
   }
 
   for (const [name, value] of Object.entries(list)) {
-    files.set(normalizePath(name), toBuffer(value));
+    files.set(normalizePath(name), normalizeAsarValue(value));
   }
   return files;
 }
@@ -93,6 +132,12 @@ function repositoryHookCopies(root = ROOT) {
     release: fs.readFileSync(path.join(root, 'src', 'test-hook.js')),
     test: fs.readFileSync(path.join(root, 'test', 'hook', 'test-hook.js')),
   };
+}
+
+function asarEntryKind(value) {
+  if (isAsarLink(value)) return 'link';
+  if (isAsarDirectory(value)) return 'directory';
+  return 'file';
 }
 
 function compareAsar(rel, leftBytes, rightBytes, listAsar, expectedHooks, differences) {
@@ -115,32 +160,125 @@ function compareAsar(rel, leftBytes, rightBytes, listAsar, expectedHooks, differ
       continue;
     }
 
+    const leftEntry = left.get(name);
+    const rightEntry = right.get(name);
+    const leftKind = asarEntryKind(leftEntry);
+    const rightKind = asarEntryKind(rightEntry);
+
     // The test hook is the one file the two builds are meant to differ in,
     // but each copy must still be exactly the file the build should have put
     // there.  A stub in a test build (or the driving hook in release) is a
     // failure, not an allowed difference.
     if (name === TEST_HOOK_PATH) {
-      if (!left.get(name).equals(toBuffer(expectedHooks.release))) {
+      if (leftKind !== 'file' || !leftEntry.equals(toBuffer(expectedHooks.release))) {
         differences.push(`${rel}:${name}: release copy differs from src/test-hook.js`);
       }
-      if (!right.get(name).equals(toBuffer(expectedHooks.test))) {
+      if (rightKind !== 'file' || !rightEntry.equals(toBuffer(expectedHooks.test))) {
         differences.push(`${rel}:${name}: test copy differs from test/hook/test-hook.js`);
       }
       continue;
     }
 
-    if (!left.get(name).equals(right.get(name))) {
+    if (leftKind !== rightKind) {
+      differences.push(
+        `${rel}:${name}: is a ${leftKind} in release but a ${rightKind} in test`,
+      );
+      continue;
+    }
+
+    if (leftKind === 'directory') continue;
+
+    if (leftKind === 'link') {
+      if (leftEntry.target !== rightEntry.target) {
+        differences.push(
+          `${rel}:${name}: link target differs (${leftEntry.target} vs ${rightEntry.target})`,
+        );
+      }
+      continue;
+    }
+
+    if (!leftEntry.equals(rightEntry)) {
       differences.push(`${rel}:${name}: differs`);
     }
   }
 }
 
+function isLowercaseHexByte(byte) {
+  return (byte >= 0x30 && byte <= 0x39) || (byte >= 0x61 && byte <= 0x66);
+}
+
+function lowercaseHexRuns(buffer) {
+  const runs = new Map();
+  let index = 0;
+  while (index < buffer.length) {
+    if (!isLowercaseHexByte(buffer[index])) {
+      index += 1;
+      continue;
+    }
+    const start = index;
+    while (index < buffer.length && isLowercaseHexByte(buffer[index])) index += 1;
+    const length = index - start;
+    if (length === 64) runs.set(start, length);
+  }
+  return runs;
+}
+
+function integrityHashRanges(left, right) {
+  const ranges = [];
+  const leftRuns = lowercaseHexRuns(left);
+  if (leftRuns.size === 0) return ranges;
+  const rightRuns = lowercaseHexRuns(right);
+  for (const [start, length] of leftRuns) {
+    if (rightRuns.get(start) !== 64) continue;
+    ranges.push([start, start + length]);
+  }
+  return ranges;
+}
+
+// The two executables are built from the same Electron distribution with the
+// same fuses, so they must be identical except for the embedded asar integrity
+// hash.  That hash is a run of exactly 64 lowercase hex characters at the same
+// offset in both files.  Any other differing byte range is a failure.
+function compareExecutables(leftBuffer, rightBuffer) {
+  const left = toBuffer(leftBuffer);
+  const right = toBuffer(rightBuffer);
+  if (left.length !== right.length) {
+    return [`lengths differ (release ${left.length} bytes, test ${right.length} bytes)`];
+  }
+  if (left.equals(right)) {
+    return ['identical in both builds; the test build must differ'];
+  }
+
+  const allowedRanges = integrityHashRanges(left, right);
+  const differences = [];
+  let index = 0;
+  while (index < left.length && differences.length < 10) {
+    if (left[index] === right[index]) {
+      index += 1;
+      continue;
+    }
+
+    const start = index;
+    while (index < left.length && left[index] !== right[index]) index += 1;
+    const length = index - start;
+
+    const insideIntegrityHash = allowedRanges.some(
+      ([rangeStart, rangeEnd]) => start >= rangeStart && index <= rangeEnd,
+    );
+    if (!insideIntegrityHash) {
+      differences.push(`bytes differ at offset ${start} (length ${length})`);
+    }
+  }
+  return differences;
+}
+
 // Pure comparison of two trees.  Each tree is a Map or plain object of
 // relative path -> Buffer/string.  listAsar(bytes, side, rel) returns the
-// files inside that asar as a Map, array or plain object.  It is injected so
-// this function itself never touches the archives on disk.  expectedHooks is
-// { release, test } as Buffers; by default the repository's two hook files are
-// used, because each build must carry exactly its own copy.
+// entries inside that asar as a Map, array or plain object; entries may be
+// files, links or directories.  It is injected so this function itself never
+// touches the archives on disk.  expectedHooks is { release, test } as Buffers;
+// by default the repository's two hook files are used, because each build must
+// carry exactly its own copy.
 function compareTrees(a, b, listAsar, expectedHooks) {
   const hooks = expectedHooks ?? repositoryHookCopies();
   const left = normalizeTree(a);
@@ -161,7 +299,14 @@ function compareTrees(a, b, listAsar, expectedHooks) {
     }
 
     if (rel === EXE_PATH || rel.endsWith(`/${EXE_PATH}`)) {
-      notes.push(`${rel}: allowed to differ (fuses and embedded asar integrity)`);
+      const exeDifferences = compareExecutables(left.get(rel), right.get(rel));
+      for (const difference of exeDifferences) {
+        differences.push(`${rel}: ${difference}`);
+      }
+      notes.push(
+        `${rel}: compared byte for byte (only the embedded asar integrity hash may differ); `
+          + 'the fuse wire is checked separately',
+      );
       continue;
     }
 
@@ -294,9 +439,9 @@ function listAsarFromDisk(asar, archivePath) {
   for (const entry of entries) {
     const name = normalizePath(entry);
 
-    // listPackage() returns folders and links as well as files.  A folder is
-    // covered by the files inside it, and a link has no bytes of its own, so
-    // neither may be passed to extractFile().
+    // listPackage() returns folders and links as well as files.  A link has a
+    // target but no bytes, and a folder may be empty, so record both instead of
+    // passing them to extractFile().
     let stats = null;
     if (typeof asar.statFile === 'function') {
       try {
@@ -305,7 +450,14 @@ function listAsarFromDisk(asar, archivePath) {
         // Without a stat we can still try to extract a real file below.
       }
     }
-    if (stats && (stats.files !== undefined || stats.link)) continue;
+    if (stats && stats.link !== undefined && stats.link !== null && stats.link !== false) {
+      files.set(name, asarLink(stats.link));
+      continue;
+    }
+    if (stats && (stats.files !== undefined || stats.directory === true)) {
+      files.set(name, asarDirectory());
+      continue;
+    }
 
     try {
       files.set(name, extractAsarFile(asar, archivePath, entry));
@@ -336,22 +488,121 @@ function expectedFuseEntries(FuseV1Options) {
 function wireBytes(wire) {
   if (Buffer.isBuffer(wire)) return wire;
   if (wire instanceof Uint8Array) return wire;
+  if (Array.isArray(wire)) return Uint8Array.from(wire);
   if (wire !== null && typeof wire === 'object') {
-    for (const candidate of [wire.wire, wire.buffer, wire.bytes]) {
+    for (const candidate of [
+      wire.wire,
+      wire.buffer,
+      wire.bytes,
+      wire.fuseWire,
+      wire.fuses,
+      wire.data,
+    ]) {
       if (Buffer.isBuffer(candidate) || candidate instanceof Uint8Array) return candidate;
+      if (Array.isArray(candidate)) return Uint8Array.from(candidate);
     }
   }
   return null;
 }
 
+function stateByte(value, fallback) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const text = value.trim().toLowerCase();
+    if (text === '0' || text === 'off' || text === 'disabled' || text === 'disable') {
+      return FUSE_STATE_BYTES.DISABLE;
+    }
+    if (text === '1' || text === 'on' || text === 'enabled' || text === 'enable') {
+      return FUSE_STATE_BYTES.ENABLE;
+    }
+    if (text === 'r' || text === 'removed') return FUSE_STATE_BYTES.REMOVED;
+    if (text === '?' || text === 'invalid') return FUSE_STATE_BYTES.INVALID;
+  }
+  return fallback;
+}
+
 function fuseStateValues(FuseState) {
   const exported = FuseState !== null && typeof FuseState === 'object' ? FuseState : {};
   return {
-    disable: exported.DISABLE ?? FUSE_STATE_BYTES.DISABLE,
-    enable: exported.ENABLE ?? FUSE_STATE_BYTES.ENABLE,
-    removed: exported.REMOVED ?? FUSE_STATE_BYTES.REMOVED,
-    invalid: exported.INVALID ?? FUSE_STATE_BYTES.INVALID,
+    disable: stateByte(exported.DISABLE, FUSE_STATE_BYTES.DISABLE),
+    enable: stateByte(exported.ENABLE, FUSE_STATE_BYTES.ENABLE),
+    removed: stateByte(exported.REMOVED, FUSE_STATE_BYTES.REMOVED),
+    invalid: stateByte(exported.INVALID, FUSE_STATE_BYTES.INVALID),
   };
+}
+
+function fuseStateByte(state, states) {
+  if (state === true) return states.enable;
+  if (state === false) return states.disable;
+  if (state === 'removed') return states.removed;
+  return states.invalid;
+}
+
+// Turn any supported fuse-wire shape into the raw bytes.  Normally the fuses
+// library hands us the wire bytes directly; when it gives an object instead,
+// rebuild the wire from its option keys so the two wires can still be compared
+// byte for byte.
+function fuseWireBuffer(wire, FuseV1Options, FuseState) {
+  const raw = wireBytes(wire);
+  if (raw !== null) return Buffer.from(raw);
+  if (wire === null || typeof wire !== 'object') return null;
+
+  const states = fuseStateValues(FuseState);
+  const values = new Map();
+  const remember = (option, value) => {
+    const state = normalizeFuseState(value, states);
+    values.set(
+      option,
+      state === null ? stateByte(value, states.invalid) : fuseStateByte(state, states),
+    );
+  };
+
+  if (typeof wire.getFuseState === 'function') {
+    const options = Object.values(FuseV1Options ?? {}).filter((value) => Number.isInteger(value));
+    if (options.length === 0) return null;
+    for (const option of options) remember(option, wire.getFuseState(option));
+  } else {
+    for (const [key, value] of Object.entries(wire)) {
+      let option;
+      if (/^\d+$/.test(key)) {
+        option = Number(key);
+      } else if (Object.prototype.hasOwnProperty.call(FuseV1Options ?? {}, key)) {
+        option = FuseV1Options[key];
+      } else {
+        continue;
+      }
+      remember(option, value);
+    }
+  }
+
+  if (values.size === 0) return null;
+  const last = Math.max(...values.keys());
+  const bytes = Buffer.alloc(last + 1, states.invalid);
+  for (const [option, byte] of values) bytes[option] = byte;
+  return bytes;
+}
+
+function compareFuseWires(leftWire, rightWire, label = 'executable') {
+  const left = wireBytes(leftWire) ?? fuseWireBuffer(leftWire);
+  const right = wireBytes(rightWire) ?? fuseWireBuffer(rightWire);
+  if (left === null || right === null) {
+    return [`${label}: cannot read the fuse wire bytes`];
+  }
+  const a = Buffer.isBuffer(left) ? left : Buffer.from(left);
+  const b = Buffer.isBuffer(right) ? right : Buffer.from(right);
+  if (a.length !== b.length) {
+    return [`${label}: fuse wire lengths differ (${a.length} vs ${b.length})`];
+  }
+
+  const differences = [];
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) {
+      differences.push(
+        `${label}: fuse wire byte ${index} differs (${a[index]} vs ${b[index]})`,
+      );
+    }
+  }
+  return differences;
 }
 
 function normalizeFuseState(value, states) {
@@ -369,13 +620,16 @@ function normalizeFuseState(value, states) {
 
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return null;
-  if (numeric === states.enable) return true;
-  if (numeric === states.disable) return false;
-  if (numeric === states.removed) return 'removed';
-  if (numeric === states.invalid) return 'invalid';
-  // Also accept a plain 0/1 wire, for callers that already decoded the bytes.
+  if (numeric === states.enable || numeric === FUSE_STATE_BYTES.ENABLE) return true;
+  if (numeric === states.disable || numeric === FUSE_STATE_BYTES.DISABLE) return false;
+  if (numeric === states.removed || numeric === FUSE_STATE_BYTES.REMOVED) return 'removed';
+  if (numeric === states.invalid || numeric === FUSE_STATE_BYTES.INVALID) return 'invalid';
+  // Also accept the ordinal and plain 0/1 forms, for callers that already
+  // decoded the wire instead of handing over its bytes.
   if (numeric === 0) return false;
   if (numeric === 1) return true;
+  if (numeric === 2) return 'removed';
+  if (numeric === 3) return 'invalid';
   return null;
 }
 
@@ -453,14 +707,42 @@ function executableKey(tree) {
   );
 }
 
-async function compareExecutableFuses(directory, tree, fuses) {
-  const rel = executableKey(tree);
-  if (rel === undefined) {
-    return [`${EXE_PATH}: missing`];
-  }
+async function compareExecutableFuses(
+  releaseDirectory,
+  releaseTree,
+  testDirectory,
+  testTree,
+  fuses,
+) {
   const { getCurrentFuseWire, FuseV1Options, FuseState } = fuses;
-  const wire = await getCurrentFuseWire(path.join(path.resolve(directory), rel));
-  return checkFuseWire(wire, FuseV1Options, FuseState, rel);
+  const differences = [];
+  const wires = {};
+
+  for (const [side, directory, tree] of [
+    ['release', releaseDirectory, releaseTree],
+    ['test', testDirectory, testTree],
+  ]) {
+    const rel = executableKey(tree);
+    if (rel === undefined) {
+      differences.push(`${EXE_PATH}: missing`);
+      continue;
+    }
+    const wire = await getCurrentFuseWire(path.join(path.resolve(directory), rel));
+    wires[side] = wire;
+    differences.push(...checkFuseWire(wire, FuseV1Options, FuseState, rel));
+  }
+
+  if (wires.release !== undefined && wires.test !== undefined) {
+    const releaseBytes = fuseWireBuffer(wires.release, FuseV1Options, FuseState);
+    const testBytes = fuseWireBuffer(wires.test, FuseV1Options, FuseState);
+    differences.push(...compareFuseWires(
+      releaseBytes ?? wires.release,
+      testBytes ?? wires.test,
+      executableKey(releaseTree) ?? EXE_PATH,
+    ));
+  }
+
+  return differences;
 }
 
 async function main(argv) {
@@ -484,8 +766,7 @@ async function main(argv) {
   try {
     const fuses = await loadFuses();
     result.differences.push(
-      ...await compareExecutableFuses(releaseDir, releaseTree, fuses),
-      ...await compareExecutableFuses(testDir, testTree, fuses),
+      ...await compareExecutableFuses(releaseDir, releaseTree, testDir, testTree, fuses),
     );
   } catch (error) {
     result.differences.push(`cannot read the executable fuses: ${error.message}`);
@@ -502,8 +783,9 @@ async function main(argv) {
   }
 
   console.log(
-    'builds match: every file is byte-identical except resources/app.asar and the exe; '
-      + 'inside the asars only src/test-hook.js may differ, and both exes hold the section 1 fuses.',
+    'builds match: every file is byte-identical except resources/app.asar, and the exes differ '
+      + 'only in their embedded asar integrity hash; inside the asars only src/test-hook.js may '
+      + 'differ, and both exes hold the section 1 fuses and the same fuse wire.',
   );
 }
 
@@ -520,6 +802,9 @@ module.exports = {
   TEST_HOOK_PATH,
   SECTION_1_FUSES,
   compareTrees,
+  compareExecutables,
+  compareFuseWires,
+  compareExecutableFuses,
   readTree,
   listAsarFromDisk,
   repositoryHookCopies,
