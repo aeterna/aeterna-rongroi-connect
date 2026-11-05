@@ -52,7 +52,7 @@ jobs:
       - name: Banned crates
         working-directory: native/pipe
         run: |
-          cargo install cargo-deny --version 0.18.9 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
           cargo deny --config deny.toml check bans
       - name: Tests on a real pipe
         working-directory: native/pipe
