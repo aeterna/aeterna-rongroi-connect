@@ -111,35 +111,41 @@ mod platform {
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, Instant};
 
-    use windows::core::{HSTRING, PWSTR};
+    use windows::core::{HSTRING, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_INVALID_DATA,
-        ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED,
-        ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+        CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE,
+        ERROR_INVALID_DATA, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
+        ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         SDDL_REVISION_1,
     };
     use windows::Win32::Security::{
-        GetTokenInformation, OpenProcessToken, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-        TOKEN_QUERY, TOKEN_USER,
+        GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+        TOKEN_USER,
     };
     use windows::Win32::Storage::FileSystem::{
-        ConnectNamedPipe, CreateNamedPipeW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE,
-        FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-        PIPE_TYPE_BYTE, PIPE_WAIT,
+        ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+        PIPE_ACCESS_DUPLEX,
     };
     use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
-    use windows::Win32::System::Memory::LocalFree;
-    use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
+        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
     use windows::Win32::System::Threading::{
-        CreateEventW, GetCurrentProcess, OpenProcess, QueryFullProcessImageNameW,
+        CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
         WaitForSingleObject, INFINITE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-        WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
 
-    type HandleEntry = Arc<Mutex<Option<HANDLE>>>;
+    // A `HANDLE` wraps a raw pointer and is therefore not `Send`, so it cannot
+    // live in the process-wide registry.  The registry stores only the opaque
+    // kernel handle value; a `HANDLE` is rebuilt for the duration of one call.
+    // SAFETY: the id stored here is an opaque kernel handle value owned by
+    // this registry; it is never interpreted as a Rust pointer.
+    type HandleEntry = Arc<Mutex<Option<isize>>>;
 
     fn registry() -> &'static Mutex<HashMap<u32, HandleEntry>> {
         static REGISTRY: OnceLock<Mutex<HashMap<u32, HandleEntry>>> = OnceLock::new();
@@ -279,7 +285,8 @@ mod platform {
         // exactly once.  `Default::default()` works for the Windows BOOL type
         // and expresses false in both the old and new windows-rs bindings.
         unsafe {
-            CreateEventW(None, Default::default(), Default::default(), None).map_err(map_error)
+            CreateEventW(None, Default::default(), Default::default(), PCWSTR::null())
+                .map_err(map_error)
         }
     }
 
@@ -323,14 +330,20 @@ mod platform {
         // parameters are valid for the duration of the call.
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                &sddl,
+                PCWSTR::from_raw(sddl.as_wide().as_ptr()),
                 SDDL_REVISION_1,
                 &mut descriptor,
-                &mut descriptor_size,
+                Some(&mut descriptor_size),
             )
             .map_err(|_| PipeError::Denied)?;
         }
-        let _descriptor = LocalFreeGuard(descriptor);
+        // SAFETY: `PSECURITY_DESCRIPTOR` is a transparent pointer wrapper (or a
+        // raw-pointer alias), so this preserves the allocation that
+        // `LocalFreeGuard` must release.
+        #[allow(clippy::useless_transmute, clippy::transmute_ptr_to_ptr)]
+        let descriptor_raw: *mut core::ffi::c_void =
+            unsafe { core::mem::transmute(descriptor) };
+        let _descriptor = LocalFreeGuard(descriptor_raw);
 
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -341,9 +354,9 @@ mod platform {
         let name = HSTRING::from(name);
         // SAFETY: all arguments are valid for the call.  The descriptor stays
         // alive until CreateNamedPipeW has copied it.
-        let handle = unsafe {
+        let handle = match unsafe {
             CreateNamedPipeW(
-                &name,
+                PCWSTR::from_raw(name.as_wide().as_ptr()),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
@@ -352,29 +365,31 @@ mod platform {
                 0,
                 Some(&attributes),
             )
+        } {
+            Ok(handle) if handle != INVALID_HANDLE_VALUE => handle,
+            Ok(_) => return Err(PipeError::Failed(hresult_from_win32(ERROR_INVALID_DATA.0))),
+            Err(error) => {
+                return Err(if win32_code(&error) == Some(ERROR_ACCESS_DENIED.0) {
+                    // FILE_FLAG_FIRST_PIPE_INSTANCE reports an existing instance
+                    // this way.
+                    PipeError::Exists
+                } else {
+                    map_error(error)
+                });
+            }
         };
 
-        if handle == INVALID_HANDLE_VALUE {
-            // SAFETY: reading the thread's last error has no preconditions.
-            let code = unsafe { GetLastError() };
-            return Err(if code == ERROR_ACCESS_DENIED {
-                // FILE_FLAG_FIRST_PIPE_INSTANCE reports an existing instance
-                // this way.
-                PipeError::Exists
-            } else {
-                PipeError::Failed(hresult_from_win32(code.0))
-            });
-        }
-
         let id = next_id();
-        lock(registry()).insert(id, Arc::new(Mutex::new(Some(handle))));
+        lock(registry()).insert(id, Arc::new(Mutex::new(Some(handle.0 as isize))));
         Ok(id)
     }
 
     pub fn accept(id: u32, timeout_ms: u32) -> Result<(), PipeError> {
         let entry = entry_for(id)?;
         let guard = lock(&entry);
-        let handle = (*guard).ok_or(PipeError::Closed)?;
+        let handle = (*guard)
+            .map(|value| HANDLE(value as *mut core::ffi::c_void))
+            .ok_or(PipeError::Closed)?;
 
         let event = create_event()?;
         let _event = HandleGuard(event);
@@ -429,7 +444,9 @@ mod platform {
     pub fn client_image(id: u32) -> Result<Option<String>, PipeError> {
         let entry = entry_for(id)?;
         let guard = lock(&entry);
-        let handle = (*guard).ok_or(PipeError::Closed)?;
+        let handle = (*guard)
+            .map(|value| HANDLE(value as *mut core::ffi::c_void))
+            .ok_or(PipeError::Closed)?;
 
         let mut process_id = 0u32;
         // SAFETY: `handle` is a connected server-side pipe and `process_id` is
@@ -545,7 +562,9 @@ mod platform {
     pub fn write_line(id: u32, text: &str, timeout_ms: u32) -> Result<(), PipeError> {
         let entry = entry_for(id)?;
         let guard = lock(&entry);
-        let handle = (*guard).ok_or(PipeError::Closed)?;
+        let handle = (*guard)
+            .map(|value| HANDLE(value as *mut core::ffi::c_void))
+            .ok_or(PipeError::Closed)?;
 
         let mut line = Vec::with_capacity(text.len() + 1);
         line.extend_from_slice(text.as_bytes());
@@ -560,7 +579,9 @@ mod platform {
     ) -> Result<Vec<u8>, PipeError> {
         let entry = entry_for(id)?;
         let guard = lock(&entry);
-        let handle = (*guard).ok_or(PipeError::Closed)?;
+        let handle = (*guard)
+            .map(|value| HANDLE(value as *mut core::ffi::c_void))
+            .ok_or(PipeError::Closed)?;
 
         let maximum = max_bytes as usize;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
@@ -653,7 +674,7 @@ mod platform {
             // SAFETY: the handle was removed from the registry, so this is the
             // only close for this id.  A second close sees None and does nothing.
             unsafe {
-                let _ = CloseHandle(handle);
+                let _ = CloseHandle(HANDLE(handle as *mut core::ffi::c_void));
             }
         }
         Ok(())
