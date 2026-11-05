@@ -186,14 +186,6 @@ function createFlow(options = {}) {
     }
   }
 
-  function cancelOrRegister(value) {
-    if (typeof value === 'function') {
-      rememberScanCancel(value);
-    } else {
-      cancelScanIfActive();
-    }
-  }
-
   function consentState() {
     return withCountdown({
       name: 'consent',
@@ -363,51 +355,18 @@ function createFlow(options = {}) {
 
       let answer;
       try {
-        let tokenCancel = null;
-        const cancelToken = {};
-        Object.defineProperty(cancelToken, 'cancel', {
-          enumerable: true,
-          get() {
-            return tokenCancel;
-          },
-          set(value) {
-            tokenCancel = value;
-            rememberScanCancel(value);
-          },
-        });
-
-        const started = runSidecar({
+        answer = await runSidecar({
           binding,
           policy,
           producer,
           elevate,
           onCancel: rememberScanCancel,
-          registerCancel: rememberScanCancel,
-          cancel: cancelOrRegister,
-          cancelToken,
           onElevationPending() {
             if (current.name === 'scanning' && current.elevationPending !== true) {
               publish(scanningState(true));
             }
           },
-        }, rememberScanCancel);
-
-        let scanPromise = started;
-        if (started !== null && typeof started === 'object'
-            && typeof started.then !== 'function') {
-          if (started.promise !== null && typeof started.promise === 'object'
-              && typeof started.promise.then === 'function') {
-            scanPromise = started.promise;
-          } else if (started.result !== null && typeof started.result === 'object'
-              && typeof started.result.then === 'function') {
-            scanPromise = started.result;
-          }
-          if (typeof started.cancel === 'function') rememberScanCancel(started.cancel);
-        } else if (started !== null && typeof started === 'object'
-            && typeof started.cancel === 'function') {
-          rememberScanCancel(started.cancel);
-        }
-        answer = await scanPromise;
+        });
       } catch (error) {
         if (scanCanceled || quitRequested || current.name !== 'scanning') return false;
         const tooLarge = error !== null && error !== undefined

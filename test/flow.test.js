@@ -189,6 +189,10 @@ test('the happy path moves from paste to done with one upload', async () => {
   assert.deepEqual(h.sidecarCalls[0].policy, POLICY);
   assert.deepEqual(h.sidecarCalls[0].producer, PRODUCER);
   assert.equal(h.sidecarCalls[0].elevate, false);
+  assert.equal(typeof h.sidecarCalls[0].onCancel, 'function');
+  assert.equal(h.sidecarCalls[0].registerCancel, undefined);
+  assert.equal(h.sidecarCalls[0].cancel, undefined);
+  assert.equal(h.sidecarCalls[0].cancelToken, undefined);
   assert.deepEqual(names(), ['checking', 'consent', 'scanning', 'hash']);
 
   const hash = lastState(h);

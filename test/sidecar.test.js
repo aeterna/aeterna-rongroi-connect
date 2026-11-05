@@ -380,6 +380,20 @@ test('cancel kills the child, closes the pipe and is harmless when repeated', as
   });
 });
 
+test('onCancel is called exactly once before the first pipe operation', async () => {
+  const h = makeHarness();
+  const callsAtRegister = [];
+  const pending = h.call({
+    onCancel() {
+      callsAtRegister.push(callNames(h.pipe).length);
+    },
+  });
+
+  assert.deepEqual(callsAtRegister, [0]);
+  await pending;
+  assert.deepEqual(callsAtRegister, [0]);
+});
+
 test('an accept timeout kills the child, closes the pipe and rejects', async () => {
   const timeout = Object.assign(new Error('timeout'), { code: 'timeout' });
   const h = makeHarness({

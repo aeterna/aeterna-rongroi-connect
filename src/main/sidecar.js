@@ -56,11 +56,10 @@ function createSidecarRunner(options = {}) {
       ? module.exports.verifySidecar
       : verifySidecar);
 
-  async function runSidecarInner(input = {}) {
-    const { binding, policy, producer, elevate, onElevationPending } = input;
+  async function runSidecar(input = {}) {
+    const { binding, policy, producer, elevate, onCancel, onElevationPending } = input;
 
-    const name = await pipe.pipeName(randomBytes(16));
-    let handle = await pipe.create(name);
+    let handle;
     let child = null;
     let exited = false;
     let exitCode = null;
@@ -87,10 +86,10 @@ function createSidecarRunner(options = {}) {
 
     async function close() {
       if (closed) return;
-      closed = true;
       const id = handle;
       handle = undefined;
       if (id === undefined) return;
+      closed = true;
       try {
         await pipe.close(id);
       } catch {
@@ -149,13 +148,12 @@ function createSidecarRunner(options = {}) {
       });
     }
 
+    if (typeof onCancel === 'function') onCancel(cancel);
+
+    const name = await pipe.pipeName(randomBytes(16));
+    handle = await pipe.create(name);
+
     try {
-      const registerCancel = typeof input.onCancel === 'function'
-        ? input.onCancel
-        : (typeof input.registerCancel === 'function'
-          ? input.registerCancel
-          : (typeof input.cancel === 'function' ? input.cancel : null));
-      if (registerCancel !== null) registerCancel(cancel);
       throwIfCancelled();
 
       if (typeof verify === 'function') await verify();
@@ -298,30 +296,7 @@ function createSidecarRunner(options = {}) {
     }
   }
 
-  return function runSidecar(input = {}) {
-    let cancelFn = null;
-    let cancelRequested = false;
-
-    const register = (cancel) => {
-      if (typeof cancel !== 'function') return;
-      cancelFn = cancel;
-      if (typeof input.onCancel === 'function') input.onCancel(cancel);
-      if (typeof input.registerCancel === 'function') input.registerCancel(cancel);
-      if (typeof input.cancel === 'function') input.cancel(cancel);
-      if (cancelRequested) cancel();
-    };
-
-    const innerInput = {
-      ...input,
-      onCancel: register,
-    };
-    const promise = runSidecarInner(innerInput);
-    promise.cancel = () => {
-      cancelRequested = true;
-      if (cancelFn !== null) cancelFn();
-    };
-    return promise;
-  };
+  return runSidecar;
 }
 
 module.exports = createSidecarRunner;
