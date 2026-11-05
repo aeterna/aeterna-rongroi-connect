@@ -107,7 +107,7 @@ mod platform {
 
     use std::collections::HashMap;
     use std::mem::size_of;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, Instant};
 
@@ -116,7 +116,7 @@ mod platform {
         CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE,
         ERROR_INVALID_DATA, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
         ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
-        WAIT_OBJECT_0, WAIT_TIMEOUT,
+        TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -136,16 +136,27 @@ mod platform {
     };
     use windows::Win32::System::Threading::{
         CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-        WaitForSingleObject, INFINITE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
     // A `HANDLE` wraps a raw pointer and is therefore not `Send`, so it cannot
     // live in the process-wide registry.  The registry stores only the opaque
     // kernel handle value; a `HANDLE` is rebuilt for the duration of one call.
-    // SAFETY: the id stored here is an opaque kernel handle value owned by
-    // this registry; it is never interpreted as a Rust pointer.
-    type HandleEntry = Arc<Mutex<Option<isize>>>;
+    //
+    // `active` counts calls that copied the value out and are still using it.
+    // `close` marks `closed` and cancels pending work, but the handle itself is
+    // closed by whichever side finishes last: `close` when no call is active,
+    // or the last active call when it releases.  Windows may reuse a handle
+    // value as soon as `CloseHandle` returns, so a late call must never receive
+    // a value that has already been closed.
+    struct HandleState {
+        handle: Mutex<Option<isize>>,
+        closed: AtomicBool,
+        active: AtomicUsize,
+    }
+
+    type HandleEntry = Arc<HandleState>;
 
     fn registry() -> &'static Mutex<HashMap<u32, HandleEntry>> {
         static REGISTRY: OnceLock<Mutex<HashMap<u32, HandleEntry>>> = OnceLock::new();
@@ -170,6 +181,60 @@ mod platform {
             .get(&id)
             .cloned()
             .ok_or(PipeError::BadHandle)
+    }
+
+    /// One call's claim on a handle value.
+    ///
+    /// The value is copied out while the entry mutex is held, then the mutex is
+    /// released for the rest of the wait.  Keeping the lease alive prevents
+    /// `close` from calling `CloseHandle` under the running call.
+    struct HandleLease {
+        entry: HandleEntry,
+        handle: HANDLE,
+    }
+
+    impl HandleLease {
+        fn acquire(entry: HandleEntry) -> Result<Self, PipeError> {
+            // The same mutex guards the handle slot and the transition to
+            // closed.  Checking and incrementing `active` under it means close
+            // cannot decide that no call is using the handle in between.
+            let value = {
+                let guard = lock(&entry.handle);
+                if entry.closed.load(Ordering::SeqCst) {
+                    return Err(PipeError::Closed);
+                }
+                let value = (*guard).ok_or(PipeError::Closed)?;
+                entry.active.fetch_add(1, Ordering::SeqCst);
+                value
+            };
+            Ok(Self {
+                entry,
+                handle: HANDLE(value as *mut core::ffi::c_void),
+            })
+        }
+
+        fn is_closed(&self) -> bool {
+            self.entry.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for HandleLease {
+        fn drop(&mut self) {
+            if self.entry.active.fetch_sub(1, Ordering::SeqCst) == 1 {
+                // This is the last call using the handle.  If close already
+                // requested cancellation, it left the actual CloseHandle to us.
+                if self.entry.closed.load(Ordering::SeqCst) {
+                    let mut guard = lock(&self.entry.handle);
+                    if let Some(value) = guard.take() {
+                        // SAFETY: the slot still owned a live handle and this
+                        // lease is the last user, so this is the only close.
+                        unsafe {
+                            let _ = CloseHandle(HANDLE(value as *mut core::ffi::c_void));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn hresult_from_win32(code: u32) -> u32 {
@@ -299,16 +364,68 @@ mod platform {
         remaining.as_millis().min(u32::MAX as u128) as u32
     }
 
-    fn cancel(handle: HANDLE, overlapped: &OVERLAPPED, event: HANDLE) {
+    /// Cancel a pending overlapped operation and wait until the kernel has
+    /// finished with the `OVERLAPPED`, its event and its buffer.
+    ///
+    /// `GetOverlappedResult(..., TRUE)` is required here: after
+    /// `ERROR_IO_PENDING` the stack objects must not be freed while the I/O
+    /// manager could still write to them.
+    fn cancel_pending(handle: HANDLE, overlapped: &OVERLAPPED) {
         // SAFETY: `handle` and `overlapped` are the same pair passed to the
-        // pending operation.  Cancelling is advisory; waiting for the event and
-        // then reaping the completion keeps the event alive until Windows is
-        // finished with it.
+        // pending operation and both stay alive until the wait returns.
         unsafe {
             let _ = CancelIoEx(handle, Some(overlapped));
-            let _ = WaitForSingleObject(event, INFINITE);
             let mut transferred = 0u32;
-            let _ = GetOverlappedResult(handle, overlapped, &mut transferred, Default::default());
+            let _ = GetOverlappedResult(handle, overlapped, &mut transferred, TRUE);
+        }
+    }
+
+    enum PendingOutcome {
+        Completed(u32),
+        Timeout,
+        WaitFailed(u32),
+        Io(windows::core::Error),
+    }
+
+    /// Wait for an operation that returned `ERROR_IO_PENDING`.
+    ///
+    /// Every path that is not a completed operation cancels the I/O and waits
+    /// for it to be reaped, so the caller's stack `OVERLAPPED`, event and
+    /// buffer are safe to drop no matter why the wait ended.
+    fn wait_pending(
+        handle: HANDLE,
+        overlapped: &OVERLAPPED,
+        event: HANDLE,
+        timeout_ms: u32,
+    ) -> PendingOutcome {
+        // SAFETY: `event` belongs to `overlapped`.
+        let wait = unsafe { WaitForSingleObject(event, timeout_ms) };
+        if wait == WAIT_OBJECT_0 {
+            let mut transferred = 0u32;
+            // SAFETY: the event is signalled, so the operation has completed.
+            // Waiting is harmless here and reaps the completion.
+            return match unsafe {
+                GetOverlappedResult(handle, overlapped, &mut transferred, TRUE)
+            } {
+                Ok(()) => PendingOutcome::Completed(transferred),
+                Err(error) => PendingOutcome::Io(error),
+            };
+        }
+
+        // Capture the wait error before cancelling, because the cleanup calls
+        // may overwrite the thread's last-error value.
+        let wait_error = if wait == WAIT_TIMEOUT {
+            None
+        } else {
+            // SAFETY: reading the thread's last error has no preconditions.
+            Some(unsafe { GetLastError() }.0)
+        };
+
+        cancel_pending(handle, overlapped);
+
+        match wait_error {
+            Some(code) => PendingOutcome::WaitFailed(code),
+            None => PendingOutcome::Timeout,
         }
     }
 
@@ -374,16 +491,20 @@ mod platform {
         }
 
         let id = next_id();
-        lock(registry()).insert(id, Arc::new(Mutex::new(Some(handle.0 as isize))));
+        lock(registry()).insert(
+            id,
+            Arc::new(HandleState {
+                handle: Mutex::new(Some(handle.0 as isize)),
+                closed: AtomicBool::new(false),
+                active: AtomicUsize::new(0),
+            }),
+        );
         Ok(id)
     }
 
     pub fn accept(id: u32, timeout_ms: u32) -> Result<(), PipeError> {
-        let entry = entry_for(id)?;
-        let guard = lock(&entry);
-        let handle = (*guard)
-            .map(|value| HANDLE(value as *mut core::ffi::c_void))
-            .ok_or(PipeError::Closed)?;
+        let lease = HandleLease::acquire(entry_for(id)?)?;
+        let handle = lease.handle;
 
         let event = create_event()?;
         let _event = HandleGuard(event);
@@ -403,47 +524,48 @@ mod platform {
                     return Ok(());
                 }
                 if code != Some(ERROR_IO_PENDING.0) {
+                    if lease.is_closed() {
+                        return Err(PipeError::Closed);
+                    }
                     return Err(map_error(error));
                 }
 
+                // close may have cancelled before ConnectNamedPipe queued its
+                // I/O, in which case that CancelIoEx could not see it yet.
+                if lease.is_closed() {
+                    cancel_pending(handle, &overlapped);
+                    return Err(PipeError::Closed);
+                }
+
                 let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-                // SAFETY: the event belongs to `overlapped`.
-                let wait =
-                    unsafe { WaitForSingleObject(event, wait_timeout_ms(deadline, timeout_ms)) };
-                if wait == WAIT_OBJECT_0 {
-                    let mut transferred = 0u32;
-                    // SAFETY: the operation completed; reaping it here is safe.
-                    match unsafe {
-                        GetOverlappedResult(
-                            handle,
-                            &overlapped,
-                            &mut transferred,
-                            Default::default(),
-                        )
-                    } {
-                        Ok(()) => Ok(()),
-                        Err(error) if win32_code(&error) == Some(ERROR_PIPE_CONNECTED.0) => Ok(()),
-                        Err(error) => Err(map_error(error)),
+                match wait_pending(
+                    handle,
+                    &overlapped,
+                    event,
+                    wait_timeout_ms(deadline, timeout_ms),
+                ) {
+                    PendingOutcome::Completed(_) => Ok(()),
+                    PendingOutcome::Io(error) => {
+                        if lease.is_closed() {
+                            Err(PipeError::Closed)
+                        } else if win32_code(&error) == Some(ERROR_PIPE_CONNECTED.0) {
+                            Ok(())
+                        } else {
+                            Err(map_error(error))
+                        }
                     }
-                } else if wait == WAIT_TIMEOUT {
-                    cancel(handle, &overlapped, event);
-                    Err(PipeError::Timeout)
-                } else {
-                    // SAFETY: reading the thread's last error has no preconditions.
-                    Err(PipeError::Failed(hresult_from_win32(
-                        unsafe { GetLastError() }.0,
-                    )))
+                    PendingOutcome::Timeout => Err(PipeError::Timeout),
+                    PendingOutcome::WaitFailed(code) => {
+                        Err(PipeError::Failed(hresult_from_win32(code)))
+                    }
                 }
             }
         }
     }
 
     pub fn client_image(id: u32) -> Result<Option<String>, PipeError> {
-        let entry = entry_for(id)?;
-        let guard = lock(&entry);
-        let handle = (*guard)
-            .map(|value| HANDLE(value as *mut core::ffi::c_void))
-            .ok_or(PipeError::Closed)?;
+        let lease = HandleLease::acquire(entry_for(id)?)?;
+        let handle = lease.handle;
 
         let mut process_id = 0u32;
         // SAFETY: `handle` is a connected server-side pipe and `process_id` is
@@ -489,11 +611,16 @@ mod platform {
         Ok(Some(String::from_utf16_lossy(&buffer[..size as usize])))
     }
 
-    fn write_all(handle: HANDLE, data: &[u8], timeout_ms: u32) -> Result<(), PipeError> {
+    fn write_all(lease: &HandleLease, data: &[u8], timeout_ms: u32) -> Result<(), PipeError> {
+        let handle = lease.handle;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
         let mut written_total = 0usize;
 
         while written_total < data.len() {
+            if lease.is_closed() {
+                return Err(PipeError::Closed);
+            }
+
             let event = create_event()?;
             let _event = HandleGuard(event);
             let mut overlapped = OVERLAPPED {
@@ -519,33 +646,35 @@ mod platform {
                 Ok(()) => written as usize,
                 Err(error) => {
                     if win32_code(&error) != Some(ERROR_IO_PENDING.0) {
+                        if lease.is_closed() {
+                            return Err(PipeError::Closed);
+                        }
                         return Err(map_error(error));
                     }
-                    let wait =
-                        // SAFETY: the event belongs to `overlapped`.
-                        unsafe { WaitForSingleObject(event, wait_timeout_ms(deadline, timeout_ms)) };
-                    if wait == WAIT_OBJECT_0 {
-                        let mut transferred = 0u32;
-                        // SAFETY: the operation completed and is reaped once.
-                        match unsafe {
-                            GetOverlappedResult(
-                                handle,
-                                &overlapped,
-                                &mut transferred,
-                                Default::default(),
-                            )
-                        } {
-                            Ok(()) => transferred as usize,
-                            Err(error) => return Err(map_error(error)),
+
+                    // close may have cancelled before WriteFile queued its I/O.
+                    if lease.is_closed() {
+                        cancel_pending(handle, &overlapped);
+                        return Err(PipeError::Closed);
+                    }
+
+                    match wait_pending(
+                        handle,
+                        &overlapped,
+                        event,
+                        wait_timeout_ms(deadline, timeout_ms),
+                    ) {
+                        PendingOutcome::Completed(transferred) => transferred as usize,
+                        PendingOutcome::Io(error) => {
+                            if lease.is_closed() {
+                                return Err(PipeError::Closed);
+                            }
+                            return Err(map_error(error));
                         }
-                    } else if wait == WAIT_TIMEOUT {
-                        cancel(handle, &overlapped, event);
-                        return Err(PipeError::Timeout);
-                    } else {
-                        // SAFETY: reading the thread's last error has no preconditions.
-                        return Err(PipeError::Failed(hresult_from_win32(
-                            unsafe { GetLastError() }.0,
-                        )));
+                        PendingOutcome::Timeout => return Err(PipeError::Timeout),
+                        PendingOutcome::WaitFailed(code) => {
+                            return Err(PipeError::Failed(hresult_from_win32(code)));
+                        }
                     }
                 }
             };
@@ -560,16 +689,12 @@ mod platform {
     }
 
     pub fn write_line(id: u32, text: &str, timeout_ms: u32) -> Result<(), PipeError> {
-        let entry = entry_for(id)?;
-        let guard = lock(&entry);
-        let handle = (*guard)
-            .map(|value| HANDLE(value as *mut core::ffi::c_void))
-            .ok_or(PipeError::Closed)?;
+        let lease = HandleLease::acquire(entry_for(id)?)?;
 
         let mut line = Vec::with_capacity(text.len() + 1);
         line.extend_from_slice(text.as_bytes());
         line.push(b'\n');
-        write_all(handle, &line, timeout_ms)
+        write_all(&lease, &line, timeout_ms)
     }
 
     pub fn read_until_close(
@@ -577,17 +702,18 @@ mod platform {
         max_bytes: u32,
         timeout_ms: u32,
     ) -> Result<Vec<u8>, PipeError> {
-        let entry = entry_for(id)?;
-        let guard = lock(&entry);
-        let handle = (*guard)
-            .map(|value| HANDLE(value as *mut core::ffi::c_void))
-            .ok_or(PipeError::Closed)?;
+        let lease = HandleLease::acquire(entry_for(id)?)?;
+        let handle = lease.handle;
 
         let maximum = max_bytes as usize;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
         let mut collected: Vec<u8> = Vec::new();
 
         loop {
+            if lease.is_closed() {
+                return Err(PipeError::Closed);
+            }
+
             let room = maximum.saturating_sub(collected.len());
             // One byte over the cap is enough to notice a too-large record
             // without ever accumulating more than the caller allowed.
@@ -617,46 +743,49 @@ mod platform {
                 Ok(()) => read as usize,
                 Err(error) => {
                     if win32_code(&error) != Some(ERROR_IO_PENDING.0) {
+                        if lease.is_closed() {
+                            return Err(PipeError::Closed);
+                        }
                         if is_closed_code(&error) {
                             break;
                         }
                         return Err(map_error(error));
                     }
-                    let wait =
-                        // SAFETY: the event belongs to `overlapped`.
-                        unsafe { WaitForSingleObject(event, wait_timeout_ms(deadline, timeout_ms)) };
-                    if wait == WAIT_OBJECT_0 {
-                        let mut transferred = 0u32;
-                        // SAFETY: the operation completed and is reaped once.
-                        match unsafe {
-                            GetOverlappedResult(
-                                handle,
-                                &overlapped,
-                                &mut transferred,
-                                Default::default(),
-                            )
-                        } {
-                            Ok(()) => transferred as usize,
-                            Err(error) => {
-                                if is_closed_code(&error) {
-                                    break;
-                                }
-                                return Err(map_error(error));
+
+                    // close may have cancelled before ReadFile queued its I/O.
+                    if lease.is_closed() {
+                        cancel_pending(handle, &overlapped);
+                        return Err(PipeError::Closed);
+                    }
+
+                    match wait_pending(
+                        handle,
+                        &overlapped,
+                        event,
+                        wait_timeout_ms(deadline, timeout_ms),
+                    ) {
+                        PendingOutcome::Completed(transferred) => transferred as usize,
+                        PendingOutcome::Io(error) => {
+                            if lease.is_closed() {
+                                return Err(PipeError::Closed);
                             }
+                            if is_closed_code(&error) {
+                                break;
+                            }
+                            return Err(map_error(error));
                         }
-                    } else if wait == WAIT_TIMEOUT {
-                        cancel(handle, &overlapped, event);
-                        return Err(PipeError::Timeout);
-                    } else {
-                        // SAFETY: reading the thread's last error has no preconditions.
-                        return Err(PipeError::Failed(hresult_from_win32(
-                            unsafe { GetLastError() }.0,
-                        )));
+                        PendingOutcome::Timeout => return Err(PipeError::Timeout),
+                        PendingOutcome::WaitFailed(code) => {
+                            return Err(PipeError::Failed(hresult_from_win32(code)));
+                        }
                     }
                 }
             };
 
             if this_time == 0 {
+                if lease.is_closed() {
+                    return Err(PipeError::Closed);
+                }
                 break;
             }
             if this_time > room {
@@ -670,14 +799,40 @@ mod platform {
 
     pub fn close(id: u32) -> Result<(), PipeError> {
         let entry = entry_for(id)?;
-        let mut guard = lock(&entry);
-        if let Some(handle) = guard.take() {
-            // SAFETY: the handle was removed from the registry, so this is the
-            // only close for this id.  A second close sees None and does nothing.
+        // The mutex is held only for this state transition.  Waiting calls no
+        // longer hold it, so the cancel below never waits for their timeout.
+        let mut guard = lock(&entry.handle);
+        if entry.closed.swap(true, Ordering::SeqCst) {
+            // Already closed; a second close is harmless.
+            return Ok(());
+        }
+
+        let Some(value) = *guard else {
+            return Ok(());
+        };
+        let handle = HANDLE(value as *mut core::ffi::c_void);
+
+        // Wake every call that is waiting on this handle.  A call that has not
+        // queued its I/O yet notices `closed` after the call and cancels
+        // itself before waiting.
+        // SAFETY: `active` leases keep the handle value alive, so it cannot
+        // have been closed or reused underneath this call.
+        unsafe {
+            let _ = CancelIoEx(handle, None);
+        }
+
+        if entry.active.load(Ordering::SeqCst) == 0 {
+            // No call can acquire the handle now: acquisition checks `closed`
+            // under this same mutex.  Close it here and clear the slot so a
+            // later call can never see the reused value.
+            let _ = guard.take();
+            // SAFETY: this is the only remaining owner of the handle.
             unsafe {
-                let _ = CloseHandle(HANDLE(handle as *mut core::ffi::c_void));
+                let _ = CloseHandle(handle);
             }
         }
+        // Otherwise the last active lease closes it when it releases.
+
         Ok(())
     }
 }

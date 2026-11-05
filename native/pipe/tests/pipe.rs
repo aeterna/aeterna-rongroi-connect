@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! A real client, not a mock: it connects with CreateFileW, receives the line
-//! Connect writes, sends a record and closes.  The test also proves the single
-//! instance, the `max_bytes` cap and the accept timeout.
+//! Connect writes, sends a record and closes.  The tests also prove the single
+//! instance, the `max_bytes` cap, the accept timeout and that `close` wakes a
+//! blocked `accept` instead of waiting for its timeout.
 
 #![cfg(windows)]
 
@@ -139,4 +140,42 @@ fn real_client_round_trip() {
     );
     assert!(started.elapsed() < Duration::from_secs(5));
     close(timeout_handle).expect("the pipe closes");
+}
+
+#[test]
+fn close_wakes_a_blocked_accept_promptly() {
+    let name = pipe_name(&[10u8; 16]).expect("fixed random bytes");
+    let handle = create(&name).expect("pipe is created");
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let waiter = thread::spawn(move || {
+        started_tx.send(()).expect("test thread still listening");
+        accept(handle, 60_000)
+    });
+
+    started_rx.recv().expect("accept thread started");
+    // Let the accept call issue ConnectNamedPipe and block on the event.
+    thread::sleep(Duration::from_millis(100));
+
+    let started = Instant::now();
+    close(handle).expect("the pipe closes");
+    let result = waiter.join().expect("the accept thread finishes");
+
+    assert_eq!(
+        result,
+        Err(PipeError::Closed),
+        "a closed pipe reports closed instead of timing out"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "close must wake accept promptly, took {:?}",
+        started.elapsed()
+    );
+
+    // A call that starts after the close must not use the old handle value.
+    assert_eq!(
+        accept(handle, 0),
+        Err(PipeError::Closed),
+        "a late call reports closed"
+    );
 }
