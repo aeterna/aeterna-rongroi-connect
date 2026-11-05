@@ -10,9 +10,11 @@
   },
   "scripts": {
     "test": "node --test",
-    "lint": "node --check src/core/pairing.js && node --check src/core/canonical.js && node --check src/core/envelope.js && node --check src/core/upload-plan.js"
+    "lint": "eslint src test"
   },
   "devDependencies": {
-    "electron": "44.7.1"
+    "@eslint/js": "9.39.1",
+    "electron": "44.7.1",
+    "eslint": "9.39.1"
   }
 }
