@@ -349,6 +349,10 @@ Differences from the sections above, each found while building:
 
   This list is what remained after the delete, not everything Chromium wrote during the run. A crash can leave more.
 
+- A scan that a player quits, or whose ticket expires, is stopped: the main process kills the child if it is its own and closes the pipe. An elevated sidecar cannot be killed from the unelevated main process; it finds the pipe closed.
+- A sidecar that connects and writes nothing, or exits non-zero within 2 seconds of the pipe closing, is a sidecar failure (exit 13). Non-empty invalid text with no bad exit stays a refused record (exit 14), so a sidecar killed without an exit code after a partial write is reported as 14.
+- A refused code or policy, and any other error without "Try again", is final for the run: the player closes Connect and starts it again to enter a new code. This is `single-shot` as defined above.
+- **The client image check of section 4 is not in 2c.** The pipe module exposes it and nothing calls it yet. Until lane 3c adds it, a process running as the same user that opens the pipe first gets the binding, policy and producer, and can supply the record. 0.1.0 does not ship without it.
 - **What the release smoke shows.** The release folder's exe stayed running for 8 seconds, with embedded asar integrity on. It does not show that the window drew or that the release build completes a flow, since the test hook is not in it. The byte comparison with the test build carries the rest.
 
 ## Consequences
