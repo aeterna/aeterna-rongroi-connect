@@ -6,6 +6,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 - Status: accepted — owner, 2026-11-01 (local-address origins and the 14-day patch rule accepted)
 - Date: 2026-11-01
+- Amended: 2026-11-05, lane 2c as built ("As built: 2c"); Claude Code - Claude Opus 5.5
 - Related: aeterna-rongroi ADR 0089 (product line and schema 2,
   [aeterna-rongroi#252](https://github.com/aeterna/aeterna-rongroi/pull/252), not merged yet; this ADR follows
   its revision of 2026-11-01), ADR 0002 (evidence, never a verdict), ADR 0007 (official builds), ADR 0012
@@ -311,6 +312,48 @@ update alone is a patch.
 
 A persistent or background mode (its own ADR, owner decision Q17); auto-update of any kind; Hub; an installer;
 code signing; macOS and Linux builds.
+
+## As built: 2c
+
+Differences from the sections above, each found while building:
+
+- The preload also exposes `retry()`, for the error state's "Try again". Section 1's table listed five calls and `onState`.
+- A 5xx or a lost answer that uses up its retries restarts the whole upload once while the ticket has time left, as 422 does, then is an error. Server Kit answers 500 when saving failed and has dropped its buffer, so repeating one slice cannot work (section 4's table says retry, then error).
+- A lost-answer or partial upload error says part of the report may have reached the server, since some slices may have been accepted.
+- Electron is 44.10.2, not the spike's 44.7.1: `npm audit` reported a high advisory on the earlier version.
+- **One known socket, accepted by the owner (2026-11-05).** Section 2's job fails on any socket naming anything but the paired host. Chromium's host resolver opens one UDP socket and connects it to `[2001:4860:4860::8888]:443`, a Google public DNS address, to learn whether IPv6 is reachable, even for a request to an IP address. So Connect opens a socket toward that address, and sends nothing on it, as measured below. This is weaker than "no socket", and nothing here may say otherwise.
+
+  | Where (Electron 44.10.2) | IPv6 route | Connect result | Packets to that address |
+  |---|---|---|---|
+  | This repo's hosted Windows runner | none | `net_error -109` | netlog: no byte events. Not captured by the OS |
+  | Development PC, Windows, `pktmon` | none (Teredo and Tailscale only) | `net_error -109` | none seen, but the control could not send either, so this shows nothing beyond "no route, nothing leaves" |
+  | MacBook, macOS, `tcpdump` | yes | connected, `ipv6_available: true` | **0**, with a control that sent 1 byte and captured 1 packet |
+
+  `--enable-features` with `EnableIPv6ReachabilityOverride` or `kEnableIPv6ReachabilityOverride` did not stop the check on the Mac. No `disable-ipv6` switch string was found in the binary. Whether another way exists is unknown.
+
+  The netlog shows this socket at two layers, as a `UDP_SOCKET` source and a `UDP_CLIENT_SOCKET` source. The netlog check accepts them only when the type is UDP, the address and port are exactly that, the source holds only open, connect, local-address and alive events (so no bytes and no send or receive attempt, failed or not), and the log holds Chromium's IPv6 reachability check event. Any other case fails the job.
+
+  **Windows with a working IPv6 route is unmeasured.** Before 0.1.0, lane 3c measures it with `pktmon` and a control that sends. A packet to that address ends this exception, and 0.1.0 does not ship until that is resolved. Until then nothing public says Connect contacts nobody else.
+- **Files left in `%TEMP%` after a normal exit (hosted Windows runner, Electron 44.10.2, the mock flow, run 42021779777 on `1991908`).** The delete in `will-quit` does not finish: the folder stays with 20 files, 115,883 bytes. Why is not proven; files Chromium still holds open is the likely cause (section 3). The stale sweep removes the folder on a later run, once its pid is gone and it is more than 10 minutes old, so a player who never runs Connect again keeps it until Windows' own temp cleanup.
+
+  | Under the folder | Files | Bytes |
+  |---|---|---:|
+  | `Shared Dictionary\db`, `db-journal`, `cache\index`, `cache\index-dir\the-real-index` | 4 | 45,128 |
+  | `Network\Trust Tokens`, `Trust Tokens-journal`, `Network Persistent State`, `NetworkDataMigrated` | 4 | 36,975 |
+  | `declarative_performance_observer.db`, `-journal` | 2 | 32,768 |
+  | `Local Storage\leveldb\` `000003.log`, `CURRENT`, `LOCK`, `LOG`, `MANIFEST-000001` | 5 | 402 |
+  | `Local State`, `Preferences` | 2 | 610 |
+  | `GPUPersistentCache\DawnGraphiteCache\<id>\` | 3 | 0 |
+
+  The e2e job searches every leftover file up to 1 MiB for the run's ticket, nonce, Kit key and origin, as plain UTF-8 and UTF-16LE: no hits in this run. A ticket, nonce or key hit fails the job; an origin hit is only reported. Larger or unreadable files are listed in the report as not searched, and a value stored compressed or encoded would not be found. That is a search for those four values in a mock flow, not proof about a real scan, and the real sidecar's run is lane 3c's to repeat. S12's HTTP, code and shader caches and the dictionary did not appear.
+
+  This list is what remained after the delete, not everything Chromium wrote during the run. A crash can leave more.
+
+- A scan that a player quits, or whose ticket expires, is stopped: the main process kills the child if it is its own and closes the pipe. An elevated sidecar cannot be killed from the unelevated main process; it finds the pipe closed.
+- A sidecar that connects and writes nothing, or exits non-zero within 2 seconds of the pipe closing, is a sidecar failure (exit 13). Non-empty invalid text with no bad exit stays a refused record (exit 14), so a sidecar killed without an exit code after a partial write is reported as 14.
+- A refused code or policy, and any other error without "Try again", is final for the run: the player closes Connect and starts it again to enter a new code. This is `single-shot` as defined above.
+- **The client image check of section 4 is not in 2c.** The pipe module exposes it and nothing calls it yet. Until lane 3c adds it, a process running as the same user that opens the pipe first gets the binding, policy and producer, and can supply the record. 0.1.0 does not ship without it.
+- **What the release smoke shows.** The release folder's exe stayed running for 8 seconds, with embedded asar integrity on. It does not show that the window drew or that the release build completes a flow, since the test hook is not in it. The byte comparison with the test build carries the rest.
 
 ## Consequences
 

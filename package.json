@@ -1,0 +1,28 @@
+{
+  "name": "aeterna-rongroi-connect",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Rongroi Connect: the player's consent gate between a PC and one paired FiveM server.",
+  "license": "GPL-3.0-or-later",
+  "type": "commonjs",
+  "main": "src/main/main.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test",
+    "lint": "eslint src test",
+    "build:native": "node scripts/build-native.js",
+    "build": "node scripts/build.js dist/release",
+    "build:test": "node scripts/build.js dist/test --test",
+    "e2e": "node scripts/run-e2e.js dist/test"
+  },
+  "devDependencies": {
+    "@electron/asar": "4.3.1",
+    "@electron/fuses": "2.1.3",
+    "@electron/packager": "20.3.0",
+    "@eslint/js": "9.39.1",
+    "electron": "44.10.2",
+    "eslint": "9.39.1"
+  }
+}
