@@ -12,12 +12,23 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { checkNetlog, DEFAULT_REQUIRED_PATHS } = require('./check-netlog');
+const { parsePairingCode } = require('../src/core/pairing');
 
 const ROOT = path.resolve(__dirname, '..');
 const TEMP_PREFIX = 'rongroi-connect-';
 const APP_LIMIT_MS = 120 * 1000;
 const RELEASE_SMOKE_MS = 8 * 1000;
 const REQUIRED_PATHS = [...DEFAULT_REQUIRED_PATHS];
+const LEFTOVER_MAX_BYTES = 1024 * 1024;
+const LEFTOVER_FAILURE_KINDS = new Set([
+  'ticket',
+  'nonce',
+  'kitPublicKey',
+  'kit_public_key',
+  'publicKey',
+  'public_key',
+  'key',
+]);
 
 function withTimeout(promise, millis, message) {
   let timer = null;
@@ -185,9 +196,87 @@ function listFilesUnder(entries) {
   return files;
 }
 
-function captureLeftovers(report) {
+function searchLeftovers(entries, values) {
+  const rawRoots = entries === undefined || entries === null
+    ? []
+    : (Array.isArray(entries) ? entries : [entries]);
+  const roots = rawRoots.map((entry) => (
+    entry !== null && typeof entry === 'object' && typeof entry.path === 'string'
+      ? entry.path
+      : entry
+  ));
+
+  const items = [];
+  if (Array.isArray(values)) {
+    for (const value of values) {
+      if (Array.isArray(value) && value.length >= 2) {
+        if (typeof value[0] === 'string' && typeof value[1] === 'string') {
+          items.push([value[0], value[1]]);
+        }
+      } else if (typeof value === 'string') {
+        items.push([value, value]);
+      } else if (value !== null && typeof value === 'object') {
+        const what = value.what ?? value.name ?? value.kind ?? value.label;
+        const text = value.text ?? value.value ?? value.needle ?? value.secret;
+        if (what !== undefined && typeof text === 'string') items.push([String(what), text]);
+      }
+    }
+  } else if (values instanceof Map) {
+    for (const [what, text] of values) {
+      if (typeof text === 'string') items.push([String(what), text]);
+    }
+  } else if (values !== null && typeof values === 'object') {
+    for (const [what, text] of Object.entries(values)) {
+      if (typeof text === 'string') items.push([what, text]);
+    }
+  }
+
+  const needles = [];
+  for (const [what, text] of items) {
+    if (text === '') continue;
+    needles.push({
+      what,
+      utf8: Buffer.from(text, 'utf8'),
+      utf16le: Buffer.from(text, 'utf16le'),
+    });
+  }
+  if (needles.length === 0) return [];
+
+  const hits = [];
+  for (const file of listFilesUnder(roots)) {
+    if (file.size > LEFTOVER_MAX_BYTES) continue;
+
+    let bytes;
+    try {
+      bytes = fs.readFileSync(file.path);
+    } catch {
+      continue;
+    }
+
+    for (const needle of needles) {
+      if (bytes.includes(needle.utf8) || bytes.includes(needle.utf16le)) {
+        hits.push({ file: file.path, what: needle.what });
+      }
+    }
+  }
+  return hits;
+}
+
+const findLeftoverHits = searchLeftovers;
+const scanLeftovers = searchLeftovers;
+const scanLeftoverFiles = searchLeftovers;
+const searchLeftoverFiles = searchLeftovers;
+
+function leftoverFailure(hits) {
+  return hits.some((hit) => LEFTOVER_FAILURE_KINDS.has(hit.what));
+}
+
+const hasLeftoverFailure = leftoverFailure;
+
+function captureLeftovers(report, values) {
   report.tempAfter = listTempMatches();
   report.leftoverFiles = listFilesUnder(report.tempAfter);
+  report.leftoverHits = searchLeftovers(report.tempAfter, values ?? {});
 }
 
 function runApplication(executable, args, env) {
@@ -394,6 +483,7 @@ async function main(argv) {
     kitVisualHash: null,
     netlogOk: false,
     netlogNames: [],
+    acceptedIpv6Check: { sources: 0, connected: false },
     netlogUnexpected: [],
     netlogUnexpectedDetails: [],
     netlogUnexpectedByName: {},
@@ -410,16 +500,30 @@ async function main(argv) {
     tempBefore: listTempMatches(),
     tempAfter: [],
     leftoverFiles: [],
+    leftoverHits: [],
     error: null,
   };
 
   let kit = null;
   let netlogPath = null;
+  let leftoverValues = {};
 
   try {
     const executable = findExecutable(buildDir);
     kit = startKit();
     const kitInfo = await withTimeout(kit.info, 10 * 1000, 'the mock kit did not print its code');
+
+    try {
+      const parsed = parsePairingCode(kitInfo.code);
+      leftoverValues = {
+        ticket: parsed.ticket,
+        nonce: parsed.nonce,
+        kitPublicKey: parsed.kitPublicKey,
+        origin: `${kitInfo.host}:${kitInfo.port}`,
+      };
+    } catch {
+      // The netlog and kit checks below still report the run's real outcome.
+    }
 
     netlogPath = path.join(
       os.tmpdir(),
@@ -470,6 +574,7 @@ async function main(argv) {
       );
       report.netlogOk = netlog.ok;
       report.netlogNames = netlog.names;
+      report.acceptedIpv6Check = netlog.acceptedIpv6Check;
       report.netlogUnexpected = netlog.unexpected;
       report.netlogUnexpectedDetails = netlog.unexpectedDetails;
       report.netlogUnexpectedByName = netlog.unexpectedByName;
@@ -502,19 +607,20 @@ async function main(argv) {
       report.netlogError = error.message;
     }
 
-    captureLeftovers(report);
+    captureLeftovers(report, leftoverValues);
     report.ok = run.error === null
       && !run.timedOut
       && run.exitCode === 0
       && report.kitReceived
       && report.netlogOk
-      && report.negativeControlOk;
+      && report.negativeControlOk
+      && !leftoverFailure(report.leftoverHits);
 
     if (run.stdout !== '') process.stdout.write(run.stdout);
     if (run.stderr !== '') process.stderr.write(run.stderr);
   } catch (error) {
     report.error = error.message;
-    captureLeftovers(report);
+    captureLeftovers(report, leftoverValues);
   } finally {
     if (kit !== null) kit.child.kill();
     if (netlogPath !== null) {
@@ -556,9 +662,17 @@ if (require.main === module) {
 }
 
 module.exports = {
+  LEFTOVER_MAX_BYTES,
   findExecutable,
   listTempMatches,
   listFilesUnder,
+  searchLeftovers,
+  findLeftoverHits,
+  scanLeftovers,
+  scanLeftoverFiles,
+  searchLeftoverFiles,
+  leftoverFailure,
+  hasLeftoverFailure,
   captureLeftovers,
   runApplication,
   releaseSmoke,

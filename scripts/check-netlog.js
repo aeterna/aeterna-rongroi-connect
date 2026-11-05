@@ -5,7 +5,8 @@
 // Read Chromium's netlog JSON and list every host it names.  The proof in ADR
 // 0001 section 2 fails when a name other than the paired host and port appears,
 // when the paired host never appears, or when the flow did not request both the
-// policy and the report paths.
+// policy and the report paths.  The owner accepted one narrow exception:
+// Chromium's silent UDP probe of the fixed IPv6 reachability address.
 
 const DEFAULT_PORTS = {
   'http:': '80',
@@ -14,8 +15,17 @@ const DEFAULT_PORTS = {
   'wss:': '443',
 };
 
-const DEFAULT_REQUIRED_PATHS = ['/nakara_rongroi/policy/', '/nakara_rongroi/report/'];
-const BYTE_TRANSFER_TYPE = /_BYTES_(?:SENT|RECEIVED)$/;
+const DEFAULT_REQUIRED_PATHS = [
+  { prefix: '/nakara_rongroi/policy/' },
+  { exact: '/nakara_rongroi/report' },
+];
+const KNOWN_IPV6_CHECK = '[2001:4860:4860::8888]:443';
+const KNOWN_IPV6_HOST = '2001:4860:4860::8888';
+const KNOWN_IPV6_PORT = '443';
+const CHUNKED_REPORT_PATH = '/nakara_rongroi/report/chunk';
+const UDP_SOURCE_TYPES = new Set(['UDP_SOCKET', 'UDP_CLIENT_SOCKET']);
+const REACHABILITY_CHECK_TYPE = 'HOST_RESOLVER_MANAGER_IPV6_REACHABILITY_CHECK';
+const BYTE_TRANSFER_TYPE = /(?:^|_)BYTES(?:_|$)/;
 
 function normalizeHost(value) {
   return String(value)
@@ -196,6 +206,95 @@ function eventTypeName(constants, type) {
   return String(type);
 }
 
+function sourceTypeName(constants, type) {
+  if (typeof type === 'string') return type;
+  const types = constants && constants.logSourceType;
+  if (Array.isArray(types)) return types[type] ?? String(type);
+  if (types !== null && typeof types === 'object') {
+    return types[type] ?? types[String(type)] ?? String(type);
+  }
+  return String(type);
+}
+
+function sourceKey(source) {
+  if (source === null || typeof source !== 'object') return null;
+  const type = source.type === undefined || source.type === null ? '' : source.type;
+  if (source.id !== undefined && source.id !== null) return `id:${source.id}:type:${type}`;
+  try {
+    return `source:${JSON.stringify(source)}`;
+  } catch {
+    return null;
+  }
+}
+
+function pathnameOf(value) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (text === '') return null;
+
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) {
+    try {
+      return new URL(text).pathname;
+    } catch {
+      // Fall through to the hand parser.
+    }
+  }
+
+  let rest = text;
+  const scheme = /^[a-z][a-z0-9+.-]*:\/\//i.exec(rest);
+  if (scheme !== null) rest = rest.slice(scheme[0].length);
+  else if (rest.startsWith('//')) rest = rest.slice(2);
+
+  // A non-hierarchical scheme such as data: has no pathname to match.
+  if (/^[a-z][a-z0-9+.-]*:/i.test(rest)
+      && !/^[a-z][a-z0-9+.-]*:\d+(?:[\/?#]|$)/i.test(rest)) {
+    return null;
+  }
+
+  const slash = rest.search(/[\/?#]/);
+  if (slash === -1) return '/';
+  const path = rest.slice(slash);
+  const end = path.search(/[?#]/);
+  return end === -1 ? path : path.slice(0, end);
+}
+
+function pathRuleKey(rule) {
+  return typeof rule.exact === 'string'
+    ? `exact:${rule.exact}`
+    : `prefix:${rule.prefix}`;
+}
+
+function pathMatches(rule, pathname) {
+  if (typeof pathname !== 'string') return false;
+  if (typeof rule.exact === 'string') {
+    if (pathname === rule.exact) return true;
+    // upload-plan.js sends report/chunk when the sealed report is too large
+    // for one POST; that is the report endpoint, not a different path.
+    return rule.exact === '/nakara_rongroi/report' && pathname === CHUNKED_REPORT_PATH;
+  }
+  if (typeof rule.prefix === 'string') {
+    const prefix = rule.prefix;
+    if (pathname === prefix) return true;
+    // A prefix without a trailing slash still stops at a segment boundary, so
+    // /report does not accept /report-other.
+    return prefix.endsWith('/')
+      ? pathname.startsWith(prefix)
+      : pathname.startsWith(`${prefix}/`);
+  }
+  return false;
+}
+
+function normalizePathRule(value) {
+  if (typeof value === 'string') {
+    return value.endsWith('/') ? { prefix: value } : { exact: value };
+  }
+  if (value !== null && typeof value === 'object') {
+    if (typeof value.exact === 'string') return { exact: value.exact };
+    if (typeof value.prefix === 'string') return { prefix: value.prefix };
+  }
+  return { exact: String(value) };
+}
+
 function parseNetlog(input) {
   if (Buffer.isBuffer(input)) input = input.toString('utf8');
   if (input !== null && typeof input === 'object') return input;
@@ -224,15 +323,18 @@ function parseNetlog(input) {
 }
 
 function requiredPathList(requiredPaths) {
-  if (requiredPaths === undefined || requiredPaths === null) return [...DEFAULT_REQUIRED_PATHS];
+  if (requiredPaths === undefined || requiredPaths === null) {
+    return DEFAULT_REQUIRED_PATHS.map(normalizePathRule);
+  }
   const values = Array.isArray(requiredPaths) ? requiredPaths : [requiredPaths];
-  return values.map((value) => String(value));
+  return values.map(normalizePathRule);
 }
 
 function emptyResult(allowed, paths, error) {
   return {
     ok: false,
     allowedHostPort: allowed === null ? null : allowed.display,
+    acceptedIpv6Check: { sources: 0, connected: false },
     names: [],
     unexpected: [],
     unexpectedDetails: [],
@@ -247,6 +349,73 @@ function emptyResult(allowed, paths, error) {
     missingPaths: paths.slice(),
     error,
   };
+}
+
+function endpointFromValue(value, port) {
+  const parts = splitHostPort(value);
+  if (parts === null) return null;
+  return {
+    host: parts.host,
+    port: parts.port !== null
+      ? parts.port
+      : (port === undefined || port === null ? null : String(port)),
+  };
+}
+
+function isConnectEvent(typeName) {
+  return /(?:^|_)CONNECT(?:_|$)/.test(typeName);
+}
+
+function connectSucceeded(params) {
+  const value = params.net_error;
+  if (value === undefined || value === null) return true;
+  if (typeof value === 'number') return value === 0;
+  if (typeof value === 'string') return value === '' || value === '0' || /^OK$/i.test(value);
+  return false;
+}
+
+function connectEndpoints(params) {
+  const eventPort = params.port ?? params.remote_port ?? null;
+  const values = [];
+
+  if (typeof params.address === 'string') {
+    values.push([params.address, params.port ?? eventPort]);
+  }
+  if (typeof params.remote_address === 'string') {
+    values.push([params.remote_address, params.remote_port ?? eventPort]);
+  }
+  if (typeof params.host === 'string') values.push([params.host, eventPort]);
+  if (typeof params.ip === 'string') values.push([params.ip, eventPort]);
+
+  if (params.address_list !== undefined) {
+    const items = Array.isArray(params.address_list) ? params.address_list : [params.address_list];
+    for (const item of items) {
+      if (typeof item === 'string') {
+        values.push([item, eventPort]);
+      } else if (item !== null && typeof item === 'object') {
+        const port = item.port ?? eventPort;
+        for (const key of ['address', 'ip', 'host', 'name', 'value']) {
+          if (typeof item[key] === 'string') {
+            values.push([item[key], port]);
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  const endpoints = [];
+  for (const [value, port] of values) {
+    const endpoint = endpointFromValue(value, port);
+    if (endpoint !== null) endpoints.push(endpoint);
+  }
+  return endpoints;
+}
+
+function isKnownIpv6Endpoint(endpoint) {
+  return endpoint !== null
+    && endpoint.host === KNOWN_IPV6_HOST
+    && endpoint.port === KNOWN_IPV6_PORT;
 }
 
 // Pure check of one netlog.  json is the file text (or an already parsed
@@ -279,24 +448,10 @@ function checkNetlog(json, host, requiredPaths) {
   let allowedSeen = false;
 
   function notePath(value) {
-    if (typeof value !== 'string') return;
-    for (const path of paths) {
-      if (value.includes(path)) {
-        seenPaths.add(path);
-        continue;
-      }
-      // The direct report request ends at /report, which has no trailing
-      // slash; accept that exact path as the required /report/ prefix.
-      if (path.endsWith('/')) {
-        const withoutSlash = path.slice(0, -1);
-        const index = value.indexOf(withoutSlash);
-        if (index !== -1) {
-          const next = value[index + withoutSlash.length];
-          if (next === undefined || next === '/' || next === '?' || next === '#') {
-            seenPaths.add(path);
-          }
-        }
-      }
+    const pathname = pathnameOf(value);
+    if (pathname === null) return;
+    for (const rule of paths) {
+      if (pathMatches(rule, pathname)) seenPaths.add(pathRuleKey(rule));
     }
   }
 
@@ -335,8 +490,69 @@ function checkNetlog(json, host, requiredPaths) {
     }
   }
 
+  // The one accepted non-paired destination: Chromium's host resolver opens a
+  // UDP socket, connects it to a fixed IPv6 address to learn whether IPv6 is
+  // reachable, and sends no packet.  Identify that source before walking the
+  // events for names, so only a complete, silent source is exempted.
+  const sourceInfo = new Map();
+  let hasReachabilityCheck = false;
+
   for (const event of events) {
     if (event === null || typeof event !== 'object') continue;
+    const typeName = eventTypeName(constants, event.type);
+    if (typeName === REACHABILITY_CHECK_TYPE) hasReachabilityCheck = true;
+
+    const key = sourceKey(event.source);
+    let entry = null;
+    if (key !== null) {
+      entry = sourceInfo.get(key);
+      if (entry === undefined) {
+        entry = {
+          key,
+          sourceType: sourceTypeName(constants, event.source.type),
+          byteTransfer: false,
+          knownConnect: false,
+          otherConnect: false,
+          connectSuccess: false,
+        };
+        sourceInfo.set(key, entry);
+      }
+      if (BYTE_TRANSFER_TYPE.test(typeName)) entry.byteTransfer = true;
+    }
+
+    const params = event.params;
+    if (params === null || typeof params !== 'object' || Array.isArray(params)) continue;
+
+    if (entry !== null && isConnectEvent(typeName)) {
+      const endpoints = connectEndpoints(params);
+      if (endpoints.some(isKnownIpv6Endpoint)) {
+        entry.knownConnect = true;
+        if (connectSucceeded(params)) entry.connectSuccess = true;
+      }
+      if (endpoints.some((endpoint) => !isKnownIpv6Endpoint(endpoint))) {
+        entry.otherConnect = true;
+      }
+    }
+  }
+
+  const acceptedSources = [...sourceInfo.values()].filter((entry) => (
+    UDP_SOURCE_TYPES.has(entry.sourceType)
+    && entry.knownConnect
+    && !entry.otherConnect
+    && !entry.byteTransfer
+    && hasReachabilityCheck
+  ));
+  const acceptedSourceKeys = new Set(acceptedSources.map((entry) => entry.key));
+  const acceptedIpv6Check = {
+    sources: acceptedSources.length,
+    connected: acceptedSources.some((entry) => entry.connectSuccess),
+  };
+
+  for (const event of events) {
+    if (event === null || typeof event !== 'object') continue;
+    const eventSourceKey = sourceKey(event.source);
+    if (eventSourceKey !== null && acceptedSourceKeys.has(eventSourceKey)) continue;
+
     const params = event.params;
     if (params === null || typeof params !== 'object' || Array.isArray(params)) continue;
 
@@ -403,12 +619,13 @@ function checkNetlog(json, host, requiredPaths) {
     };
   });
 
-  const missingPaths = paths.filter((path) => !seenPaths.has(path));
+  const missingPaths = paths.filter((path) => !seenPaths.has(pathRuleKey(path)));
   const anyByteTransfer = unexpectedDetails.some((detail) => detail.byteTransfer);
 
   return {
     ok: unexpectedNames.length === 0 && allowedSeen && missingPaths.length === 0,
     allowedHostPort: allowed.display,
+    acceptedIpv6Check,
     names: [...names].sort(),
     unexpected: unexpectedNames,
     unexpectedDetails,
@@ -426,7 +643,7 @@ function checkNetlog(json, host, requiredPaths) {
     allowedSeen,
     requestUrls: [...requestUrls].sort(),
     requiredPaths: paths,
-    seenPaths: paths.filter((path) => seenPaths.has(path)),
+    seenPaths: paths.filter((path) => seenPaths.has(pathRuleKey(path))),
     missingPaths,
     error: null,
   };
@@ -461,10 +678,13 @@ if (require.main === module) {
 
 module.exports = {
   DEFAULT_REQUIRED_PATHS,
+  KNOWN_IPV6_CHECK,
+  CHUNKED_REPORT_PATH,
   checkNetlog,
   parseNetlog,
   splitHostPort,
   normalizeAllowedHostPort,
   isAllowedName,
   eventTypeName,
+  sourceTypeName,
 };
