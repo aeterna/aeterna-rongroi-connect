@@ -115,8 +115,8 @@ mod platform {
     use windows::Win32::Foundation::{
         CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE,
         ERROR_INVALID_DATA, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
-        ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
-        TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, TRUE,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -404,9 +404,8 @@ mod platform {
             let mut transferred = 0u32;
             // SAFETY: the event is signalled, so the operation has completed.
             // Waiting is harmless here and reaps the completion.
-            return match unsafe {
-                GetOverlappedResult(handle, overlapped, &mut transferred, TRUE)
-            } {
+            return match unsafe { GetOverlappedResult(handle, overlapped, &mut transferred, TRUE) }
+            {
                 Ok(()) => PendingOutcome::Completed(transferred),
                 Err(error) => PendingOutcome::Io(error),
             };
