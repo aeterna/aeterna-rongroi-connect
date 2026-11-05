@@ -76,6 +76,25 @@
     return groups.join(' ');
   }
 
+  // The server decides which collectors to require, so it may name one that
+  // this build has no sentence for. Show the id in that case rather than hide
+  // the collector from the consent list.
+  function collectorName(t, collector) {
+    var id = collector === null || collector === undefined ? '' : String(collector);
+    var key = 'collector.' + id;
+    var name = null;
+    try {
+      name = t(key);
+    } catch (error) {
+      name = null;
+    }
+    if (name === null || name === undefined || String(name) === ''
+        || String(name) === key) {
+      return id;
+    }
+    return String(name);
+  }
+
   function button(t, action, label, variant) {
     var classes = variant === 'primary'
       ? 'button button-primary'
@@ -159,7 +178,7 @@
       ]),
       element('h2', { class: 'subsection' }, [textNode(t('consent.collectors'))]),
       element('ul', { class: 'collectors' }, collectors.map(function (collector) {
-        return element('li', {}, [textNode(collector)]);
+        return element('li', {}, [textNode(collectorName(t, collector))]);
       })),
       element('p', { class: 'lede' }, [
         textNode(state.elevation ? t('consent.elevationYes') : t('consent.elevationNo')),
@@ -193,7 +212,9 @@
 
   function renderHash(state, t) {
     return screen(state, [
+      element('p', { class: 'eyebrow hash-label' }, [textNode(t('hash.label'))]),
       element('h1', { class: 'hash' }, [textNode(groupHash(state.visualHash))]),
+      element('p', { class: 'hint hash-hint' }, [textNode(t('hash.hint'))]),
       element('details', { class: 'record' }, [
         element('summary', {}, [textNode(t('hash.see'))]),
         element('pre', { class: 'record-text' }, [textNode(state.recordText)]),

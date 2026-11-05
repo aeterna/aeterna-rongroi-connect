@@ -16,6 +16,31 @@ const ORIGIN = 'http://127.0.0.1:30120';
 const HASH = '0123456789abcdef';
 const RECORD = '{"binding":"example","policy":"posture"}';
 const RESULT_WORDS = /verified|clean|passed|safe|ผ่าน|ปลอดภัย|สะอาด/i;
+const COLLECTOR_IDS = [
+  'posture',
+  'powershell_text',
+  'driver_service',
+  'antivirus_product',
+  'autostart',
+  'defender_exclusion',
+  'fivem_dir',
+  'net_config',
+  'os_image',
+  'install_marker',
+  'process',
+  'evtx',
+  'prefetch',
+  'bam',
+  'pca',
+  'userassist',
+  'pci_device',
+  'hid_device',
+  'windows_start',
+  'event_fields',
+  'usn',
+  'fivem_servers',
+  'recorded_files',
+];
 
 function makeT(messages) {
   return function t(key, params) {
@@ -225,7 +250,7 @@ test('consent shows the origin large, the server name as text, collectors and co
   assert.ok(list, 'collectors are a list');
   assert.deepEqual(
     list.children.map(function (item) { return texts(item).join(''); }),
-    ['posture', 'os_image'],
+    [en['collector.posture'], en['collector.os_image']],
   );
 
   assert.match(flatText(tree), new RegExp(en['consent.elevationYes']));
@@ -248,6 +273,56 @@ test('consent omits the elevation sentence it does not apply and hides the local
   assert.match(flatText(tree), new RegExp(en['consent.elevationNo']));
   assert.equal(flatText(tree).includes(en['consent.localAddress']), false);
   assert.equal(find(tree, function (node) { return node.attrs.class === 'warning'; }), null);
+});
+
+test('both locales name every collector the server can ask for', function () {
+  for (const [locale, messages] of Object.entries(LOCALES)) {
+    for (const id of COLLECTOR_IDS) {
+      assert.equal(
+        typeof messages['collector.' + id],
+        'string',
+        `${locale} is missing collector.${id}`,
+      );
+    }
+  }
+});
+
+test('consent shows collector names, not ids, in both locales', function () {
+  for (const [locale, messages] of Object.entries(LOCALES)) {
+    const state = {
+      ...STATES.consent(),
+      collectors: ['antivirus_product'],
+    };
+    const tree = view.render(state, makeT(messages));
+    const list = find(tree, function (node) { return node.tag === 'ul'; });
+    assert.deepEqual(
+      list.children.map(function (item) { return texts(item).join(''); }),
+      [messages['collector.antivirus_product']],
+      `${locale}: antivirus_product is shown by name`,
+    );
+    assert.equal(
+      flatText(tree).includes('antivirus_product'),
+      false,
+      `${locale}: the raw antivirus_product id is not shown`,
+    );
+  }
+});
+
+test('consent shows an unknown collector id instead of hiding it', function () {
+  for (const [locale, messages] of Object.entries(LOCALES)) {
+    const state = {
+      ...STATES.consent(),
+      collectors: ['not_a_collector'],
+    };
+    const tree = view.render(state, makeT(messages));
+    const list = find(tree, function (node) { return node.tag === 'ul'; });
+    assert.deepEqual(
+      list.children.map(function (item) { return texts(item).join(''); }),
+      ['not_a_collector'],
+      `${locale}: an unknown collector is not hidden`,
+    );
+    assert.equal(flatText(tree).includes('collector.not_a_collector'), false);
+  }
 });
 
 test('scanning uses the permission sentence while elevation is pending', function () {
@@ -283,6 +358,32 @@ test('hash is grouped 4x4 and the details panel holds the record as text', funct
   assert.deepEqual(all.map(function (item) { return item.action; }), ['send', 'quit']);
   assert.equal(primaryCount(tree), 1);
   assert.equal(all[0].classes.includes('button-primary'), true);
+});
+
+test('hash names the code above it and explains sending below it, in both locales', function () {
+  for (const [locale, messages] of Object.entries(LOCALES)) {
+    const tree = view.render(STATES.hash(), makeT(messages));
+    const label = find(tree, function (node) {
+      return node.tag === 'p' && node.text === messages['hash.label'];
+    });
+    const hint = find(tree, function (node) {
+      return node.tag === 'p' && node.text === messages['hash.hint'];
+    });
+    const hash = find(tree, function (node) {
+      return node.tag === 'h1' && /\bhash\b/.test(node.attrs.class || '');
+    });
+    assert.ok(label, `${locale}: hash has a label`);
+    assert.ok(hint, `${locale}: hash has a hint`);
+    assert.ok(hash, `${locale}: hash has the code block`);
+
+    const order = [];
+    walk(tree, function (node) {
+      if (node === label) order.push('label');
+      if (node === hash) order.push('hash');
+      if (node === hint) order.push('hint');
+    });
+    assert.deepEqual(order, ['label', 'hash', 'hint'], `${locale}: label is above and hint below`);
+  }
 });
 
 test('uploading shows progress when it has it and a sentence otherwise', function () {
@@ -406,6 +507,25 @@ test('app builds nodes without markup and chooses the locale from navigator.lang
   assert.match(source, /window\.connect\.send/);
   assert.match(source, /window\.connect\.quit/);
   assert.equal(/eval\s*\(|new Function/.test(source), false);
+});
+
+test('the app locale mirror carries the collector names and hash lines for both languages', function () {
+  const source = fs.readFileSync(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  for (const id of COLLECTOR_IDS) {
+    assert.equal(
+      (source.match(new RegExp(`"collector.${id}":`, 'g')) || []).length,
+      2,
+      `app mirror is missing an en or th entry for collector.${id}`,
+    );
+  }
+  for (const key of ['hash.label', 'hash.hint']) {
+    const marker = `"${key}":`;
+    assert.equal(
+      source.split(marker).length - 1,
+      2,
+      `app mirror is missing an en or th entry for ${key}`,
+    );
+  }
 });
 
 test('the stylesheet keeps the product tokens, the Thai font stack and no motion', function () {
