@@ -24,8 +24,19 @@ test('orders keys by UTF-16 code units and escapes JSON strings', () => {
   assert.equal(canonicalize('é😀/'), '"é😀/"');
 });
 
-test('uses ECMAScript number formatting', () => {
-  assert.equal(canonicalize({ n: [1, -0, 1e21, 1e-7] }), '{"n":[1,0,1e+21,1e-7]}');
+test('uses ECMAScript number formatting for integers', () => {
+  assert.equal(canonicalize({ n: [1, -0, 1e21] }), '{"n":[1,0,1e+21]}');
+  assert.equal(
+    canonicalize({ n: [Number.MAX_SAFE_INTEGER] }),
+    '{"n":[9007199254740991]}',
+  );
+});
+
+test('refuses a non-integer number', () => {
+  assert.throws(() => canonicalize(1.5), TypeError);
+  assert.throws(() => canonicalize({ n: [1.5] }), TypeError);
+  assert.throws(() => canonicalize(1e-7), TypeError);
+  assert.throws(() => policyHash({ score: 1.5 }), TypeError);
 });
 
 test('policyHash covers the canonical policy without policy_hash', () => {

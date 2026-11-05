@@ -7,6 +7,7 @@ const { actionForStatus, planUpload } = require('../core/upload-plan');
 
 const PATH_PREFIX = '/nakara_rongroi/';
 const MAX_RATE_LIMIT_WAITS = 4;
+const MAX_RESPONSE_BYTES = 64 * 1024;
 const STATUS_CODES = Object.freeze({
   400: 'bad_request',
   404: 'unknown_ticket',
@@ -103,11 +104,65 @@ function defaultSleep(millis) {
   return new Promise((resolve) => setTimeout(resolve, millis));
 }
 
+function saysRedirect(value) {
+  if (typeof value === 'string') return /redirect/i.test(value);
+  if (value === null || typeof value !== 'object') return false;
+  for (const field of [value.code, value.name, value.message]) {
+    if (typeof field === 'string' && /redirect/i.test(field)) return true;
+  }
+  return saysRedirect(value.cause);
+}
+
+async function cancelResponseBody(body) {
+  if (body === null || body === undefined) return;
+  try {
+    if (typeof body.cancel === 'function') {
+      await body.cancel();
+    } else if (typeof body.getReader === 'function') {
+      await body.getReader().cancel();
+    }
+  } catch {
+    // The body is already unusable; the caller's error is the important one.
+  }
+}
+
+async function readResponseBody(response, url) {
+  const body = response.body;
+  if (body !== null && body !== undefined && typeof body.getReader === 'function') {
+    const reader = body.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === null || value === undefined) continue;
+      const chunk = Buffer.from(value);
+      total += chunk.length;
+      if (total > MAX_RESPONSE_BYTES) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The stream is already closing; the size is still an error.
+        }
+        fail('response_too_large', `response from ${url.pathname} exceeds ${MAX_RESPONSE_BYTES} bytes`);
+      }
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks, total);
+  }
+
+  const array = await response.arrayBuffer();
+  if (array.byteLength > MAX_RESPONSE_BYTES) {
+    fail('response_too_large', `response from ${url.pathname} exceeds ${MAX_RESPONSE_BYTES} bytes`);
+  }
+  return Buffer.from(array);
+}
+
 class PairedClient {
   constructor({
     origin,
     ticket,
-    fetchImpl = globalThis.fetch,
+    fetchImpl,
     now,
     sleep = defaultSleep,
     timeoutMs = 15000,
@@ -163,26 +218,32 @@ class PairedClient {
     }, this.timeoutMs);
 
     try {
-      const response = await this.fetchImpl(url.href, {
+      const options = {
         ...init,
-        redirect: 'manual',
+        redirect: 'error',
         signal: controller.signal,
-      });
+      };
+      const method = typeof options.method === 'string' ? options.method.toUpperCase() : 'GET';
+      if (method === 'POST' && options.body !== undefined && options.body !== null
+          && !Buffer.isBuffer(options.body)) {
+        options.body = Buffer.from(options.body);
+      }
+
+      const response = await this.fetchImpl(url.href, options);
 
       if (response.type === 'opaqueredirect'
           || (response.status >= 300 && response.status < 400)) {
-        try {
-          await response.body?.cancel();
-        } catch {
-          // The body is already unusable; the redirect itself is the error.
-        }
+        await cancelResponseBody(response.body);
         fail('redirect_refused', `redirect from ${url.pathname} refused`);
       }
 
-      const bytes = Buffer.from(await response.arrayBuffer());
+      const bytes = await readResponseBody(response, url);
       return { status: response.status, headers: response.headers, bytes };
     } catch (error) {
       if (error instanceof ConnectError) throw error;
+      if (saysRedirect(error)) {
+        fail('redirect_refused', `redirect from ${url.pathname} refused`, { cause: error });
+      }
       if (timedOut || (error !== null && error !== undefined && error.name === 'AbortError')) {
         fail('timeout', `request to ${url.pathname} timed out`);
       }
@@ -232,11 +293,19 @@ class PairedClient {
     let restarted = false;
     for (;;) {
       const outcome = await this.sendPlan(plan);
-      if (outcome !== 'restart') return { status: 'accepted' };
-      if (restarted) fail('upload_refused', 'the server asked to restart a second time');
+      if (outcome.action === 'ok') return { status: 'accepted' };
+      if (restarted) {
+        const options = outcome.cause === undefined ? undefined : { cause: outcome.cause };
+        fail(outcome.code, outcome.message, options);
+      }
       if (!this.hasTime()) fail('expired', 'the ticket expired before the upload could restart');
       restarted = true;
     }
+  }
+
+  async decline(sealedBytes) {
+    await this.upload(sealedBytes);
+    return { status: 'declined' };
   }
 
   rememberExpiry(policy, dateHeader) {
@@ -258,14 +327,15 @@ class PairedClient {
     }
     for (const slice of plan.slices) {
       const outcome = await this.send(plan.endpoint, slice.data, slice.headers, plan.retryDelaysMs);
-      if (outcome === 'restart') return 'restart';
+      if (outcome.action === 'restart') return outcome;
     }
-    return 'ok';
+    return { action: 'ok' };
   }
 
   async send(endpoint, data, headers, retryDelaysMs) {
     let backoff = 0;
     let rateLimitWaits = 0;
+    const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
 
     for (;;) {
       let response;
@@ -273,18 +343,19 @@ class PairedClient {
         response = await this.request(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/octet-stream', ...headers },
-          body: data,
+          body,
         });
       } catch (error) {
         const retryable = error instanceof ConnectError
           && (error.code === 'network' || error.code === 'timeout');
         if (!retryable) throw error;
         if (backoff >= retryDelaysMs.length) {
-          fail(
-            error.code,
-            `upload failed after ${retryDelaysMs.length} retries`,
-            { cause: error },
-          );
+          return {
+            action: 'restart',
+            code: error.code,
+            message: `upload failed after ${retryDelaysMs.length} retries`,
+            cause: error,
+          };
         }
         await this.sleep(retryDelaysMs[backoff]);
         backoff += 1;
@@ -292,8 +363,14 @@ class PairedClient {
       }
 
       const action = actionForStatus(response.status, response.headers.get('retry-after'));
-      if (action.action === 'continue') return 'ok';
-      if (action.action === 'restart') return 'restart';
+      if (action.action === 'continue') return { action: 'ok' };
+      if (action.action === 'restart') {
+        return {
+          action: 'restart',
+          code: 'upload_refused',
+          message: 'the server asked to restart the upload',
+        };
+      }
 
       if (action.action === 'wait') {
         const delay = action.retryAfterMs === null ? 1000 : action.retryAfterMs;
@@ -310,7 +387,11 @@ class PairedClient {
 
       if (action.action === 'retry') {
         if (backoff >= retryDelaysMs.length) {
-          fail('server_error', `upload failed with status ${response.status}`);
+          return {
+            action: 'restart',
+            code: 'server_error',
+            message: `upload failed with status ${response.status}`,
+          };
         }
         await this.sleep(retryDelaysMs[backoff]);
         backoff += 1;
@@ -326,3 +407,4 @@ module.exports = PairedClient;
 module.exports.PairedClient = PairedClient;
 module.exports.ConnectError = ConnectError;
 module.exports.buildUrl = buildUrl;
+module.exports.MAX_RESPONSE_BYTES = MAX_RESPONSE_BYTES;

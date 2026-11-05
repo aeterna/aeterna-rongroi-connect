@@ -16,6 +16,10 @@ function canonicalize(value) {
   if (type === 'boolean') return value ? 'true' : 'false';
   if (type === 'number') {
     if (!Number.isFinite(value)) throw new TypeError('JCS cannot serialize a non-finite number');
+    // rongroi-core refuses numbers that are not integers. JSON.stringify
+    // would silently print 1.5, so refuse it here too; integers keep the
+    // ECMAScript number formatting required by RFC 8785.
+    if (!Number.isInteger(value)) throw new TypeError('JCS cannot serialize a non-integer number');
     return JSON.stringify(value);
   }
   if (type === 'string') return JSON.stringify(value);

@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const { createHash } = require('node:crypto');
 const { policyHash } = require('../src/core/canonical');
-const { PairedClient, ConnectError } = require('../src/main/net');
+const { PairedClient, ConnectError, MAX_RESPONSE_BYTES } = require('../src/main/net');
 
 const TICKET = '9f82c4e1b07a412891d604e38a291bf0';
 const POLICY = {
@@ -31,7 +31,7 @@ function makeClient(origin, options = {}) {
   return new PairedClient({
     origin,
     ticket: TICKET,
-    fetchImpl: options.fetchImpl,
+    fetchImpl: options.fetchImpl ?? globalThis.fetch,
     now: options.now,
     sleep: options.sleep,
     timeoutMs: options.timeoutMs ?? 5000,
@@ -111,6 +111,102 @@ test('refuses a redirect instead of following it', async () => {
   });
 });
 
+test('asks fetch for redirect: error and maps a rejected redirect', async () => {
+  let seen;
+  const client = makeClient('http://127.0.0.1:9', {
+    fetchImpl: async (url, init) => {
+      seen = init;
+      const error = new TypeError('fetch failed');
+      error.cause = Object.assign(new Error('unexpected redirect'), {
+        code: 'unexpected-redirect',
+      });
+      throw error;
+    },
+  });
+
+  await assert.rejects(client.request(`policy/${TICKET}`), isCode('redirect_refused'));
+  assert.equal(seen.redirect, 'error');
+});
+
+test('refuses a 3xx response that still arrives and cancels its body', async () => {
+  let cancelled = false;
+  const client = makeClient('http://127.0.0.1:9', {
+    fetchImpl: async () => ({
+      status: 302,
+      headers: new Headers(),
+      body: new ReadableStream({
+        cancel() {
+          cancelled = true;
+        },
+      }),
+    }),
+  });
+
+  await assert.rejects(client.request(`policy/${TICKET}`), isCode('redirect_refused'));
+  assert.equal(cancelled, true);
+});
+
+test('requires an injected fetch implementation', () => {
+  assert.throws(
+    () => new PairedClient({ origin: 'http://127.0.0.1:9', ticket: TICKET }),
+    isCode('bad_fetch'),
+  );
+});
+
+test('reads the body stream and refuses more than 64 KiB', async () => {
+  let cancelled = false;
+  const client = makeClient('http://127.0.0.1:9', {
+    fetchImpl: async () => ({
+      status: 200,
+      headers: new Headers(),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array(MAX_RESPONSE_BYTES));
+          controller.enqueue(new Uint8Array(1));
+          // Stay open so the reader's cancel reaches the source.
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }),
+    }),
+  });
+
+  await assert.rejects(client.request(`policy/${TICKET}`), isCode('response_too_large'));
+  assert.equal(cancelled, true);
+});
+
+test('falls back to arrayBuffer for a body without a stream and applies the cap', async () => {
+  const client = makeClient('http://127.0.0.1:9', {
+    fetchImpl: async () => ({
+      status: 200,
+      headers: new Headers(),
+      body: null,
+      arrayBuffer: async () => new ArrayBuffer(MAX_RESPONSE_BYTES + 1),
+    }),
+  });
+
+  await assert.rejects(client.request(`policy/${TICKET}`), isCode('response_too_large'));
+});
+
+test('accepts a body of exactly 64 KiB', async () => {
+  const client = makeClient('http://127.0.0.1:9', {
+    fetchImpl: async () => ({
+      status: 200,
+      headers: new Headers(),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array(MAX_RESPONSE_BYTES));
+          controller.close();
+        },
+      }),
+    }),
+  });
+
+  const response = await client.request(`policy/${TICKET}`);
+  assert.equal(response.bytes.length, MAX_RESPONSE_BYTES);
+});
+
 test('refuses another origin in the constructor and on every call', async () => {
   assert.throws(
     () => new PairedClient({ origin: 'http://example.com/path', ticket: TICKET }),
@@ -151,6 +247,7 @@ test('uploads a small envelope directly', async () => {
     assert.equal(requests[0].url, '/nakara_rongroi/report');
     assert.equal(requests[0].headers['x-rongroi-upload-id'], TICKET);
     assert.equal(requests[0].headers['x-rongroi-report-sha256'], sha256(envelope));
+    assert.equal(requests[0].headers['content-length'], String(envelope.length));
     assert.deepEqual(requests[0].body, envelope);
   });
 });
@@ -180,8 +277,36 @@ test('chunks 9000 bytes into 3 slices with the required headers', async () => {
       assert.equal(request.headers['x-rongroi-chunk-total'], '3');
       assert.equal(request.headers['x-rongroi-chunk-sha256'], sha256(request.body));
       assert.equal(request.headers['x-rongroi-report-sha256'], sha256(envelope));
+      assert.equal(request.headers['content-length'], String(request.body.length));
     }
     assert.deepEqual(Buffer.concat(requests.map((request) => request.body)), envelope);
+  });
+});
+
+test('passes every POST body as a Buffer and never sets Content-Length itself', async () => {
+  const bodies = [];
+  const headerSets = [];
+  const fetchImpl = (url, init) => {
+    bodies.push(init.body);
+    headerSets.push(init.headers);
+    return globalThis.fetch(url, init);
+  };
+
+  await withServer((req, res) => {
+    res.writeHead(200);
+    res.end('ok');
+  }, async (origin) => {
+    const client = makeClient(origin, { fetchImpl });
+    await client.upload(Buffer.alloc(9000, 7));
+
+    assert.equal(bodies.length, 3);
+    for (const body of bodies) assert.ok(Buffer.isBuffer(body));
+    for (const headers of headerSets) {
+      assert.equal(
+        Object.keys(headers).some((name) => name.toLowerCase() === 'content-length'),
+        false,
+      );
+    }
   });
 });
 
@@ -216,6 +341,73 @@ test('does not restart a second time after a 422', async () => {
     const client = makeClient(origin);
     await assert.rejects(client.upload(Buffer.alloc(9000)), isCode('upload_refused'));
     assert.equal(requests.length, 2);
+  });
+});
+
+test('restarts the whole upload once after a 5xx uses up its retries', async () => {
+  const sleeps = [];
+  const envelope = Buffer.alloc(9000, 3);
+
+  await withServer((req, res, entry, all) => {
+    const index = entry.headers['x-rongroi-chunk-index'];
+    const firstAttempts = all.filter(
+      (request) => request.headers['x-rongroi-chunk-index'] === '0',
+    ).length;
+    if (firstAttempts === 1 && index === '2') {
+      res.writeHead(500);
+      res.end('save failed');
+      return;
+    }
+    res.writeHead(200);
+    res.end('ok');
+  }, async (origin, requests) => {
+    const client = makeClient(origin, { sleep: async (ms) => { sleeps.push(ms); } });
+    const result = await client.upload(envelope);
+
+    assert.deepEqual(result, { status: 'accepted' });
+    assert.equal(requests.length, 9);
+    assert.deepEqual(
+      requests.map((request) => request.headers['x-rongroi-chunk-index']),
+      ['0', '1', '2', '2', '2', '2', '0', '1', '2'],
+    );
+    assert.deepEqual(sleeps, [500, 1500, 3000]);
+  });
+});
+
+test('fails with server_error after exactly one restart when a 5xx never clears', async () => {
+  const envelope = Buffer.alloc(9000, 3);
+
+  await withServer((req, res) => {
+    res.writeHead(500);
+    res.end('save failed');
+  }, async (origin, requests) => {
+    const client = makeClient(origin, { sleep: async () => {} });
+    await assert.rejects(client.upload(envelope), isCode('server_error'));
+
+    assert.equal(requests.length, 8);
+    assert.deepEqual(
+      requests.map((request) => request.headers['x-rongroi-chunk-index']),
+      ['0', '0', '0', '0', '0', '0', '0', '0'],
+    );
+  });
+});
+
+test('uploads a sealed declined answer through the same plan', async () => {
+  const sealed = Buffer.from('a sealed declined answer');
+
+  await withServer((req, res) => {
+    res.writeHead(200);
+    res.end('ok');
+  }, async (origin, requests) => {
+    const client = makeClient(origin);
+    const result = await client.decline(sealed);
+
+    assert.deepEqual(result, { status: 'declined' });
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].method, 'POST');
+    assert.equal(requests[0].url, '/nakara_rongroi/report');
+    assert.equal(requests[0].headers['x-rongroi-upload-id'], TICKET);
+    assert.deepEqual(requests[0].body, sealed);
   });
 });
 
@@ -257,7 +449,7 @@ test('times out a policy request', async () => {
   });
 });
 
-test('retries upload timeouts on the schedule, then fails', async () => {
+test('retries lost answers on the schedule, restarts once, then fails', async () => {
   const sleeps = [];
   await withServer(() => {}, async (origin, requests) => {
     const client = makeClient(origin, {
@@ -266,7 +458,17 @@ test('retries upload timeouts on the schedule, then fails', async () => {
     });
     await assert.rejects(client.upload(Buffer.from('direct')), isCode('timeout'));
 
-    assert.deepEqual(sleeps, [500, 1500, 3000]);
-    assert.equal(requests.length, 4);
+    assert.deepEqual(sleeps, [500, 1500, 3000, 500, 1500, 3000]);
+    assert.equal(requests.length, 8);
+  });
+});
+
+test('refuses a policy holding a non-integer number', async () => {
+  await withServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ...POLICY, policy_hash: '1111111111111111', score: 1.5 }));
+  }, async (origin) => {
+    const client = makeClient(origin);
+    await assert.rejects(client.getPolicy(POLICY_HASH), isCode('bad_policy'));
   });
 });
