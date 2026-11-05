@@ -29,7 +29,7 @@ jobs:
       - name: Tests
         run: npm test
       - name: Licensing (REUSE)
-        run: pipx run --spec reuse reuse lint
+        run: pipx run --spec reuse==6.3.0 reuse lint
 
   pipe:
     name: pipe module (windows)
@@ -41,6 +41,8 @@ jobs:
           persist-credentials: false
       - name: Rust toolchain
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           rustup toolchain install 1.98.1 --profile minimal --component clippy --component rustfmt
           rustup default 1.98.1
       - name: Format
@@ -52,6 +54,8 @@ jobs:
       - name: Banned crates
         working-directory: native/pipe
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo install cargo-deny --version 0.20.2 --locked
           cargo deny --config deny.toml check bans
       - name: Tests on a real pipe
@@ -72,6 +76,8 @@ jobs:
           node-version: "24"
       - name: Rust toolchain
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           rustup toolchain install 1.98.1 --profile minimal
           rustup default 1.98.1
       - name: Install without running package scripts
@@ -88,7 +94,7 @@ jobs:
         run: npm run e2e
       - name: The netlog check can fail
         run: node scripts/run-e2e.js dist/test --negative-control
-      - name: The release folder starts
+      - name: The release folder stays running for 8 seconds
         run: node scripts/run-e2e.js --release-smoke dist/release
       - name: Keep the report
         if: always()
@@ -98,4 +104,6 @@ jobs:
           path: |
             e2e-report.json
             e2e-netlog.json
+            e2e-negative-report.json
+            e2e-negative-netlog.json
           if-no-files-found: warn

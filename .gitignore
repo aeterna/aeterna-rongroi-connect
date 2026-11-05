@@ -8,3 +8,5 @@ target/
 native/pipe/*.node
 native/pipe/target/
 e2e-report.json
+e2e-negative-report.json
+e2e-negative-netlog.json

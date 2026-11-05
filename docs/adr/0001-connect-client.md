@@ -331,9 +331,25 @@ Differences from the sections above, each found while building:
 
   `--enable-features` with `EnableIPv6ReachabilityOverride` or `kEnableIPv6ReachabilityOverride` did not stop the check on the Mac. No `disable-ipv6` switch string was found in the binary. Whether another way exists is unknown.
 
-  The netlog check accepts this one socket only when its type is UDP, its address and port are exactly that, it has no byte event, and the log holds Chromium's IPv6 reachability check event. Any other case fails the job.
+  The netlog shows this socket at two layers, as a `UDP_SOCKET` source and a `UDP_CLIENT_SOCKET` source. The netlog check accepts them only when the type is UDP, the address and port are exactly that, the source holds only open, connect, local-address and alive events (so no bytes and no send or receive attempt, failed or not), and the log holds Chromium's IPv6 reachability check event. Any other case fails the job.
 
   **Windows with a working IPv6 route is unmeasured.** Before 0.1.0, lane 3c measures it with `pktmon` and a control that sends. A packet to that address ends this exception, and 0.1.0 does not ship until that is resolved. Until then nothing public says Connect contacts nobody else.
+- **Files left in `%TEMP%` after a normal exit (hosted Windows runner, Electron 44.10.2, the mock flow, run 42021779777 on `1991908`).** The delete in `will-quit` does not finish: the folder stays with 20 files, 115,883 bytes. Why is not proven; files Chromium still holds open is the likely cause (section 3). The stale sweep removes the folder on a later run, once its pid is gone and it is more than 10 minutes old, so a player who never runs Connect again keeps it until Windows' own temp cleanup.
+
+  | Under the folder | Files | Bytes |
+  |---|---|---:|
+  | `Shared Dictionary\db`, `db-journal`, `cache\index`, `cache\index-dir\the-real-index` | 4 | 45,128 |
+  | `Network\Trust Tokens`, `Trust Tokens-journal`, `Network Persistent State`, `NetworkDataMigrated` | 4 | 36,975 |
+  | `declarative_performance_observer.db`, `-journal` | 2 | 32,768 |
+  | `Local Storage\leveldb\` `000003.log`, `CURRENT`, `LOCK`, `LOG`, `MANIFEST-000001` | 5 | 402 |
+  | `Local State`, `Preferences` | 2 | 610 |
+  | `GPUPersistentCache\DawnGraphiteCache\<id>\` | 3 | 0 |
+
+  The e2e job searches every leftover file up to 1 MiB for the run's ticket, nonce, Kit key and origin, as plain UTF-8 and UTF-16LE: no hits in this run. A ticket, nonce or key hit fails the job; an origin hit is only reported. Larger or unreadable files are listed in the report as not searched, and a value stored compressed or encoded would not be found. That is a search for those four values in a mock flow, not proof about a real scan, and the real sidecar's run is lane 3c's to repeat. S12's HTTP, code and shader caches and the dictionary did not appear.
+
+  This list is what remained after the delete, not everything Chromium wrote during the run. A crash can leave more.
+
+- **What the release smoke shows.** The release folder's exe stayed running for 8 seconds, with embedded asar integrity on. It does not show that the window drew or that the release build completes a flow, since the test hook is not in it. The byte comparison with the test build carries the rest.
 
 ## Consequences
 
