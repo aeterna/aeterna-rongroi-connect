@@ -321,6 +321,19 @@ Differences from the sections above, each found while building:
 - A 5xx or a lost answer that uses up its retries restarts the whole upload once while the ticket has time left, as 422 does, then is an error. Server Kit answers 500 when saving failed and has dropped its buffer, so repeating one slice cannot work (section 4's table says retry, then error).
 - A lost-answer or partial upload error says part of the report may have reached the server, since some slices may have been accepted.
 - Electron is 44.10.2, not the spike's 44.7.1: `npm audit` reported a high advisory on the earlier version.
+- **One known socket, accepted by the owner (2026-11-05).** Section 2's job fails on any socket naming anything but the paired host. Chromium's host resolver opens one UDP socket and connects it to `[2001:4860:4860::8888]:443`, a Google public DNS address, to learn whether IPv6 is reachable, even for a request to an IP address. So Connect opens a socket toward that address, and sends nothing on it, as measured below. This is weaker than "no socket", and nothing here may say otherwise.
+
+  | Where (Electron 44.10.2) | IPv6 route | Connect result | Packets to that address |
+  |---|---|---|---|
+  | This repo's hosted Windows runner | none | `net_error -109` | netlog: no byte events. Not captured by the OS |
+  | Development PC, Windows, `pktmon` | none (Teredo and Tailscale only) | `net_error -109` | none seen, but the control could not send either, so this shows nothing beyond "no route, nothing leaves" |
+  | MacBook, macOS, `tcpdump` | yes | connected, `ipv6_available: true` | **0**, with a control that sent 1 byte and captured 1 packet |
+
+  `--enable-features` with `EnableIPv6ReachabilityOverride` or `kEnableIPv6ReachabilityOverride` did not stop the check on the Mac. No `disable-ipv6` switch string was found in the binary. Whether another way exists is unknown.
+
+  The netlog check accepts this one socket only when its type is UDP, its address and port are exactly that, it has no byte event, and the log holds Chromium's IPv6 reachability check event. Any other case fails the job.
+
+  **Windows with a working IPv6 route is unmeasured.** Before 0.1.0, lane 3c measures it with `pktmon` and a control that sends. A packet to that address ends this exception, and 0.1.0 does not ship until that is resolved. Until then nothing public says Connect contacts nobody else.
 
 ## Consequences
 
