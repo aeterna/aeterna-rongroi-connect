@@ -6,6 +6,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 - Status: accepted — owner, 2026-11-01 (local-address origins and the 14-day patch rule accepted)
 - Date: 2026-11-01
+- Amended: 2026-11-05, lane 2c as built ("As built: 2c"); Claude Code - Claude Opus 5.5
 - Related: aeterna-rongroi ADR 0089 (product line and schema 2,
   [aeterna-rongroi#252](https://github.com/aeterna/aeterna-rongroi/pull/252), not merged yet; this ADR follows
   its revision of 2026-11-01), ADR 0002 (evidence, never a verdict), ADR 0007 (official builds), ADR 0012
@@ -311,6 +312,15 @@ update alone is a patch.
 
 A persistent or background mode (its own ADR, owner decision Q17); auto-update of any kind; Hub; an installer;
 code signing; macOS and Linux builds.
+
+## As built: 2c
+
+Differences from the sections above, each found while building:
+
+- The preload also exposes `retry()`, for the error state's "Try again". Section 1's table listed five calls and `onState`.
+- A 5xx or a lost answer that uses up its retries restarts the whole upload once while the ticket has time left, as 422 does, then is an error. Server Kit answers 500 when saving failed and has dropped its buffer, so repeating one slice cannot work (section 4's table says retry, then error).
+- A lost-answer or partial upload error says part of the report may have reached the server, since some slices may have been accepted.
+- Electron is 44.10.2, not the spike's 44.7.1: `npm audit` reported a high advisory on the earlier version.
 
 ## Consequences
 

@@ -49,6 +49,11 @@ jobs:
       - name: Clippy
         working-directory: native/pipe
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Banned crates
+        working-directory: native/pipe
+        run: |
+          cargo install cargo-deny --version 0.18.9 --locked
+          cargo deny --config deny.toml check bans
       - name: Tests on a real pipe
         working-directory: native/pipe
         run: cargo test --locked
@@ -81,10 +86,16 @@ jobs:
         run: node scripts/compare-builds.js dist/release dist/test
       - name: Run the whole flow and check the netlog
         run: npm run e2e
+      - name: The netlog check can fail
+        run: node scripts/run-e2e.js dist/test --negative-control
+      - name: The release folder starts
+        run: node scripts/run-e2e.js --release-smoke dist/release
       - name: Keep the report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-report
-          path: e2e-report.json
+          path: |
+            e2e-report.json
+            e2e-netlog.json
           if-no-files-found: warn
