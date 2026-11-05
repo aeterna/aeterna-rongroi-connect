@@ -25,7 +25,18 @@ const KNOWN_IPV6_PORT = '443';
 const CHUNKED_REPORT_PATH = '/nakara_rongroi/report/chunk';
 const UDP_SOURCE_TYPES = new Set(['UDP_SOCKET', 'UDP_CLIENT_SOCKET']);
 const REACHABILITY_CHECK_TYPE = 'HOST_RESOLVER_MANAGER_IPV6_REACHABILITY_CHECK';
-const BYTE_TRANSFER_TYPE = /(?:^|_)BYTES(?:_|$)/;
+// A UDP source is exempted from the name checks only when every event it logs
+// is part of Chromium's silent reachability probe.  Anything else, including a
+// send/receive error, means the source is not the probe and its names must be
+// checked like any other source.
+const ACCEPTED_UDP_SOURCE_EVENT_TYPES = new Set([
+  'SOCKET_ALIVE',
+  'SOCKET_OPEN',
+  'SOCKET_CONNECT',
+  'UDP_CONNECT',
+  'UDP_LOCAL_ADDRESS',
+]);
+const BYTE_TRANSFER_TYPE = /(?:^|_)(?:BYTES|SEND|RECEIVE|READ|WRITE)(?:_|$)/;
 
 function normalizeHost(value) {
   return String(value)
@@ -299,15 +310,19 @@ function normalizePathRule(value) {
   return { exact: String(value) };
 }
 
-function parseNetlog(input) {
+function parseNetlogDetailed(input) {
   if (Buffer.isBuffer(input)) input = input.toString('utf8');
-  if (input !== null && typeof input === 'object') return input;
+  if (input !== null && typeof input === 'object') {
+    return { netlog: input, repaired: false };
+  }
 
   const text = typeof input === 'string' ? input : String(input ?? '');
-  if (text.trim() === '') return { constants: {}, events: [] };
+  if (text.trim() === '') {
+    return { netlog: { constants: {}, events: [] }, repaired: false };
+  }
 
   try {
-    return JSON.parse(text);
+    return { netlog: JSON.parse(text), repaired: false };
   } catch {
     // Chromium may exit before it writes the closing brackets.  Close them
     // and try again; a trailing comma is dropped first for the same reason.
@@ -317,13 +332,17 @@ function parseNetlog(input) {
   const base = trimmed.endsWith(',') ? trimmed.slice(0, -1) : trimmed;
   for (const suffix of [']}', '}', ']']) {
     try {
-      return JSON.parse(base + suffix);
+      return { netlog: JSON.parse(base + suffix), repaired: true };
     } catch {
       // Try the next closing shape.
     }
   }
 
   throw new Error('netlog is not valid JSON');
+}
+
+function parseNetlog(input) {
+  return parseNetlogDetailed(input).netlog;
 }
 
 function requiredPathList(requiredPaths) {
@@ -352,6 +371,7 @@ function emptyResult(allowed, paths, error) {
     seenPaths: [],
     missingPaths: paths.slice(),
     error,
+    repaired: false,
   };
 }
 
@@ -370,12 +390,19 @@ function isConnectEvent(typeName) {
   return /(?:^|_)CONNECT(?:_|$)/.test(typeName);
 }
 
-function connectSucceeded(params) {
+function connectFailed(params) {
   const value = params.net_error;
-  if (value === undefined || value === null) return true;
-  if (typeof value === 'number') return value === 0;
-  if (typeof value === 'string') return value === '' || value === '0' || /^OK$/i.test(value);
-  return false;
+  if (value === undefined || value === null) return false;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') return !(value === '' || value === '0' || /^OK$/i.test(value));
+  return true;
+}
+
+function isEndPhase(event) {
+  const phase = event.phase ?? (event.params === null || typeof event.params !== 'object'
+    ? undefined
+    : event.params.phase);
+  return Number(phase) === 2;
 }
 
 function connectEndpoints(params) {
@@ -436,10 +463,17 @@ function checkNetlog(json, host, requiredPaths) {
   }
 
   let netlog;
+  let repaired = false;
   try {
-    netlog = parseNetlog(json);
+    const parsed = parseNetlogDetailed(json);
+    netlog = parsed.netlog;
+    repaired = parsed.repaired;
   } catch (error) {
     return emptyResult(allowed, paths, error.message);
+  }
+
+  if (netlog === null || typeof netlog !== 'object') {
+    return emptyResult(allowed, paths, 'netlog is not valid JSON');
   }
 
   const constants = netlog.constants ?? {};
@@ -514,27 +548,51 @@ function checkNetlog(json, host, requiredPaths) {
         entry = {
           key,
           sourceType: sourceTypeName(constants, event.source.type),
+          eventTypes: new Set(),
           byteTransfer: false,
           knownConnect: false,
           otherConnect: false,
-          connectSuccess: false,
+          foreignAddress: false,
+          connectError: false,
+          connectEndSuccess: false,
         };
         sourceInfo.set(key, entry);
       }
+      entry.eventTypes.add(typeName);
       if (BYTE_TRANSFER_TYPE.test(typeName)) entry.byteTransfer = true;
     }
 
     const params = event.params;
-    if (params === null || typeof params !== 'object' || Array.isArray(params)) continue;
+    const hasParams = params !== null && typeof params === 'object' && !Array.isArray(params);
 
-    if (entry !== null && isConnectEvent(typeName)) {
-      const endpoints = connectEndpoints(params);
-      if (endpoints.some(isKnownIpv6Endpoint)) {
-        entry.knownConnect = true;
-        if (connectSucceeded(params)) entry.connectSuccess = true;
+    if (entry !== null) {
+      if (hasParams) {
+        // Only the fixed reachability address may appear in an exempted
+        // source's address members.  A different address, or the same address
+        // on a different port, means this is not the silent probe.
+        const eventPort = params.port ?? params.remote_port ?? null;
+        if (typeof params.address === 'string' && params.address.trim() !== '') {
+          const endpoint = endpointFromValue(params.address, eventPort);
+          if (!isKnownIpv6Endpoint(endpoint)) entry.foreignAddress = true;
+        }
+        if (typeof params.remote_address === 'string' && params.remote_address.trim() !== '') {
+          const endpoint = endpointFromValue(
+            params.remote_address,
+            params.remote_port ?? eventPort,
+          );
+          if (!isKnownIpv6Endpoint(endpoint)) entry.foreignAddress = true;
+        }
       }
-      if (endpoints.some((endpoint) => !isKnownIpv6Endpoint(endpoint))) {
-        entry.otherConnect = true;
+
+      if (isConnectEvent(typeName)) {
+        const connectParams = hasParams ? params : {};
+        const endpoints = connectEndpoints(connectParams);
+        if (endpoints.some(isKnownIpv6Endpoint)) entry.knownConnect = true;
+        if (endpoints.some((endpoint) => !isKnownIpv6Endpoint(endpoint))) {
+          entry.otherConnect = true;
+        }
+        if (connectFailed(connectParams)) entry.connectError = true;
+        if (isEndPhase(event) && !connectFailed(connectParams)) entry.connectEndSuccess = true;
       }
     }
   }
@@ -543,13 +601,15 @@ function checkNetlog(json, host, requiredPaths) {
     UDP_SOURCE_TYPES.has(entry.sourceType)
     && entry.knownConnect
     && !entry.otherConnect
+    && !entry.foreignAddress
     && !entry.byteTransfer
+    && [...entry.eventTypes].every((type) => ACCEPTED_UDP_SOURCE_EVENT_TYPES.has(type))
     && hasReachabilityCheck
   ));
   const acceptedSourceKeys = new Set(acceptedSources.map((entry) => entry.key));
   const acceptedIpv6Check = {
     sources: acceptedSources.length,
-    connected: acceptedSources.some((entry) => entry.connectSuccess),
+    connected: acceptedSources.some((entry) => entry.connectEndSuccess && !entry.connectError),
   };
 
   for (const event of events) {
@@ -597,8 +657,11 @@ function checkNetlog(json, host, requiredPaths) {
     if (params.address_list !== undefined) {
       recordAddressList(params.address_list, typeName, byteTransfer, eventPort);
     }
-    if (typeof params.group_id === 'string' && !/^\s*\d+\s*$/.test(params.group_id)) {
-      record(endpointName(params.group_id, eventPort), typeName, byteTransfer);
+    for (const key of ['group_id', 'destination', 'logical_destination']) {
+      const value = params[key];
+      if (typeof value === 'string' && !/^\s*\d+\s*$/.test(value)) {
+        record(endpointName(value, eventPort), typeName, byteTransfer);
+      }
     }
     if (typeof params.proxy_server === 'string') {
       record(endpointName(params.proxy_server, eventPort), typeName, byteTransfer);
@@ -650,6 +713,7 @@ function checkNetlog(json, host, requiredPaths) {
     seenPaths: paths.filter((path) => seenPaths.has(pathRuleKey(path))),
     missingPaths,
     error: null,
+    repaired,
   };
 }
 

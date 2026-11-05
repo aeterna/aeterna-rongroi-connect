@@ -15,7 +15,11 @@ const {
 } = require('../scripts/check-netlog');
 const {
   searchLeftovers,
+  searchLeftoversDetailed,
   leftoverFailure,
+  negativeControlMutations,
+  reportFileNames,
+  runSucceeded,
   LEFTOVER_MAX_BYTES,
 } = require('../scripts/run-e2e');
 
@@ -59,6 +63,7 @@ function ipv6CheckEvents({
   connect = { address: '2001:4860:4860::8888', port: 443 },
   extraEvents = [],
   reachability = true,
+  phase,
 } = {}) {
   const events = [
     ...baseEvents(),
@@ -74,11 +79,13 @@ function ipv6CheckEvents({
   }
 
   if (connect !== null) {
-    events.push({
+    const connectEvent = {
       type: eventType,
       params: connect,
       source: { id: sourceId, type: sourceType },
-    });
+    };
+    if (phase !== undefined) connectEvent.phase = phase;
+    events.push(connectEvent);
   }
 
   return [...events, ...extraEvents];
@@ -168,6 +175,26 @@ test('address_list, group_id, proxy_server, request_url and location are read', 
   for (const detail of details.values()) assert.equal(detail.byteTransfer, false);
 });
 
+test('destination and logical_destination are read as names', () => {
+  const result = checkNetlog(netlog([
+    ...baseEvents(),
+    event(3, { address: '127.0.0.1', port: 30120 }),
+    event('HTTP_TRANSACTION', { destination: 'http://destination.example:1234' }),
+    event('HTTP_TRANSACTION', { logical_destination: 'http://logical.example:5678' }),
+    event('HTTP_TRANSACTION', { destination: 'http://127.0.0.1:30120' }),
+  ]), ALLOWED, REQUIRED_PATHS);
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.unexpected, [
+    'destination.example:1234',
+    'logical.example:5678',
+  ]);
+  assert.ok(result.names.includes('127.0.0.1:30120'));
+  const details = new Map(result.unexpectedDetails.map((detail) => [detail.name, detail]));
+  assert.deepEqual(details.get('destination.example:1234').eventTypes, ['HTTP_TRANSACTION']);
+  assert.deepEqual(details.get('logical.example:5678').eventTypes, ['HTTP_TRANSACTION']);
+});
+
 test('each unexpected name reports its event types and whether bytes moved', () => {
   const result = checkNetlog(netlog([
     ...baseEvents(),
@@ -241,8 +268,21 @@ test('a truncated log is repaired by closing the brackets', () => {
   const result = checkNetlog(truncated, ALLOWED, REQUIRED_PATHS);
 
   assert.equal(result.ok, true);
+  assert.equal(result.repaired, true);
   assert.equal(result.allowedSeen, true);
   assert.deepEqual(result.names, ['127.0.0.1:30120']);
+});
+
+test('repaired is false when the log parses normally or fails', () => {
+  const full = netlog([
+    ...baseEvents(),
+    event(3, { address: '127.0.0.1', port: 30120 }),
+  ]);
+
+  assert.equal(checkNetlog(full, ALLOWED, REQUIRED_PATHS).repaired, false);
+  assert.equal(checkNetlog('', ALLOWED, REQUIRED_PATHS).repaired, false);
+  assert.equal(checkNetlog('{not json', ALLOWED, REQUIRED_PATHS).repaired, false);
+  assert.equal(checkNetlog('null', ALLOWED, REQUIRED_PATHS).repaired, false);
 });
 
 test('a different port on the allowed host fails', () => {
@@ -276,12 +316,134 @@ test('the known IPv6 reachability check passes with a successful connect', () =>
   const result = checkNetlog(netlog(ipv6CheckEvents({
     sourceType: 'UDP_CLIENT_SOCKET',
     connect: { address: '[2001:4860:4860::8888]:443' },
+    phase: 2,
   })), ALLOWED, REQUIRED_PATHS);
 
   assert.equal(result.ok, true);
   assert.deepEqual(result.unexpected, []);
   assert.deepEqual(result.acceptedIpv6Check, { sources: 1, connected: true });
   assert.equal(result.names.includes('2001:4860:4860::8888:443'), false);
+});
+
+test('only an end-phase connect with no net_error counts as connected', () => {
+  const begin = checkNetlog(netlog(ipv6CheckEvents({
+    connect: { address: '[2001:4860:4860::8888]:443' },
+    phase: 0,
+  })), ALLOWED, REQUIRED_PATHS);
+
+  assert.equal(begin.ok, true);
+  assert.deepEqual(begin.acceptedIpv6Check, { sources: 1, connected: false });
+
+  const end = checkNetlog(netlog(ipv6CheckEvents({
+    connect: { address: '[2001:4860:4860::8888]:443' },
+    phase: 2,
+  })), ALLOWED, REQUIRED_PATHS);
+
+  assert.equal(end.ok, true);
+  assert.deepEqual(end.acceptedIpv6Check, { sources: 1, connected: true });
+});
+
+test('a real failed IPv6 probe leaves two accepted sources but is not connected', () => {
+  const result = checkNetlog(netlog([
+    ...baseEvents(),
+    event(3, { address: '127.0.0.1', port: 30120 }),
+    {
+      type: 'HOST_RESOLVER_MANAGER_IPV6_REACHABILITY_CHECK',
+      params: {},
+      source: { id: 88, type: 'HOST_RESOLVER_MANAGER' },
+    },
+    {
+      type: 'UDP_CONNECT',
+      params: { address: '[2001:4860:4860::8888]:443' },
+      source: { id: 22, type: 'UDP_SOCKET' },
+      phase: 1,
+    },
+    {
+      type: 'UDP_CONNECT',
+      params: { net_error: -109 },
+      source: { id: 22, type: 'UDP_SOCKET' },
+      phase: 2,
+    },
+    {
+      type: 'SOCKET_CONNECT',
+      params: { address: '[2001:4860:4860::8888]:443', net_error: -109 },
+      source: { id: 21, type: 'UDP_SOCKET' },
+      phase: 0,
+    },
+  ]), ALLOWED, REQUIRED_PATHS);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.acceptedIpv6Check, { sources: 2, connected: false });
+});
+
+test('the known IPv6 source is not accepted when any allowed event names another address', () => {
+  const result = checkNetlog(netlog(ipv6CheckEvents({
+    extraEvents: [
+      {
+        type: 'SOCKET_OPEN',
+        params: { address: '192.0.2.10', port: 443 },
+        source: { id: 77, type: 'UDP_SOCKET' },
+      },
+      {
+        type: 'SOCKET_OPEN',
+        params: { remote_address: '198.51.100.7', remote_port: 443 },
+        source: { id: 77, type: 'UDP_SOCKET' },
+      },
+    ],
+  })), ALLOWED, REQUIRED_PATHS);
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.acceptedIpv6Check, { sources: 0, connected: false });
+  assert.ok(result.unexpected.includes('2001:4860:4860::8888:443'));
+  assert.ok(result.unexpected.includes('192.0.2.10:443'));
+  assert.ok(result.unexpected.includes('198.51.100.7:443'));
+});
+
+test('the IPv6 source allowlist keeps only the silent probe event types', () => {
+  const extraEvents = [
+    'SOCKET_ALIVE',
+    'SOCKET_OPEN',
+    'SOCKET_CONNECT',
+    'UDP_CONNECT',
+    'UDP_LOCAL_ADDRESS',
+  ].map((type) => ({
+    type,
+    params: { address: IPV6_CHECK },
+    source: { id: 77, type: 'UDP_SOCKET' },
+  }));
+
+  const result = checkNetlog(netlog(ipv6CheckEvents({
+    extraEvents,
+    phase: 2,
+  })), ALLOWED, REQUIRED_PATHS);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.unexpected, []);
+  assert.deepEqual(result.acceptedIpv6Check, { sources: 1, connected: true });
+});
+
+test('IPv6 socket error events are not accepted and are marked as byte transfers', () => {
+  for (const type of [
+    'UDP_SEND_ERROR',
+    'UDP_RECEIVE_ERROR',
+    'SOCKET_WRITE_ERROR',
+    'SOCKET_READ_ERROR',
+  ]) {
+    const result = checkNetlog(netlog(ipv6CheckEvents({
+      extraEvents: [{
+        type,
+        params: { address: '2001:4860:4860::8888', port: 443 },
+        source: { id: 77, type: 'UDP_SOCKET' },
+      }],
+    })), ALLOWED, REQUIRED_PATHS);
+
+    assert.equal(result.ok, false, type);
+    assert.deepEqual(result.acceptedIpv6Check, { sources: 0, connected: false }, type);
+    assert.ok(result.unexpected.includes('2001:4860:4860::8888:443'), type);
+    assert.equal(result.unexpectedByteTransfer, true, type);
+    assert.ok(result.unexpectedByName['2001:4860:4860::8888:443'].byteTransferTypes
+      .includes(type), type);
+  }
 });
 
 test('the IPv6 address on the wrong port is unexpected', () => {
@@ -436,7 +598,7 @@ test('numeric source and event types resolve through the netlog constants', () =
       event(1, { url: REPORT_URL }),
       event(3, { address: '127.0.0.1', port: 30120 }),
       event(11, {}, { id: 2, type: 2 }),
-      event(10, { address: '2001:4860:4860::8888', port: 443 }, { id: 1, type: 1 }),
+      { ...event(10, { address: '2001:4860:4860::8888', port: 443 }, { id: 1, type: 1 }), phase: 2 },
     ],
   }), ALLOWED, REQUIRED_PATHS);
 
@@ -450,7 +612,7 @@ test('a numeric UDP_SOCKET source is accepted but a numeric TCP_SOCKET source is
     event(1, { url: REPORT_URL }),
     event(3, { address: '127.0.0.1', port: 30120 }),
     event(11, {}, { id: 2, type: 2 }),
-    event(10, { address: '2001:4860:4860::8888', port: 443 }, { id: 1, type: 1 }),
+    { ...event(10, { address: '2001:4860:4860::8888', port: 443 }, { id: 1, type: 1 }), phase: 2 },
   ];
   const constants = (sourceTypeName) => ({
     logEventTypes: {
@@ -530,6 +692,114 @@ test('the leftover search reads UTF-8 and UTF-16LE and skips files over 1 MiB', 
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('the leftover search records files it could not search', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'leftover-skip-'));
+  const tooBigFile = path.join(root, 'too-big.bin');
+  const unreadableFile = path.join(root, 'unreadable.bin');
+
+  try {
+    fs.writeFileSync(tooBigFile, Buffer.alloc(LEFTOVER_MAX_BYTES + 1));
+    fs.writeFileSync(unreadableFile, 'ticket abc123', 'utf8');
+
+    const originalReadFileSync = fs.readFileSync;
+    fs.readFileSync = function readFileSyncWithFailure(file, ...args) {
+      if (path.resolve(String(file)) === path.resolve(unreadableFile)) {
+        const error = new Error('EACCES: permission denied');
+        error.code = 'EACCES';
+        throw error;
+      }
+      return originalReadFileSync.call(fs, file, ...args);
+    };
+
+    try {
+      const result = searchLeftoversDetailed([root], { ticket: 'abc123' });
+      assert.equal(result.searchRan, true);
+      assert.deepEqual(result.hits, []);
+      assert.deepEqual(result.notSearched, [
+        { path: tooBigFile, reason: 'too-large' },
+        { path: unreadableFile, reason: 'unreadable' },
+      ]);
+    } finally {
+      fs.readFileSync = originalReadFileSync;
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the leftover search reports whether it built any needles', () => {
+  const empty = searchLeftoversDetailed([], {});
+  assert.deepEqual(empty, { hits: [], notSearched: [], searchRan: false });
+
+  const options = {};
+  assert.deepEqual(searchLeftovers([], {}, options), []);
+  assert.equal(options.searchRan, false);
+});
+
+test('negative-control mode uses separate report files', () => {
+  assert.deepEqual(reportFileNames(false), {
+    report: 'e2e-report.json',
+    netlog: 'e2e-netlog.json',
+  });
+  assert.deepEqual(reportFileNames(true), {
+    report: 'e2e-negative-report.json',
+    netlog: 'e2e-negative-netlog.json',
+  });
+});
+
+test('a run fails when the netlog was repaired or the leftover search did not run', () => {
+  const run = { error: null, timedOut: false, exitCode: 0 };
+  const report = {
+    kitReceived: true,
+    netlogOk: true,
+    netlogRepaired: false,
+    leftoverSearchRan: true,
+    negativeControlOk: true,
+    leftoverHits: [],
+  };
+
+  assert.equal(runSucceeded(run, report), true);
+  assert.equal(runSucceeded(run, { ...report, netlogRepaired: true }), false);
+  assert.equal(runSucceeded(run, { ...report, leftoverSearchRan: false }), false);
+  assert.equal(runSucceeded({ ...run, exitCode: 1 }, report), false);
+});
+
+test('negative-control mutations change every probe port and paired host', () => {
+  const text = `first ${IPV6_CHECK} second ${IPV6_CHECK} host 127.0.0.1 and 127.0.0.1`;
+  const result = negativeControlMutations(text);
+
+  assert.equal(result.ipv6, text.split(IPV6_CHECK).join('[2001:4860:4860::8888]:444'));
+  assert.equal(result.host, text.split('127.0.0.1').join('127.0.0.2'));
+  assert.equal(result.ipv6.includes(IPV6_CHECK), false);
+  assert.equal(result.host.includes('127.0.0.1'), false);
+  assert.ok(result.ipv6.includes('127.0.0.1'));
+  assert.ok(result.host.includes(IPV6_CHECK));
+});
+
+test('the negative-control mutations turn a passing netlog into a failure', () => {
+  const log = netlog([
+    ...baseEvents(),
+    event(3, { address: '127.0.0.1', port: 30120 }),
+    {
+      type: 'HOST_RESOLVER_MANAGER_IPV6_REACHABILITY_CHECK',
+      params: {},
+      source: { id: 88, type: 'HOST_RESOLVER_MANAGER' },
+    },
+    {
+      type: 'UDP_CONNECT',
+      params: { address: IPV6_CHECK },
+      source: { id: 77, type: 'UDP_SOCKET' },
+      phase: 2,
+    },
+  ]);
+
+  assert.equal(checkNetlog(log, ALLOWED, REQUIRED_PATHS).ok, true);
+
+  const mutations = negativeControlMutations(log);
+  assert.equal(checkNetlog(mutations.ipv6, ALLOWED, REQUIRED_PATHS).ok, false);
+  assert.equal(checkNetlog(mutations.host, ALLOWED, REQUIRED_PATHS).ok, false);
 });
 
 test('a leftover hit fails only for a ticket, nonce or kit key', () => {

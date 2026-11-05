@@ -4,6 +4,7 @@
 
 // Drive the test build through the whole flow against the mock Server Kit and
 // the mock sidecar, then check Chromium's netlog and write e2e-report.json.
+// Negative-control runs write e2e-negative-report.json instead.
 //   node scripts/run-e2e.js <testBuildDir> [--negative-control]
 //   node scripts/run-e2e.js --release-smoke <releaseDir>
 
@@ -11,7 +12,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { checkNetlog, DEFAULT_REQUIRED_PATHS } = require('./check-netlog');
+const { checkNetlog, DEFAULT_REQUIRED_PATHS, KNOWN_IPV6_CHECK } = require('./check-netlog');
 const { parsePairingCode } = require('../src/core/pairing');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -20,6 +21,8 @@ const APP_LIMIT_MS = 120 * 1000;
 const RELEASE_SMOKE_MS = 8 * 1000;
 const REQUIRED_PATHS = [...DEFAULT_REQUIRED_PATHS];
 const LEFTOVER_MAX_BYTES = 1024 * 1024;
+const NEGATIVE_IPV6_CHECK = '[2001:4860:4860::8888]:444';
+const NEGATIVE_HOST = '127.0.0.2';
 const LEFTOVER_FAILURE_KINDS = new Set([
   'ticket',
   'nonce',
@@ -196,7 +199,7 @@ function listFilesUnder(entries) {
   return files;
 }
 
-function searchLeftovers(entries, values) {
+function searchLeftoversDetailed(entries, values) {
   const rawRoots = entries === undefined || entries === null
     ? []
     : (Array.isArray(entries) ? entries : [entries]);
@@ -240,32 +243,67 @@ function searchLeftovers(entries, values) {
       utf16le: Buffer.from(text, 'utf16le'),
     });
   }
-  if (needles.length === 0) return [];
 
-  const hits = [];
+  const result = { hits: [], notSearched: [], searchRan: false };
+  if (needles.length === 0) return result;
+  result.searchRan = true;
+
   for (const file of listFilesUnder(roots)) {
-    if (file.size > LEFTOVER_MAX_BYTES) continue;
+    if (file.size > LEFTOVER_MAX_BYTES) {
+      result.notSearched.push({ path: file.path, reason: 'too-large' });
+      continue;
+    }
 
     let bytes;
     try {
       bytes = fs.readFileSync(file.path);
     } catch {
+      result.notSearched.push({ path: file.path, reason: 'unreadable' });
       continue;
     }
 
     for (const needle of needles) {
       if (bytes.includes(needle.utf8) || bytes.includes(needle.utf16le)) {
-        hits.push({ file: file.path, what: needle.what });
+        result.hits.push({ file: file.path, what: needle.what });
       }
     }
   }
-  return hits;
+  return result;
+}
+
+function searchLeftovers(entries, values, options) {
+  const result = searchLeftoversDetailed(entries, values);
+  if (options !== null && typeof options === 'object') {
+    options.searchRan = result.searchRan;
+    if (Array.isArray(options.notSearched)) {
+      options.notSearched.push(...result.notSearched);
+    } else {
+      options.notSearched = result.notSearched;
+    }
+  }
+  return result.hits;
 }
 
 const findLeftoverHits = searchLeftovers;
 const scanLeftovers = searchLeftovers;
 const scanLeftoverFiles = searchLeftovers;
 const searchLeftoverFiles = searchLeftovers;
+
+function negativeControlMutations(text) {
+  const source = typeof text === 'string' ? text : String(text ?? '');
+  return {
+    ipv6: source.split(KNOWN_IPV6_CHECK).join(NEGATIVE_IPV6_CHECK),
+    host: source.split('127.0.0.1').join(NEGATIVE_HOST),
+  };
+}
+
+const mutateNegativeControlNetlog = negativeControlMutations;
+
+function reportFileNames(negativeControl) {
+  return negativeControl
+    ? { report: 'e2e-negative-report.json', netlog: 'e2e-negative-netlog.json' }
+    : { report: 'e2e-report.json', netlog: 'e2e-netlog.json' };
+}
 
 function leftoverFailure(hits) {
   return hits.some((hit) => LEFTOVER_FAILURE_KINDS.has(hit.what));
@@ -276,7 +314,22 @@ const hasLeftoverFailure = leftoverFailure;
 function captureLeftovers(report, values) {
   report.tempAfter = listTempMatches();
   report.leftoverFiles = listFilesUnder(report.tempAfter);
-  report.leftoverHits = searchLeftovers(report.tempAfter, values ?? {});
+  const leftovers = searchLeftoversDetailed(report.tempAfter, values ?? {});
+  report.leftoverHits = leftovers.hits;
+  report.leftoverNotSearched = leftovers.notSearched;
+  report.leftoverSearchRan = leftovers.searchRan;
+}
+
+function runSucceeded(run, report) {
+  return run.error === null
+    && !run.timedOut
+    && run.exitCode === 0
+    && report.kitReceived
+    && report.netlogOk
+    && !report.netlogRepaired
+    && report.leftoverSearchRan
+    && report.negativeControlOk
+    && !leftoverFailure(report.leftoverHits);
 }
 
 function runApplication(executable, args, env) {
@@ -470,8 +523,9 @@ async function main(argv) {
   }
 
   const buildDir = path.resolve(buildArg);
-  const reportPath = path.join(process.cwd(), 'e2e-report.json');
-  const netlogCopyPath = path.join(process.cwd(), 'e2e-netlog.json');
+  const reportNames = reportFileNames(negativeControl);
+  const reportPath = path.join(process.cwd(), reportNames.report);
+  const netlogCopyPath = path.join(process.cwd(), reportNames.netlog);
   const report = {
     mode: negativeControl ? 'e2e-negative-control' : 'e2e',
     ok: false,
@@ -482,6 +536,7 @@ async function main(argv) {
     kitReceived: false,
     kitVisualHash: null,
     netlogOk: false,
+    netlogRepaired: false,
     netlogNames: [],
     acceptedIpv6Check: { sources: 0, connected: false },
     netlogUnexpected: [],
@@ -496,11 +551,15 @@ async function main(argv) {
     netlogCopied: false,
     netlogCopyError: null,
     negativeControl: null,
+    negativeControlIpv6: null,
+    negativeControlHost: null,
     negativeControlOk: !negativeControl,
     tempBefore: listTempMatches(),
     tempAfter: [],
     leftoverFiles: [],
     leftoverHits: [],
+    leftoverNotSearched: [],
+    leftoverSearchRan: false,
     error: null,
   };
 
@@ -567,12 +626,14 @@ async function main(argv) {
 
     try {
       const netlogText = fs.readFileSync(netlogPath, 'utf8');
+      const pairedHost = `${kitInfo.host}:${kitInfo.port}`;
       const netlog = checkNetlog(
         netlogText,
-        `${kitInfo.host}:${kitInfo.port}`,
+        pairedHost,
         REQUIRED_PATHS,
       );
       report.netlogOk = netlog.ok;
+      report.netlogRepaired = netlog.repaired === true;
       report.netlogNames = netlog.names;
       report.acceptedIpv6Check = netlog.acceptedIpv6Check;
       report.netlogUnexpected = netlog.unexpected;
@@ -587,34 +648,44 @@ async function main(argv) {
 
       if (negativeControl) {
         const wrongPort = kitInfo.port === 65535 ? kitInfo.port - 1 : kitInfo.port + 1;
+        const mutations = negativeControlMutations(netlogText);
+        const summarize = (check) => ({
+          allowedHostPort: check.allowedHostPort,
+          ok: check.ok,
+          unexpected: check.unexpected,
+          missingPaths: check.missingPaths,
+          error: check.error,
+        });
         const negative = checkNetlog(
           netlogText,
           `${kitInfo.host}:${wrongPort}`,
           REQUIRED_PATHS,
         );
-        report.negativeControl = {
-          allowedHostPort: negative.allowedHostPort,
-          ok: negative.ok,
-          unexpected: negative.unexpected,
-          missingPaths: negative.missingPaths,
-          error: negative.error,
-        };
-        // A checker that cannot see the port would pass this log even though
-        // it names the real port, so the negative control would fail the job.
-        report.negativeControlOk = negative.ok === false;
+        const negativeIpv6 = checkNetlog(
+          mutations.ipv6,
+          pairedHost,
+          REQUIRED_PATHS,
+        );
+        const negativeHost = checkNetlog(
+          mutations.host,
+          pairedHost,
+          REQUIRED_PATHS,
+        );
+        report.negativeControl = summarize(negative);
+        report.negativeControlIpv6 = summarize(negativeIpv6);
+        report.negativeControlHost = summarize(negativeHost);
+        // A checker that cannot see the port, the probe address or the paired
+        // host would wrongly pass one of these mutations, so the job fails.
+        report.negativeControlOk = negative.ok === false
+          && negativeIpv6.ok === false
+          && negativeHost.ok === false;
       }
     } catch (error) {
       report.netlogError = error.message;
     }
 
     captureLeftovers(report, leftoverValues);
-    report.ok = run.error === null
-      && !run.timedOut
-      && run.exitCode === 0
-      && report.kitReceived
-      && report.netlogOk
-      && report.negativeControlOk
-      && !leftoverFailure(report.leftoverHits);
+    report.ok = runSucceeded(run, report);
 
     if (run.stdout !== '') process.stdout.write(run.stdout);
     if (run.stderr !== '') process.stderr.write(run.stderr);
@@ -644,7 +715,7 @@ async function main(argv) {
   if (!report.netlogCopied) {
     report.ok = false;
     if (report.netlogCopyError === null) {
-      report.netlogCopyError = 'the netlog was not available to copy to e2e-netlog.json';
+      report.netlogCopyError = `the netlog was not available to copy to ${reportNames.netlog}`;
     }
   }
 
@@ -667,13 +738,18 @@ module.exports = {
   listTempMatches,
   listFilesUnder,
   searchLeftovers,
+  searchLeftoversDetailed,
   findLeftoverHits,
   scanLeftovers,
   scanLeftoverFiles,
   searchLeftoverFiles,
+  negativeControlMutations,
+  mutateNegativeControlNetlog,
+  reportFileNames,
   leftoverFailure,
   hasLeftoverFailure,
   captureLeftovers,
+  runSucceeded,
   runApplication,
   releaseSmoke,
   main,
