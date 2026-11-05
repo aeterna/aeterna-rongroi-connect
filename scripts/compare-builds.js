@@ -3,8 +3,9 @@
 'use strict';
 
 // Compare the release and test builds of ADR 0001 section 2.  The pure part is
-// compareTrees(); the command line only turns two folders into file maps and
-// gives compareTrees a way to read the two app.asar archives.
+// compareTrees(); the command line turns two folders into file maps, gives
+// compareTrees a way to read the two app.asar archives, and reads the fuses of
+// both executables.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -12,6 +13,16 @@ const path = require('node:path');
 const ASAR_PATH = 'resources/app.asar';
 const EXE_PATH = 'rongroi-connect.exe';
 const TEST_HOOK_PATH = 'src/test-hook.js';
+const ROOT = path.resolve(__dirname, '..');
+
+const SECTION_1_FUSES = [
+  { name: 'RunAsNode', value: false },
+  { name: 'EnableNodeOptionsEnvironmentVariable', value: false },
+  { name: 'EnableNodeCliInspectArguments', value: false },
+  { name: 'OnlyLoadAppFromAsar', value: true },
+  { name: 'EnableEmbeddedAsarIntegrityValidation', value: true },
+  { name: 'EnableCookieEncryption', value: true },
+];
 
 function normalizePath(value) {
   return String(value)
@@ -67,7 +78,14 @@ function normalizeAsarList(list) {
   return files;
 }
 
-function compareAsar(rel, leftBytes, rightBytes, listAsar, differences) {
+function repositoryHookCopies(root = ROOT) {
+  return {
+    release: fs.readFileSync(path.join(root, 'src', 'test-hook.js')),
+    test: fs.readFileSync(path.join(root, 'test', 'hook', 'test-hook.js')),
+  };
+}
+
+function compareAsar(rel, leftBytes, rightBytes, listAsar, expectedHooks, differences) {
   let left;
   let right;
   try {
@@ -86,8 +104,21 @@ function compareAsar(rel, leftBytes, rightBytes, listAsar, differences) {
       differences.push(`${rel}:${name}: only in ${inLeft ? 'release' : 'test'}`);
       continue;
     }
-    // The test hook is the one file the two builds are meant to differ in.
-    if (name === TEST_HOOK_PATH) continue;
+
+    // The test hook is the one file the two builds are meant to differ in,
+    // but each copy must still be exactly the file the build should have put
+    // there.  A stub in a test build (or the driving hook in release) is a
+    // failure, not an allowed difference.
+    if (name === TEST_HOOK_PATH) {
+      if (!left.get(name).equals(toBuffer(expectedHooks.release))) {
+        differences.push(`${rel}:${name}: release copy differs from src/test-hook.js`);
+      }
+      if (!right.get(name).equals(toBuffer(expectedHooks.test))) {
+        differences.push(`${rel}:${name}: test copy differs from test/hook/test-hook.js`);
+      }
+      continue;
+    }
+
     if (!left.get(name).equals(right.get(name))) {
       differences.push(`${rel}:${name}: differs`);
     }
@@ -97,12 +128,18 @@ function compareAsar(rel, leftBytes, rightBytes, listAsar, differences) {
 // Pure comparison of two trees.  Each tree is a Map or plain object of
 // relative path -> Buffer/string.  listAsar(bytes, side, rel) returns the
 // files inside that asar as a Map, array or plain object.  It is injected so
-// this function itself never touches the file system.
-function compareTrees(a, b, listAsar) {
+// this function itself never touches the archives on disk.  expectedHooks is
+// { release, test } as Buffers; by default the repository's two hook files are
+// used, because each build must carry exactly its own copy.
+function compareTrees(a, b, listAsar, expectedHooks) {
+  const hooks = expectedHooks ?? repositoryHookCopies();
   const left = normalizeTree(a);
   const right = normalizeTree(b);
   const differences = [];
   const notes = [];
+
+  if (left.size === 0) differences.push('the release tree is empty');
+  if (right.size === 0) differences.push('the test tree is empty');
 
   const names = new Set([...left.keys(), ...right.keys()]);
   for (const rel of [...names].sort()) {
@@ -119,9 +156,13 @@ function compareTrees(a, b, listAsar) {
     }
 
     if (rel === ASAR_PATH || rel.endsWith(`/${ASAR_PATH}`)) {
-      if (typeof listAsar === 'function') {
-        compareAsar(rel, left.get(rel), right.get(rel), listAsar, differences);
-      } else if (!left.get(rel).equals(right.get(rel))) {
+      if (left.get(rel).equals(right.get(rel))) {
+        // If the two archives are the same bytes, the test build did not
+        // differ at all and the comparison proved nothing.
+        differences.push(`${rel}: identical in both builds; the test build must differ`);
+      } else if (typeof listAsar === 'function') {
+        compareAsar(rel, left.get(rel), right.get(rel), listAsar, hooks, differences);
+      } else {
         differences.push(`${rel}: differs (no asar lister)`);
       }
       continue;
@@ -135,6 +176,16 @@ function compareTrees(a, b, listAsar) {
 
 function readTree(directory) {
   const root = path.resolve(directory);
+  let stats;
+  try {
+    stats = fs.statSync(root);
+  } catch {
+    throw new Error(`the build folder is missing: ${root}`);
+  }
+  if (!stats.isDirectory()) {
+    throw new Error(`the build folder is not a directory: ${root}`);
+  }
+
   const files = new Map();
 
   function walk(current, prefix) {
@@ -151,6 +202,10 @@ function readTree(directory) {
   }
 
   walk(root, '');
+
+  if (files.size === 0) {
+    throw new Error(`the build folder is empty: ${root}`);
+  }
   return files;
 }
 
@@ -175,6 +230,28 @@ async function loadAsar() {
   return asar;
 }
 
+async function loadFuses() {
+  let loaded;
+  try {
+    loaded = require('@electron/fuses');
+  } catch (error) {
+    if (error && (error.code === 'ERR_REQUIRE_ESM' || error.code === 'ERR_REQUIRE_ASYNC_MODULE')) {
+      loaded = await import('@electron/fuses');
+    } else {
+      throw error;
+    }
+  }
+
+  const fuses = [loaded, loaded && loaded.default]
+    .find((candidate) => candidate && typeof candidate.getCurrentFuseWire === 'function')
+    ?? loaded;
+  const { getCurrentFuseWire, FuseV1Options } = fuses ?? {};
+  if (typeof getCurrentFuseWire !== 'function' || !FuseV1Options) {
+    throw new Error('@electron/fuses did not export getCurrentFuseWire and FuseV1Options');
+  }
+  return { getCurrentFuseWire, FuseV1Options };
+}
+
 function extractAsarFile(asar, archivePath, entry) {
   const candidates = [entry, normalizePath(entry), `/${normalizePath(entry)}`];
   let lastError = null;
@@ -188,20 +265,173 @@ function extractAsarFile(asar, archivePath, entry) {
   throw lastError;
 }
 
+function statAsarFile(asar, archivePath, entry) {
+  const candidates = [entry, normalizePath(entry), `/${normalizePath(entry)}`];
+  let lastError = null;
+  for (const candidate of candidates) {
+    try {
+      return asar.statFile(archivePath, candidate);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
 function listAsarFromDisk(asar, archivePath) {
+  const entries = asar.listPackage(archivePath);
+  if (!Array.isArray(entries)) {
+    throw new Error(`@electron/asar listPackage did not return an array for ${archivePath}`);
+  }
+  if (entries.length === 0) {
+    throw new Error(`the asar is empty: ${archivePath}`);
+  }
+
   const files = new Map();
-  for (const entry of asar.listPackage(archivePath)) {
+  for (const entry of entries) {
     const name = normalizePath(entry);
     try {
       files.set(name, extractAsarFile(asar, archivePath, entry));
-    } catch {
-      // An unpacked file (the native .node) has only its entry in the asar;
-      // its bytes live in app.asar.unpacked and are compared by readTree().
-      // Keep a stable placeholder so the asar comparison only checks presence.
-      files.set(name, Buffer.from(`unpacked:${name}`, 'utf8'));
+    } catch (error) {
+      let stats = null;
+      if (typeof asar.statFile === 'function') {
+        try {
+          stats = statAsarFile(asar, archivePath, entry);
+        } catch {
+          // The stat error is less useful than the extract error below.
+        }
+      }
+      if (stats !== null && stats.unpacked === true) {
+        // An unpacked file (the native .node) has only its entry in the asar;
+        // its bytes live in app.asar.unpacked and are compared by readTree().
+        // Keep a stable placeholder so the asar comparison only checks presence.
+        files.set(name, Buffer.from(`unpacked:${name}`, 'utf8'));
+        continue;
+      }
+      throw new Error(`cannot extract ${name} from ${archivePath}: ${error.message}`);
     }
   }
   return files;
+}
+
+function expectedFuseEntries(FuseV1Options) {
+  return SECTION_1_FUSES.map(({ name, value }) => {
+    const option = FuseV1Options[name];
+    if (option === undefined) {
+      throw new Error(`@electron/fuses has no FuseV1Options.${name}`);
+    }
+    return { name, option, value };
+  });
+}
+
+function wireBytes(wire) {
+  if (Buffer.isBuffer(wire)) return wire;
+  if (wire instanceof Uint8Array) return wire;
+  if (wire !== null && typeof wire === 'object') {
+    for (const candidate of [wire.wire, wire.buffer, wire.bytes]) {
+      if (Buffer.isBuffer(candidate) || candidate instanceof Uint8Array) return candidate;
+    }
+  }
+  return null;
+}
+
+function readWireState(bytes, option) {
+  const raw = Number(option);
+  const fromNumber = (value) => {
+    if (value === 0) return false;
+    if (value === 1) return true;
+    if (value === 2) return false;
+    return null;
+  };
+
+  // Electron's fuse wire stores each fuse as a 32-bit little-endian value,
+  // with the option number as its slot.  Try the two common offsets before
+  // falling back to a bit field.
+  for (const offset of [raw, raw - 1]) {
+    if (offset < 0 || bytes.length < (offset + 1) * 4) continue;
+    const view = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+    const value = view.readUInt32LE(offset * 4);
+    const state = fromNumber(value);
+    if (state !== null) return state;
+  }
+
+  // A byte-per-fuse wire.
+  for (const offset of [raw, raw - 1]) {
+    if (offset < 0 || offset >= bytes.length) continue;
+    const value = bytes[offset];
+    const state = fromNumber(value);
+    if (state !== null) return state;
+  }
+
+  // A bit field with fuse 1 in bit 0.
+  const index = raw - 1;
+  const byte = bytes[Math.floor(index / 8)];
+  if (index >= 0 && byte !== undefined) {
+    return (byte & (1 << (index % 8))) !== 0;
+  }
+
+  return null;
+}
+
+function readFuseState(wire, option, name) {
+  if (wire !== null && typeof wire === 'object' && typeof wire.getFuseState === 'function') {
+    const value = wire.getFuseState(option);
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value !== 0;
+    if (typeof value === 'string') return /^(?:1|true|on|enabled)$/i.test(value);
+  }
+
+  if (wire !== null && typeof wire === 'object') {
+    for (const container of [wire.fuses, wire.options, wire.states, wire]) {
+      if (container === null || typeof container !== 'object') continue;
+      for (const key of [option, String(option), name]) {
+        if (key in container) return Boolean(container[key]);
+      }
+    }
+  }
+
+  const bytes = wireBytes(wire);
+  if (bytes !== null) {
+    const state = readWireState(Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes), option);
+    if (state !== null) return state;
+  }
+
+  throw new Error(`cannot read the ${name} fuse from the fuse wire`);
+}
+
+function checkFuseWire(wire, FuseV1Options, label = 'executable') {
+  const differences = [];
+  for (const { name, option, value } of expectedFuseEntries(FuseV1Options)) {
+    let actual;
+    try {
+      actual = readFuseState(wire, option, name);
+    } catch (error) {
+      differences.push(`${label}: cannot read fuse ${name}: ${error.message}`);
+      continue;
+    }
+    if (actual !== value) {
+      differences.push(
+        `${label}: fuse ${name} is ${actual ? 'on' : 'off'}, expected ${value ? 'on' : 'off'}`,
+      );
+    }
+  }
+  return differences;
+}
+
+function executableKey(tree) {
+  return [...tree.keys()].find(
+    (rel) => rel === EXE_PATH || rel.endsWith(`/${EXE_PATH}`),
+  );
+}
+
+async function compareExecutableFuses(directory, tree, fuses) {
+  const rel = executableKey(tree);
+  if (rel === undefined) {
+    return [`${EXE_PATH}: missing`];
+  }
+  const { getCurrentFuseWire, FuseV1Options } = fuses;
+  const wire = await getCurrentFuseWire(path.join(path.resolve(directory), rel));
+  return checkFuseWire(wire, FuseV1Options, rel);
 }
 
 async function main(argv) {
@@ -213,13 +443,26 @@ async function main(argv) {
   }
 
   const [releaseDir, testDir] = directories;
+  const releaseTree = readTree(releaseDir);
+  const testTree = readTree(testDir);
   const asar = await loadAsar();
   const listAsar = (bytes, side, rel) => {
     const directory = side === 'release' ? releaseDir : testDir;
     return listAsarFromDisk(asar, path.join(directory, rel));
   };
 
-  const result = compareTrees(readTree(releaseDir), readTree(testDir), listAsar);
+  const result = compareTrees(releaseTree, testTree, listAsar);
+  try {
+    const fuses = await loadFuses();
+    result.differences.push(
+      ...await compareExecutableFuses(releaseDir, releaseTree, fuses),
+      ...await compareExecutableFuses(testDir, testTree, fuses),
+    );
+  } catch (error) {
+    result.differences.push(`cannot read the executable fuses: ${error.message}`);
+  }
+  result.ok = result.differences.length === 0;
+
   for (const note of result.notes) console.log(`note: ${note}`);
 
   if (!result.ok) {
@@ -231,7 +474,7 @@ async function main(argv) {
 
   console.log(
     'builds match: every file is byte-identical except resources/app.asar and the exe; '
-      + 'inside the asars only src/test-hook.js may differ.',
+      + 'inside the asars only src/test-hook.js may differ, and both exes hold the section 1 fuses.',
   );
 }
 
@@ -246,8 +489,12 @@ module.exports = {
   ASAR_PATH,
   EXE_PATH,
   TEST_HOOK_PATH,
+  SECTION_1_FUSES,
   compareTrees,
   readTree,
   listAsarFromDisk,
+  repositoryHookCopies,
+  expectedFuseEntries,
+  checkFuseWire,
   main,
 };

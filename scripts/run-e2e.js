@@ -4,17 +4,20 @@
 
 // Drive the test build through the whole flow against the mock Server Kit and
 // the mock sidecar, then check Chromium's netlog and write e2e-report.json.
-//   node scripts/run-e2e.js <testBuildDir>
+//   node scripts/run-e2e.js <testBuildDir> [--negative-control]
+//   node scripts/run-e2e.js --release-smoke <releaseDir>
 
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { checkNetlog } = require('./check-netlog');
+const { checkNetlog, DEFAULT_REQUIRED_PATHS } = require('./check-netlog');
 
 const ROOT = path.resolve(__dirname, '..');
 const TEMP_PREFIX = 'rongroi-connect-';
 const APP_LIMIT_MS = 120 * 1000;
+const RELEASE_SMOKE_MS = 8 * 1000;
+const REQUIRED_PATHS = [...DEFAULT_REQUIRED_PATHS];
 
 function withTimeout(promise, millis, message) {
   let timer = null;
@@ -233,16 +236,155 @@ function runApplication(executable, args, env) {
   });
 }
 
+// Start the release executable with no test code.  A build whose embedded
+// asar-integrity resource is wrong exits by itself almost immediately; the
+// smoke run passes only when it is still alive after eight seconds.
+function releaseSmoke(executable, runForMs = RELEASE_SMOKE_MS) {
+  return new Promise((resolve) => {
+    const env = { ...process.env };
+    delete env.CONNECT_TEST_CODE;
+    delete env.CONNECT_TEST_NODE;
+    delete env.CONNECT_TEST_SIDECAR;
+    delete env.NODE_TEST_CONTEXT;
+
+    let child;
+    try {
+      child = spawn(executable, [], {
+        env,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      resolve({
+        ok: false,
+        exitedEarly: false,
+        seconds: 0,
+        exitCode: null,
+        signal: null,
+        stdout: '',
+        stderr: '',
+        error: error.message,
+      });
+      return;
+    }
+
+    const started = Date.now();
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ stdout, stderr, ...result });
+    };
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      child.kill();
+      finish({
+        ok: true,
+        exitedEarly: false,
+        seconds: (Date.now() - started) / 1000,
+        exitCode: null,
+        signal: null,
+        error: null,
+      });
+    }, runForMs);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    child.on('error', (error) => {
+      finish({
+        ok: false,
+        exitedEarly: false,
+        seconds: (Date.now() - started) / 1000,
+        exitCode: null,
+        signal: null,
+        error: error.message,
+      });
+    });
+
+    child.on('exit', (code, signal) => {
+      finish({
+        ok: false,
+        exitedEarly: true,
+        seconds: (Date.now() - started) / 1000,
+        exitCode: code,
+        signal,
+        error: `the release exe exited before ${runForMs / 1000} s (${code ?? signal})`,
+      });
+    });
+  });
+}
+
+function writeJsonReport(report, file) {
+  fs.writeFileSync(file, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
+}
+
 async function main(argv) {
-  const buildArg = argv.find((value) => value !== '--');
+  const smokeEquals = argv.find((value) => value.startsWith('--release-smoke='));
+  const smokeIndex = argv.indexOf('--release-smoke');
+
+  if (smokeIndex !== -1 || smokeEquals !== undefined) {
+    const releaseArg = smokeEquals !== undefined
+      ? smokeEquals.slice('--release-smoke='.length)
+      : argv[smokeIndex + 1];
+    if (releaseArg === undefined || releaseArg === '' || releaseArg.startsWith('--')) {
+      console.error('usage: node scripts/run-e2e.js --release-smoke <releaseDir>');
+      process.exitCode = 2;
+      return;
+    }
+
+    try {
+      const executable = findExecutable(releaseArg);
+      const smoke = await releaseSmoke(executable);
+      const smokeReport = {
+        mode: 'release-smoke',
+        ok: smoke.ok,
+        executable,
+        seconds: smoke.seconds,
+        exitedEarly: smoke.exitedEarly,
+        exitCode: smoke.exitCode,
+        signal: smoke.signal,
+        error: smoke.error,
+      };
+      if (smoke.stdout !== '') process.stdout.write(smoke.stdout);
+      if (smoke.stderr !== '') process.stderr.write(smoke.stderr);
+      console.log(JSON.stringify(smokeReport, null, 2));
+      if (!smoke.ok) process.exitCode = 1;
+    } catch (error) {
+      console.error(error && error.stack ? error.stack : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  const negativeControl = argv.includes('--negative-control');
+  const buildArg = argv.find(
+    (value) => value !== '--' && value !== '--negative-control',
+  );
   if (buildArg === undefined || buildArg === '') {
-    console.error('usage: node scripts/run-e2e.js <testBuildDir>');
+    console.error('usage: node scripts/run-e2e.js <testBuildDir> [--negative-control]');
+    console.error('       node scripts/run-e2e.js --release-smoke <releaseDir>');
     process.exitCode = 2;
     return;
   }
 
   const buildDir = path.resolve(buildArg);
+  const reportPath = path.join(process.cwd(), 'e2e-report.json');
+  const netlogCopyPath = path.join(process.cwd(), 'e2e-netlog.json');
   const report = {
+    mode: negativeControl ? 'e2e-negative-control' : 'e2e',
     ok: false,
     exitCode: null,
     signal: null,
@@ -253,7 +395,18 @@ async function main(argv) {
     netlogOk: false,
     netlogNames: [],
     netlogUnexpected: [],
+    netlogUnexpectedDetails: [],
+    netlogUnexpectedByName: {},
+    netlogUnexpectedByteTransfer: false,
+    netlogByteTransfer: false,
+    netlogRequestUrls: [],
+    netlogRequiredPaths: [...REQUIRED_PATHS],
+    netlogMissingPaths: [],
     netlogError: null,
+    netlogCopied: false,
+    netlogCopyError: null,
+    negativeControl: null,
+    negativeControlOk: !negativeControl,
     tempBefore: listTempMatches(),
     tempAfter: [],
     leftoverFiles: [],
@@ -299,13 +452,52 @@ async function main(argv) {
     report.kitReceived = kit.received;
     report.kitVisualHash = kit.visualHash;
 
+    if (fs.existsSync(netlogPath)) {
+      try {
+        fs.copyFileSync(netlogPath, netlogCopyPath);
+        report.netlogCopied = true;
+      } catch (error) {
+        report.netlogCopyError = error.message;
+      }
+    }
+
     try {
       const netlogText = fs.readFileSync(netlogPath, 'utf8');
-      const netlog = checkNetlog(netlogText, `${kitInfo.host}:${kitInfo.port}`);
+      const netlog = checkNetlog(
+        netlogText,
+        `${kitInfo.host}:${kitInfo.port}`,
+        REQUIRED_PATHS,
+      );
       report.netlogOk = netlog.ok;
       report.netlogNames = netlog.names;
       report.netlogUnexpected = netlog.unexpected;
+      report.netlogUnexpectedDetails = netlog.unexpectedDetails;
+      report.netlogUnexpectedByName = netlog.unexpectedByName;
+      report.netlogUnexpectedByteTransfer = netlog.unexpectedByteTransfer;
+      report.netlogByteTransfer = netlog.byteTransfer;
+      report.netlogRequestUrls = netlog.requestUrls;
+      report.netlogRequiredPaths = netlog.requiredPaths;
+      report.netlogMissingPaths = netlog.missingPaths;
       report.netlogError = netlog.error;
+
+      if (negativeControl) {
+        const wrongPort = kitInfo.port === 65535 ? kitInfo.port - 1 : kitInfo.port + 1;
+        const negative = checkNetlog(
+          netlogText,
+          `${kitInfo.host}:${wrongPort}`,
+          REQUIRED_PATHS,
+        );
+        report.negativeControl = {
+          allowedHostPort: negative.allowedHostPort,
+          ok: negative.ok,
+          unexpected: negative.unexpected,
+          missingPaths: negative.missingPaths,
+          error: negative.error,
+        };
+        // A checker that cannot see the port would pass this log even though
+        // it names the real port, so the negative control would fail the job.
+        report.negativeControlOk = negative.ok === false;
+      }
     } catch (error) {
       report.netlogError = error.message;
     }
@@ -315,7 +507,8 @@ async function main(argv) {
       && !run.timedOut
       && run.exitCode === 0
       && report.kitReceived
-      && report.netlogOk;
+      && report.netlogOk
+      && report.negativeControlOk;
 
     if (run.stdout !== '') process.stdout.write(run.stdout);
     if (run.stderr !== '') process.stderr.write(run.stderr);
@@ -326,6 +519,15 @@ async function main(argv) {
     if (kit !== null) kit.child.kill();
     if (netlogPath !== null) {
       try {
+        if (!report.netlogCopied && fs.existsSync(netlogPath)) {
+          fs.copyFileSync(netlogPath, netlogCopyPath);
+          report.netlogCopied = true;
+          report.netlogCopyError = null;
+        }
+      } catch (error) {
+        report.netlogCopyError = error.message;
+      }
+      try {
         fs.unlinkSync(netlogPath);
       } catch {
         // The netlog may not have been created.
@@ -333,11 +535,14 @@ async function main(argv) {
     }
   }
 
-  fs.writeFileSync(
-    path.join(process.cwd(), 'e2e-report.json'),
-    `${JSON.stringify(report, null, 2)}\n`,
-    'utf8',
-  );
+  if (!report.netlogCopied) {
+    report.ok = false;
+    if (report.netlogCopyError === null) {
+      report.netlogCopyError = 'the netlog was not available to copy to e2e-netlog.json';
+    }
+  }
+
+  writeJsonReport(report, reportPath);
   console.log(JSON.stringify(report, null, 2));
 
   if (!report.ok) process.exitCode = 1;
@@ -356,5 +561,6 @@ module.exports = {
   listFilesUnder,
   captureLeftovers,
   runApplication,
+  releaseSmoke,
   main,
 };
