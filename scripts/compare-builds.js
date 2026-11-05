@@ -265,30 +265,20 @@ async function loadFuses() {
   return { getCurrentFuseWire, FuseV1Options, FuseState };
 }
 
+// listPackage() returns entries with a leading separator, which is a backslash
+// on Windows.  extractFile() and statFile() want the path relative to the
+// archive root, so strip the leading separator while keeping the separator
+// style listPackage used.
+function archiveEntryName(entry) {
+  return String(entry).replace(/^[\\/]+/, '');
+}
+
 function extractAsarFile(asar, archivePath, entry) {
-  const candidates = [entry, normalizePath(entry), `/${normalizePath(entry)}`];
-  let lastError = null;
-  for (const candidate of candidates) {
-    try {
-      return asar.extractFile(archivePath, candidate);
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError;
+  return asar.extractFile(archivePath, archiveEntryName(entry));
 }
 
 function statAsarFile(asar, archivePath, entry) {
-  const candidates = [entry, normalizePath(entry), `/${normalizePath(entry)}`];
-  let lastError = null;
-  for (const candidate of candidates) {
-    try {
-      return asar.statFile(archivePath, candidate);
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError;
+  return asar.statFile(archivePath, archiveEntryName(entry));
 }
 
 function listAsarFromDisk(asar, archivePath) {

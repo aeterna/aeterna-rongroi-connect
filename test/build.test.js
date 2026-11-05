@@ -205,6 +205,35 @@ test('listAsarFromDisk uses the unpacked placeholder only for unpacked entries',
   assert.equal(files.get('src/main/main.js').toString('utf8'), 'main bytes');
 });
 
+test('listAsarFromDisk strips the leading separator listPackage returns', () => {
+  const archive = path.join('C:', 'app', 'resources', 'app.asar');
+  const contents = new Map([
+    ['native\\pipe\\index.js', Buffer.from('pipe bytes')],
+    ['src/a.js', Buffer.from('a bytes')],
+  ]);
+  const resolve = (entry) => {
+    const name = String(entry);
+    assert.equal(
+      /^[\\/]/.test(name),
+      false,
+      `extractFile/statFile received a leading separator: ${name}`,
+    );
+    assert.equal(contents.has(name), true, `unexpected archive path: ${name}`);
+    return name;
+  };
+  const asarFile = {
+    listPackage: () => ['\\native\\pipe\\index.js', '/src/a.js'],
+    statFile: (file, entry) => ({ unpacked: false, name: resolve(entry) }),
+    extractFile: (file, entry) => contents.get(resolve(entry)),
+  };
+
+  const files = listAsarFromDisk(asarFile, archive);
+
+  assert.deepEqual([...files.keys()], ['native/pipe/index.js', 'src/a.js']);
+  assert.equal(files.get('native/pipe/index.js').toString('utf8'), 'pipe bytes');
+  assert.equal(files.get('src/a.js').toString('utf8'), 'a bytes');
+});
+
 test('listAsarFromDisk skips folders and links without extracting them', () => {
   const archive = path.join('C:', 'app', 'resources', 'app.asar');
   const extracted = [];
