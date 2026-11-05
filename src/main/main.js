@@ -71,7 +71,13 @@ function finish(code) {
 }
 
 process.on('uncaughtException', () => {
-  finish(10);
+  // Before ready, app.quit() cannot run the normal quit path. This covers a
+  // failure at load time, such as createTempUserData throwing.
+  if (typeof app.isReady === 'function' && app.isReady()) {
+    finish(10);
+  } else {
+    app.exit(10);
+  }
 });
 
 // ADR 0001 sections 2 and 3: the temporary userData comes first, then the

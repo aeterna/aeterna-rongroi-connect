@@ -25,6 +25,9 @@ class ConnectError extends Error {
     super(message === undefined ? code : message, options);
     this.name = 'ConnectError';
     this.code = code;
+    if (options !== null && typeof options === 'object' && typeof options.sent === 'boolean') {
+      this.sent = options.sent;
+    }
   }
 }
 
@@ -310,18 +313,26 @@ class PairedClient {
     try {
       plan = planUpload(envelopeBytes, this.ticket);
     } catch (error) {
-      fail('bad_envelope', error.message, { cause: error });
+      fail('bad_envelope', error.message, { cause: error, sent: false });
     }
 
+    // `sent` means a slice was answered 2xx, or an answer may have been lost
+    // (network error, timeout, 5xx). A refusal before any of those sent nothing.
+    const state = { sent: false };
     let restarted = false;
     for (;;) {
-      const outcome = await this.sendPlan(plan);
+      const outcome = await this.sendPlan(plan, state);
       if (outcome.action === 'ok') return { status: 'accepted' };
       if (restarted) {
-        const options = outcome.cause === undefined ? undefined : { cause: outcome.cause };
+        const options = { sent: state.sent === true };
+        if (outcome.cause !== undefined) options.cause = outcome.cause;
         fail(outcome.code, outcome.message, options);
       }
-      if (!this.hasTime()) fail('expired', 'the ticket expired before the upload could restart');
+      if (!this.hasTime()) {
+        fail('expired', 'the ticket expired before the upload could restart', {
+          sent: state.sent === true,
+        });
+      }
       restarted = true;
     }
   }
@@ -349,18 +360,24 @@ class PairedClient {
     this.expiresAtMs = expires - offset;
   }
 
-  async sendPlan(plan) {
+  async sendPlan(plan, state = { sent: false }) {
     if (plan.mode === 'direct') {
-      return this.send(plan.endpoint, plan.data, plan.headers, plan.retryDelaysMs);
+      return this.send(plan.endpoint, plan.data, plan.headers, plan.retryDelaysMs, state);
     }
     for (const slice of plan.slices) {
-      const outcome = await this.send(plan.endpoint, slice.data, slice.headers, plan.retryDelaysMs);
+      const outcome = await this.send(
+        plan.endpoint,
+        slice.data,
+        slice.headers,
+        plan.retryDelaysMs,
+        state,
+      );
       if (outcome.action === 'restart') return outcome;
     }
     return { action: 'ok' };
   }
 
-  async send(endpoint, data, headers, retryDelaysMs) {
+  async send(endpoint, data, headers, retryDelaysMs, state = { sent: false }) {
     let backoff = 0;
     let rateLimitWaits = 0;
     const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
@@ -376,13 +393,22 @@ class PairedClient {
       } catch (error) {
         const retryable = error instanceof ConnectError
           && (error.code === 'network' || error.code === 'timeout');
-        if (!retryable) throw error;
+        if (!retryable) {
+          if (error !== null && typeof error === 'object' && typeof error.sent !== 'boolean') {
+            error.sent = state.sent === true;
+          }
+          throw error;
+        }
+        // A network error or a timeout means the answer was lost, so the
+        // server may have accepted this slice even though we saw no 2xx.
+        state.sent = true;
         if (backoff >= retryDelaysMs.length) {
           return {
             action: 'restart',
             code: error.code,
             message: `upload failed after ${retryDelaysMs.length} retries`,
             cause: error,
+            sent: state.sent,
           };
         }
         await this.sleep(retryDelaysMs[backoff]);
@@ -391,22 +417,30 @@ class PairedClient {
       }
 
       const action = actionForStatus(response.status, response.headers.get('retry-after'));
-      if (action.action === 'continue') return { action: 'ok' };
+      if (action.action === 'continue') {
+        state.sent = true;
+        return { action: 'ok' };
+      }
       if (action.action === 'restart') {
         return {
           action: 'restart',
           code: 'upload_refused',
           message: 'the server asked to restart the upload',
+          sent: state.sent,
         };
       }
 
       if (action.action === 'wait') {
         const delay = action.retryAfterMs === null ? 1000 : action.retryAfterMs;
         if (!this.hasTime(this.now() + delay)) {
-          fail('expired', 'the ticket expires before the Retry-After wait ends');
+          fail('expired', 'the ticket expires before the Retry-After wait ends', {
+            sent: state.sent === true,
+          });
         }
         if (rateLimitWaits >= MAX_RATE_LIMIT_WAITS) {
-          fail('rate_limited', 'the server kept asking to retry later');
+          fail('rate_limited', 'the server kept asking to retry later', {
+            sent: state.sent === true,
+          });
         }
         rateLimitWaits += 1;
         await this.sleep(delay);
@@ -414,11 +448,15 @@ class PairedClient {
       }
 
       if (action.action === 'retry') {
+        // A 5xx is an answer, but not an accepted slice: the request may have
+        // reached the server and failed while saving, so the report is partial.
+        state.sent = true;
         if (backoff >= retryDelaysMs.length) {
           return {
             action: 'restart',
             code: 'server_error',
             message: `upload failed with status ${response.status}`,
+            sent: state.sent,
           };
         }
         await this.sleep(retryDelaysMs[backoff]);
@@ -426,7 +464,9 @@ class PairedClient {
         continue;
       }
 
-      fail(statusCode(response.status), `upload refused with status ${response.status}`);
+      fail(statusCode(response.status), `upload refused with status ${response.status}`, {
+        sent: state.sent === true,
+      });
     }
   }
 }

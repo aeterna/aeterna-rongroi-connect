@@ -100,6 +100,54 @@ test('createTempUserData passes the exact name to mkdtemp when fs is injected', 
   ]);
 });
 
+test('createTempUserData falls back to the exact name when rename fails', () => {
+  withTempRoot((root) => {
+    const pid = 8080;
+    const token = '0123456789abcdef';
+    const expected = path.join(root, tempName(pid, token));
+    let made = null;
+    const paths = [];
+    const fakeFs = {
+      ...fs,
+      mkdtempSync(prefix) {
+        made = fs.mkdtempSync(prefix);
+        return made;
+      },
+      renameSync() {
+        throw new Error('rename failed');
+      },
+    };
+
+    const directory = createTempUserData({
+      setPath(name, value) {
+        paths.push([name, value]);
+      },
+    }, {
+      os: { tmpdir: () => root },
+      fs: fakeFs,
+      pid,
+      random: () => token,
+    });
+
+    assert.notEqual(made, expected);
+    assert.equal(NAME.test(path.basename(made)), false);
+    assert.equal(directory, expected);
+    assert.equal(path.basename(directory), tempName(pid, token));
+    assert.equal(NAME.test(path.basename(directory)), true);
+    assert.equal(fs.existsSync(made), false);
+    assert.equal(fs.existsSync(expected), true);
+    assert.equal(fs.statSync(expected).isDirectory(), true);
+    assert.deepEqual(paths, [
+      ['userData', expected],
+      ['sessionData', expected],
+      ['crashDumps', expected],
+    ]);
+
+    assert.equal(removeTempUserData(directory, { fs }), true);
+    assert.equal(fs.existsSync(expected), false);
+  });
+});
+
 test('removeTempUserData removes a matching folder', () => {
   withTempRoot((root) => {
     const directory = path.join(root, tempName(99, '0123456789abcdef'));

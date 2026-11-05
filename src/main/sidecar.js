@@ -49,29 +49,40 @@ function createSidecarRunner(options = {}) {
   const connectTimeout = timeouts.connect ?? 60_000;
   const recordTimeout = timeouts.record ?? 120_000;
   const writeTimeout = timeouts.write ?? connectTimeout;
+  const exitGrace = timeouts.exit ?? 2_000;
   const verify = typeof options.verifySidecar === 'function'
     ? options.verifySidecar
     : (typeof module.exports.verifySidecar === 'function'
       ? module.exports.verifySidecar
       : verifySidecar);
 
-  return async function runSidecar(input = {}) {
+  async function runSidecarInner(input = {}) {
     const { binding, policy, producer, elevate, onElevationPending } = input;
 
     const name = await pipe.pipeName(randomBytes(16));
     let handle = await pipe.create(name);
     let child = null;
     let exited = false;
+    let exitCode = null;
     let connected = false;
     let closed = false;
+    let cancelled = false;
     let signalExit = null;
     let signalError = null;
+    let signalCancel = null;
+    let resolveProcessExit = null;
 
     const exitSignal = new Promise((resolve) => {
       signalExit = resolve;
     });
     const errorSignal = new Promise((resolve) => {
       signalError = resolve;
+    });
+    const cancelSignal = new Promise((resolve) => {
+      signalCancel = resolve;
+    });
+    const processExit = new Promise((resolve) => {
+      resolveProcessExit = resolve;
     });
 
     async function close() {
@@ -97,8 +108,58 @@ function createSidecarRunner(options = {}) {
       }
     }
 
+    function cancel() {
+      if (cancelled) return;
+      cancelled = true;
+      killIfOurs();
+      if (signalCancel !== null) {
+        const resolve = signalCancel;
+        signalCancel = null;
+        resolve();
+      }
+      // Closing is asynchronous, but the close starts before this returns so a
+      // second cancel cannot open another window.
+      void close();
+    }
+
+    function throwIfCancelled() {
+      if (cancelled) {
+        throw new SidecarError('sidecar_cancelled', 'the scan was canceled');
+      }
+    }
+
+    function waitForExit(millis) {
+      if (!exited && child !== null && typeof child.exitCode === 'number') {
+        exited = true;
+        exitCode = child.exitCode;
+      }
+      if (exited) return Promise.resolve(exitCode);
+      return new Promise((resolve) => {
+        let settled = false;
+        let timer = null;
+        const finish = (value) => {
+          if (settled) return;
+          settled = true;
+          if (timer !== null) clearTimeout(timer);
+          resolve(value);
+        };
+        timer = setTimeout(() => finish(undefined), millis);
+        processExit.then(finish);
+        cancelSignal.then(() => finish(undefined));
+      });
+    }
+
     try {
+      const registerCancel = typeof input.onCancel === 'function'
+        ? input.onCancel
+        : (typeof input.registerCancel === 'function'
+          ? input.registerCancel
+          : (typeof input.cancel === 'function' ? input.cancel : null));
+      if (registerCancel !== null) registerCancel(cancel);
+      throwIfCancelled();
+
       if (typeof verify === 'function') await verify();
+      throwIfCancelled();
 
       const command = sidecarCommand();
       if (command === null || command === undefined || typeof command.file !== 'string') {
@@ -115,9 +176,16 @@ function createSidecarRunner(options = {}) {
       if (child === null || child === undefined || typeof child.on !== 'function') {
         throw new Error('spawn did not return a child process');
       }
+      throwIfCancelled();
 
       child.on('exit', (code) => {
         exited = true;
+        exitCode = code;
+        if (resolveProcessExit !== null) {
+          const resolve = resolveProcessExit;
+          resolveProcessExit = null;
+          resolve(code);
+        }
         if (connected) return;
         if (code === 3) {
           signalExit({ declined: true });
@@ -132,6 +200,11 @@ function createSidecarRunner(options = {}) {
       child.on('error', (error) => {
         if (exited) return;
         exited = true;
+        if (resolveProcessExit !== null) {
+          const resolve = resolveProcessExit;
+          resolveProcessExit = null;
+          resolve(null);
+        }
         const failure = error instanceof Error ? error : new Error('sidecar process failed');
         signalExit({ error: failure });
         signalError({ error: failure });
@@ -147,7 +220,8 @@ function createSidecarRunner(options = {}) {
           (error) => ({ acceptError: error }),
         );
 
-      const decision = await Promise.race([acceptResult, exitSignal]);
+      const decision = await Promise.race([acceptResult, exitSignal, cancelSignal]);
+      throwIfCancelled();
 
       if (decision.declined === true) {
         await close();
@@ -167,6 +241,7 @@ function createSidecarRunner(options = {}) {
         const exchange = (async () => {
           const line = JSON.stringify({ binding, policy, producer });
           await pipe.writeLine(handle, line, writeTimeout);
+          throwIfCancelled();
           const record = await pipe.readUntilClose(handle, MAX_RECORD_BYTES, recordTimeout);
           if (recordBytes(record) > MAX_RECORD_BYTES) {
             throw new SidecarError(
@@ -174,13 +249,32 @@ function createSidecarRunner(options = {}) {
               `the sidecar record exceeds ${MAX_RECORD_BYTES} bytes`,
             );
           }
-          return { recordText: recordText(record) };
+
+          if (record === null || record === undefined) {
+            throw new SidecarError('sidecar_failed', 'the sidecar wrote an empty record');
+          }
+          const text = recordText(record);
+          if (text.trim().length === 0) {
+            throw new SidecarError('sidecar_failed', 'the sidecar wrote an empty record');
+          }
+
+          // A child that connected and then failed is not a bad record. Give it
+          // the ADR's 2 s to report its exit, but do not hold a live elevated
+          // sidecar's relaunching parent to that rule.
+          const code = await waitForExit(exitGrace);
+          throwIfCancelled();
+          if (typeof code === 'number' && code !== 0) {
+            throw new SidecarError('sidecar_failed', `sidecar exited with code ${code}`);
+          }
+
+          return { recordText: text };
         })().then(
           (value) => ({ value }),
           (error) => ({ exchangeError: error }),
         );
 
-        const outcome = await Promise.race([exchange, errorSignal]);
+        const outcome = await Promise.race([exchange, errorSignal, cancelSignal]);
+        throwIfCancelled();
         if (outcome.error !== undefined) throw outcome.error;
         if (outcome.exchangeError !== undefined) throw outcome.exchangeError;
 
@@ -202,6 +296,31 @@ function createSidecarRunner(options = {}) {
       await close();
       throw error;
     }
+  }
+
+  return function runSidecar(input = {}) {
+    let cancelFn = null;
+    let cancelRequested = false;
+
+    const register = (cancel) => {
+      if (typeof cancel !== 'function') return;
+      cancelFn = cancel;
+      if (typeof input.onCancel === 'function') input.onCancel(cancel);
+      if (typeof input.registerCancel === 'function') input.registerCancel(cancel);
+      if (typeof input.cancel === 'function') input.cancel(cancel);
+      if (cancelRequested) cancel();
+    };
+
+    const innerInput = {
+      ...input,
+      onCancel: register,
+    };
+    const promise = runSidecarInner(innerInput);
+    promise.cancel = () => {
+      cancelRequested = true;
+      if (cancelFn !== null) cancelFn();
+    };
+    return promise;
   };
 }
 

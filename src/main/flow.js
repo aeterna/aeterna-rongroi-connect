@@ -24,6 +24,16 @@ function errorKey(error) {
   return typeof error.code === 'string' && error.code.length > 0 ? error.code : 'internal';
 }
 
+function errorMayHaveSent(error) {
+  if (error !== null && typeof error === 'object' && typeof error.sent === 'boolean') {
+    return error.sent;
+  }
+  // An injected client may predate the upload error's field. Treat the
+  // request's lost-answer codes as "maybe"; a refusal is still false.
+  const code = error !== null && typeof error === 'object' ? error.code : undefined;
+  return code === 'network' || code === 'timeout' || code === 'server_error';
+}
+
 function isOriginError(error) {
   const code = error && typeof error.code === 'string' ? error.code : '';
   const message = error && typeof error.message === 'string' ? error.message : '';
@@ -90,6 +100,9 @@ function createFlow(options = {}) {
   let expected = null;
   let sent = false;
   let quitRequested = false;
+  let scanInFlight = false;
+  let scanCanceled = false;
+  let cancelScan = null;
 
   function publish(state) {
     current = state;
@@ -145,6 +158,40 @@ function createFlow(options = {}) {
     const key = errorKey(error);
     const retry = RETRYABLE_CODES.has(key) && hasTime();
     fail(key, exitCode, retry);
+  }
+
+  function rememberScanCancel(cancel) {
+    if (typeof cancel !== 'function') return;
+    if (scanCanceled) {
+      try {
+        cancel();
+      } catch {
+        // Cancelling is best effort; the flow has already chosen its result.
+      }
+      return;
+    }
+    cancelScan = cancel;
+  }
+
+  function cancelScanIfActive() {
+    if (!scanInFlight) return;
+    scanCanceled = true;
+    const cancel = cancelScan;
+    cancelScan = null;
+    if (typeof cancel !== 'function') return;
+    try {
+      cancel();
+    } catch {
+      // A failed cancel must not stop quit or expiry from finishing.
+    }
+  }
+
+  function cancelOrRegister(value) {
+    if (typeof value === 'function') {
+      rememberScanCancel(value);
+    } else {
+      cancelScanIfActive();
+    }
   }
 
   function consentState() {
@@ -310,25 +357,68 @@ function createFlow(options = {}) {
 
       publish(scanningState(false));
 
+      scanInFlight = true;
+      scanCanceled = false;
+      cancelScan = null;
+
       let answer;
       try {
-        answer = await runSidecar({
+        let tokenCancel = null;
+        const cancelToken = {};
+        Object.defineProperty(cancelToken, 'cancel', {
+          enumerable: true,
+          get() {
+            return tokenCancel;
+          },
+          set(value) {
+            tokenCancel = value;
+            rememberScanCancel(value);
+          },
+        });
+
+        const started = runSidecar({
           binding,
           policy,
           producer,
           elevate,
+          onCancel: rememberScanCancel,
+          registerCancel: rememberScanCancel,
+          cancel: cancelOrRegister,
+          cancelToken,
           onElevationPending() {
             if (current.name === 'scanning' && current.elevationPending !== true) {
               publish(scanningState(true));
             }
           },
-        });
+        }, rememberScanCancel);
+
+        let scanPromise = started;
+        if (started !== null && typeof started === 'object'
+            && typeof started.then !== 'function') {
+          if (started.promise !== null && typeof started.promise === 'object'
+              && typeof started.promise.then === 'function') {
+            scanPromise = started.promise;
+          } else if (started.result !== null && typeof started.result === 'object'
+              && typeof started.result.then === 'function') {
+            scanPromise = started.result;
+          }
+          if (typeof started.cancel === 'function') rememberScanCancel(started.cancel);
+        } else if (started !== null && typeof started === 'object'
+            && typeof started.cancel === 'function') {
+          rememberScanCancel(started.cancel);
+        }
+        answer = await scanPromise;
       } catch (error) {
+        if (scanCanceled || quitRequested || current.name !== 'scanning') return false;
         const tooLarge = error !== null && error !== undefined
           && (error.code === 'too_large'
             || /too_large|too large/i.test(String(error.message ?? '')));
         fail(tooLarge ? 'too_large' : 'sidecar_failed', tooLarge ? 14 : 13, false);
         return true;
+      } finally {
+        scanInFlight = false;
+        scanCanceled = false;
+        cancelScan = null;
       }
 
       if (quitRequested || current.name !== 'scanning') return false;
@@ -361,6 +451,7 @@ function createFlow(options = {}) {
   async function doSend() {
     busy = true;
     try {
+      sent = false;
       publish({ name: 'uploading' });
 
       let envelope;
@@ -378,13 +469,14 @@ function createFlow(options = {}) {
         return true;
       }
 
-      sent = true;
       try {
         await client.upload(bytes);
       } catch (error) {
         if (isConnectError(error)) {
+          sent = errorMayHaveSent(error);
           failConnect(error, 15);
         } else {
+          sent = false;
           fail('internal', 10, false);
         }
         return true;
@@ -407,6 +499,7 @@ function createFlow(options = {}) {
   async function doDecline(binding) {
     busy = true;
     try {
+      sent = false;
       const plaintext = JSON.stringify({
         scan: 'declined',
         binding: { ticket: binding.ticket, nonce: binding.nonce },
@@ -427,13 +520,14 @@ function createFlow(options = {}) {
         return true;
       }
 
-      sent = true;
       try {
         await client.decline(bytes);
       } catch (error) {
         if (isConnectError(error)) {
+          sent = errorMayHaveSent(error);
           fail(errorKey(error), 15, false);
         } else {
+          sent = false;
           fail('internal', 10, false);
         }
         return true;
@@ -477,6 +571,7 @@ function createFlow(options = {}) {
   function quit() {
     if (quitRequested) return exit;
     quitRequested = true;
+    cancelScanIfActive();
 
     let code;
     if (accepted) {
@@ -499,6 +594,7 @@ function createFlow(options = {}) {
 
     const left = Math.ceil((expiry - now()) / 1000);
     if (left <= 0) {
+      cancelScanIfActive();
       fail('expired', 15, false);
       return true;
     }

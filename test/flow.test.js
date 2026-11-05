@@ -331,13 +331,13 @@ test('an unexpected internal failure becomes internal with exit code 10', async 
   await reachHash(uploadFailure);
   await uploadFailure.flow.send();
   assert.equal(uploadFailure.flow.state().name, 'error');
-  assert.deepEqual(lastState(uploadFailure).error, { key: 'internal', sent: 'maybe' });
+  assert.deepEqual(lastState(uploadFailure).error, { key: 'internal', sent: false });
   assert.equal(uploadFailure.flow.exitCode(), 10);
 
   const declineFailure = makeHarness({ declineError: new Error('boom') });
   await reachConsent(declineFailure);
   await declineFailure.flow.decline();
-  assert.deepEqual(lastState(declineFailure).error, { key: 'internal', sent: 'maybe' });
+  assert.deepEqual(lastState(declineFailure).error, { key: 'internal', sent: false });
   assert.equal(declineFailure.flow.exitCode(), 10);
 });
 
@@ -532,17 +532,47 @@ test('a retryable upload error can retry through hash and send again', async () 
 test('retry is allowed for the four recoverable codes and never for the rest', async () => {
   const recoverable = ['network', 'timeout', 'server_error', 'upload_refused'];
   const terminal = ['ticket_used', 'expired', 'too_large', 'unknown_ticket', 'bad_request', 'redirect_refused'];
+  const lostAnswer = new Set(['network', 'timeout', 'server_error']);
 
   for (const code of [...recoverable, ...terminal]) {
     const h = makeHarness({ uploadError: new ConnectError(code, code) });
     await reachHash(h);
     assert.equal(await h.flow.send(), true);
     assert.equal(h.flow.state().name, 'error');
-    assert.deepEqual(lastState(h).error, { key: code, sent: 'maybe' });
+    assert.deepEqual(lastState(h).error, {
+      key: code,
+      sent: lostAnswer.has(code) ? 'maybe' : false,
+    });
     assert.equal(lastState(h).canRetry, recoverable.includes(code), code);
     assert.equal(h.flow.exitCode(), 15);
     assert.equal(h.flow.retry(), recoverable.includes(code), code);
   }
+});
+
+test('sent is false for a refusal or a bad envelope and maybe for a lost answer', async () => {
+  const firstRefusal = new ConnectError('ticket_used', 'used');
+  firstRefusal.sent = false;
+  const refused = makeHarness({ uploadError: firstRefusal });
+  await reachHash(refused);
+  await refused.flow.send();
+  assert.deepEqual(lastState(refused).error, { key: 'ticket_used', sent: false });
+  assert.equal(refused.flow.exitCode(), 15);
+
+  const badEnvelope = new ConnectError('bad_envelope', 'bad envelope');
+  badEnvelope.sent = false;
+  const bad = makeHarness({ uploadError: badEnvelope });
+  await reachHash(bad);
+  await bad.flow.send();
+  assert.deepEqual(lastState(bad).error, { key: 'bad_envelope', sent: false });
+  assert.equal(bad.flow.exitCode(), 15);
+
+  const lost = new ConnectError('network', 'offline');
+  lost.sent = true;
+  const maybe = makeHarness({ uploadError: lost });
+  await reachHash(maybe);
+  await maybe.flow.send();
+  assert.deepEqual(lastState(maybe).error, { key: 'network', sent: 'maybe' });
+  assert.equal(maybe.flow.exitCode(), 15);
 });
 
 test('an upload error at the ticket expiry cannot retry', async () => {
@@ -608,6 +638,61 @@ test('tick expires a scanning state and a hash state', async () => {
   assert.equal(hashing.flow.state().name, 'error');
   assert.deepEqual(lastState(hashing).error, { key: 'expired', sent: false });
   assert.equal(hashing.flow.exitCode(), 15);
+});
+
+test('quit during a scan cancels it and a late result changes nothing', async () => {
+  let cancelCalls = 0;
+  let release = null;
+  const h = makeHarness({
+    sidecar(input) {
+      input.onCancel(() => { cancelCalls += 1; });
+      return new Promise((resolve) => { release = resolve; });
+    },
+  });
+  await reachConsent(h);
+  const pending = h.flow.consent();
+  assert.equal(h.flow.state().name, 'scanning');
+  assert.equal(cancelCalls, 0);
+
+  assert.equal(h.flow.quit(), 11);
+  assert.equal(cancelCalls, 1);
+  assert.equal(h.flow.quit(), 11);
+  assert.equal(cancelCalls, 1);
+
+  release({ recordText: JSON.stringify(makeRecord()) });
+  assert.equal(await pending, false);
+  assert.equal(h.flow.state().name, 'scanning');
+  assert.equal(h.flow.exitCode(), 11);
+});
+
+test('tick expiry during a scan cancels it and a late result keeps the expired error', async () => {
+  const start = 1_700_000_000_000;
+  let cancelCalls = 0;
+  let release = null;
+  const h = makeHarness({
+    startNow: start,
+    expiresAtMs: start + 2_000,
+    sidecar(input) {
+      input.onCancel(() => { cancelCalls += 1; });
+      return new Promise((resolve) => { release = resolve; });
+    },
+  });
+  await reachConsent(h);
+  const pending = h.flow.consent();
+  assert.equal(h.flow.state().name, 'scanning');
+
+  h.setNow(start + 2_500);
+  assert.equal(h.flow.tick(), true);
+  assert.equal(cancelCalls, 1);
+  assert.equal(h.flow.state().name, 'error');
+  assert.deepEqual(lastState(h).error, { key: 'expired', sent: false });
+  assert.equal(h.flow.exitCode(), 15);
+
+  release({ recordText: JSON.stringify(makeRecord()) });
+  assert.equal(await pending, false);
+  assert.equal(h.flow.state().name, 'error');
+  assert.deepEqual(lastState(h).error, { key: 'expired', sent: false });
+  assert.equal(h.flow.exitCode(), 15);
 });
 
 test('quit returns 11 in every state before anything failed or was sent', async () => {

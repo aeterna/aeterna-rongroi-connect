@@ -65,14 +65,33 @@ function createTempUserData(app, options = {}) {
       if (typeof made === 'string' && made.length > 0) {
         directory = made;
         created = true;
-        if (!TEMP_NAME.test(baseName(made)) && typeof fs.renameSync === 'function') {
+        if (!TEMP_NAME.test(baseName(made))) {
           // Some Node versions append their own suffix to a template without
           // six X's. The folder must keep its exact name for the stale sweep.
-          try {
-            fs.renameSync(made, target);
+          let renamed = false;
+          if (typeof fs.renameSync === 'function') {
+            try {
+              fs.renameSync(made, target);
+              directory = target;
+              renamed = true;
+            } catch {
+              // Fall through to the exact-name path below.
+            }
+          }
+          if (!renamed) {
+            // The made folder cannot be swept under its generated name. Remove
+            // it best effort, then let the normal path create the exact name.
+            try {
+              if (typeof fs.rmSync === 'function') {
+                fs.rmSync(made, { force: true, recursive: true });
+              } else if (typeof fs.rmdirSync === 'function') {
+                fs.rmdirSync(made, { recursive: true });
+              }
+            } catch {
+              // A leftover folder must not stop the exact-name path.
+            }
             directory = target;
-          } catch {
-            directory = made;
+            created = false;
           }
         }
       }

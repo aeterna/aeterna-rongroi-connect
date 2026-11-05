@@ -110,7 +110,7 @@ function makeHarness(options = {}) {
     spawn,
     randomBytes,
     sidecarCommand,
-    timeouts: options.timeouts ?? { connect: 60_000, record: 120_000 },
+    timeouts: options.timeouts ?? { connect: 60_000, record: 120_000, exit: 20 },
     verifySidecar: options.verifySidecar,
   });
 
@@ -263,6 +263,121 @@ test('any other exit code before connecting rejects and closes the pipe', async 
   await assert.rejects(h.call(), /code 7/);
   assert.equal(callNames(h.pipe).includes('writeLine'), false);
   assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
+});
+
+test('a non-zero exit after the record is read rejects as a sidecar failure', async () => {
+  const h = makeHarness({
+    timeouts: { connect: 60_000, record: 120_000, exit: 100 },
+    pipe: (child) => makePipe(child, {
+      readUntilClose() {
+        setTimeout(() => child.emit('exit', 9), 5);
+        return Buffer.from('{"ok":true}');
+      },
+    }),
+  });
+
+  await assert.rejects(h.call(), (failure) => {
+    assert.equal(failure instanceof SidecarError, true);
+    assert.equal(failure.code, 'sidecar_failed');
+    assert.match(failure.message, /code 9/);
+    return true;
+  });
+  assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
+});
+
+test('a non-zero exit already reported when the record read ends is a sidecar failure', async () => {
+  const h = makeHarness({
+    pipe: (child) => makePipe(child, {
+      readUntilClose() {
+        child.emit('exit', 4);
+        return Buffer.from('{"ok":true}');
+      },
+    }),
+  });
+
+  await assert.rejects(h.call(), (failure) => {
+    assert.equal(failure.code, 'sidecar_failed');
+    assert.match(failure.message, /code 4/);
+    return true;
+  });
+  assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
+});
+
+test('a child that has not exited after the grace period still returns its record', async () => {
+  const h = makeHarness({
+    timeouts: { connect: 60_000, record: 120_000, exit: 20 },
+    pipeBehaves: { recordText: '{"schema":2}' },
+  });
+
+  assert.deepEqual(await h.call(), { recordText: '{"schema":2}' });
+  assert.equal(h.child.killed, 0);
+  assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
+});
+
+test('an empty record is a sidecar failure whatever the exit code', async () => {
+  for (const code of [0, 7]) {
+    const h = makeHarness({
+      pipe: (child) => makePipe(child, {
+        readUntilClose() {
+          child.emit('exit', code);
+          return Buffer.alloc(0);
+        },
+      }),
+    });
+
+    await assert.rejects(h.call(), (failure) => {
+      assert.equal(failure instanceof SidecarError, true);
+      assert.equal(failure.code, 'sidecar_failed');
+      assert.match(failure.message, /empty/i);
+      return true;
+    });
+    assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
+  }
+});
+
+test('a non-empty invalid record is left for the flow when the sidecar exits 0', async () => {
+  const h = makeHarness({
+    pipe: (child) => makePipe(child, {
+      readUntilClose() {
+        child.emit('exit', 0);
+        return Buffer.from('not json');
+      },
+    }),
+  });
+
+  assert.deepEqual(await h.call(), { recordText: 'not json' });
+});
+
+test('cancel kills the child, closes the pipe and is harmless when repeated', async () => {
+  let cancel = null;
+  let accepting;
+  const accepted = new Promise((resolve) => { accepting = resolve; });
+  const h = makeHarness({
+    pipe: () => makePipe(null, {
+      accept() {
+        accepting();
+        return new Promise(() => {});
+      },
+    }),
+  });
+
+  const pending = h.call({
+    onCancel(value) {
+      cancel = value;
+    },
+  });
+  await accepted;
+
+  assert.equal(typeof cancel, 'function');
+  cancel();
+  cancel();
+  assert.equal(h.child.killed, 1);
+  assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
+  await assert.rejects(pending, (failure) => {
+    assert.equal(failure instanceof SidecarError, true);
+    assert.equal(failure.code, 'sidecar_cancelled');
+    return true;
+  });
 });
 
 test('an accept timeout kills the child, closes the pipe and rejects', async () => {

@@ -448,6 +448,105 @@ test('stops on a 409 without retrying', async () => {
   });
 });
 
+test('a refusal on the first request carries sent false', async () => {
+  for (const [status, code] of [[409, 'ticket_used'], [413, 'too_large']]) {
+    await withServer((req, res) => {
+      res.writeHead(status);
+      res.end('no');
+    }, async (origin, requests) => {
+      const client = makeClient(origin);
+      await assert.rejects(client.upload(Buffer.from('direct')), (error) => {
+        assert.equal(error.code, code);
+        assert.equal(error.sent, false);
+        return true;
+      });
+      assert.equal(requests.length, 1);
+    });
+  }
+});
+
+test('a bad envelope carries sent false before any request', async () => {
+  let fetched = false;
+  const client = makeClient('http://127.0.0.1:9', {
+    fetchImpl: async () => {
+      fetched = true;
+      throw new Error('must not fetch');
+    },
+  });
+
+  await assert.rejects(client.upload(Buffer.alloc(0)), (error) => {
+    assert.equal(error.code, 'bad_envelope');
+    assert.equal(error.sent, false);
+    return true;
+  });
+  assert.equal(fetched, false);
+});
+
+test('a 5xx carries sent true even when no slice was accepted', async () => {
+  await withServer((req, res) => {
+    res.writeHead(500);
+    res.end('save failed');
+  }, async (origin, requests) => {
+    const client = makeClient(origin, { sleep: async () => {} });
+    await assert.rejects(client.upload(Buffer.from('direct')), (error) => {
+      assert.equal(error.code, 'server_error');
+      assert.equal(error.sent, true);
+      return true;
+    });
+    assert.ok(requests.length > 1);
+  });
+});
+
+test('a lost first answer carries sent true', async () => {
+  await withServer(() => {}, async (origin) => {
+    const client = makeClient(origin, {
+      timeoutMs: 100,
+      sleep: async () => {},
+    });
+    await assert.rejects(client.upload(Buffer.from('direct')), (error) => {
+      assert.equal(error.code, 'timeout');
+      assert.equal(error.sent, true);
+      return true;
+    });
+  });
+});
+
+test('a refusal after an accepted slice carries sent true', async () => {
+  const envelope = Buffer.alloc(9000, 3);
+  await withServer((req, res, entry) => {
+    if (entry.headers['x-rongroi-chunk-index'] === '1') {
+      res.writeHead(409);
+      res.end('used');
+      return;
+    }
+    res.writeHead(200);
+    res.end('ok');
+  }, async (origin, requests) => {
+    const client = makeClient(origin);
+    await assert.rejects(client.upload(envelope), (error) => {
+      assert.equal(error.code, 'ticket_used');
+      assert.equal(error.sent, true);
+      return true;
+    });
+    assert.equal(requests.length, 2);
+  });
+});
+
+test('a 422 restart before any 2xx carries sent false', async () => {
+  await withServer((req, res) => {
+    res.writeHead(422);
+    res.end('restart');
+  }, async (origin, requests) => {
+    const client = makeClient(origin);
+    await assert.rejects(client.upload(Buffer.from('direct')), (error) => {
+      assert.equal(error.code, 'upload_refused');
+      assert.equal(error.sent, false);
+      return true;
+    });
+    assert.equal(requests.length, 2);
+  });
+});
+
 test('times out a policy request', async () => {
   await withServer(() => {}, async (origin) => {
     const client = makeClient(origin, { timeoutMs: 100 });
