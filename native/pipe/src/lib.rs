@@ -26,7 +26,7 @@ mod napi_api {
         Error::new(Status::GenericFailure, error.code())
     }
 
-    struct CreateTask {
+    pub struct CreateTask {
         name: String,
     }
 
@@ -43,7 +43,7 @@ mod napi_api {
         }
     }
 
-    struct AcceptTask {
+    pub struct AcceptTask {
         handle: u32,
         timeout_ms: u32,
     }
@@ -61,7 +61,7 @@ mod napi_api {
         }
     }
 
-    struct ClientImageTask {
+    pub struct ClientImageTask {
         handle: u32,
     }
 
@@ -78,7 +78,7 @@ mod napi_api {
         }
     }
 
-    struct WriteLineTask {
+    pub struct WriteLineTask {
         handle: u32,
         text: String,
         timeout_ms: u32,
@@ -97,7 +97,7 @@ mod napi_api {
         }
     }
 
-    struct ReadUntilCloseTask {
+    pub struct ReadUntilCloseTask {
         handle: u32,
         max_bytes: u32,
         timeout_ms: u32,
@@ -117,7 +117,7 @@ mod napi_api {
         }
     }
 
-    struct CloseTask {
+    pub struct CloseTask {
         handle: u32,
     }
 

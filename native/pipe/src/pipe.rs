@@ -255,7 +255,7 @@ mod platform {
 
         // TOKEN_USER and SID_AND_ATTRIBUTES contain pointers, so the buffer must
         // be pointer-aligned.  A Vec<u64> gives at least that alignment.
-        let words = (needed as usize + size_of::<u64>() - 1) / size_of::<u64>();
+        let words = (needed as usize).div_ceil(size_of::<u64>());
         let mut buffer = vec![0u64; words];
         // SAFETY: the buffer is at least `needed` bytes and suitably aligned.
         unsafe {
@@ -392,8 +392,10 @@ mod platform {
 
         let event = create_event()?;
         let _event = HandleGuard(event);
-        let mut overlapped = OVERLAPPED::default();
-        overlapped.hEvent = event;
+        let mut overlapped = OVERLAPPED {
+            hEvent: event,
+            ..Default::default()
+        };
 
         // SAFETY: `handle` is an overlapped named-pipe instance and
         // `overlapped` outlives the call and any wait.
@@ -496,8 +498,10 @@ mod platform {
         while written_total < data.len() {
             let event = create_event()?;
             let _event = HandleGuard(event);
-            let mut overlapped = OVERLAPPED::default();
-            overlapped.hEvent = event;
+            let mut overlapped = OVERLAPPED {
+                hEvent: event,
+                ..Default::default()
+            };
 
             let chunk = &data[written_total..];
             let length = chunk.len().min(u32::MAX as usize) as u32;
@@ -589,13 +593,15 @@ mod platform {
             let room = maximum.saturating_sub(collected.len());
             // One byte over the cap is enough to notice a too-large record
             // without ever accumulating more than the caller allowed.
-            let chunk_size = (room + 1).min(64 * 1024).max(1);
+            let chunk_size = (room + 1).clamp(1, 64 * 1024);
             let mut buffer = vec![0u8; chunk_size];
 
             let event = create_event()?;
             let _event = HandleGuard(event);
-            let mut overlapped = OVERLAPPED::default();
-            overlapped.hEvent = event;
+            let mut overlapped = OVERLAPPED {
+                hEvent: event,
+                ..Default::default()
+            };
 
             let mut read = 0u32;
             // SAFETY: the buffer and overlapped structure are valid for the
