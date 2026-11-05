@@ -1,0 +1,90 @@
+# SPDX-FileCopyrightText: 2026 aeterna-rongroi contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    name: node (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - name: Install without running package scripts
+        run: npm ci --ignore-scripts
+      - name: Lint
+        run: npm run lint
+      - name: Tests
+        run: npm test
+      - name: Licensing (REUSE)
+        run: pipx run --spec reuse reuse lint
+
+  pipe:
+    name: pipe module (windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component clippy --component rustfmt
+          rustup default 1.98.1
+      - name: Format
+        working-directory: native/pipe
+        run: cargo fmt --check
+      - name: Clippy
+        working-directory: native/pipe
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests on a real pipe
+        working-directory: native/pipe
+        run: cargo test --locked
+
+  quarantine:
+    # ADR 0001 section 2: the proof runs on what ships. A hosted runner, never a shared one.
+    name: quarantine proof (windows)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+      - name: Install without running package scripts
+        run: npm ci --ignore-scripts
+      - name: Build the pipe module
+        run: npm run build:native
+      - name: Build the release folder
+        run: npm run build
+      - name: Build the test folder
+        run: npm run build:test
+      - name: Compare the two builds
+        run: node scripts/compare-builds.js dist/release dist/test
+      - name: Run the whole flow and check the netlog
+        run: npm run e2e
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-report
+          path: e2e-report.json
+          if-no-files-found: warn
