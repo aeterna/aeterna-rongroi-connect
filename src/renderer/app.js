@@ -1,0 +1,210 @@
+// SPDX-FileCopyrightText: 2026 aeterna-rongroi contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+(function () {
+  'use strict';
+
+  // The page CSP allows scripts only from the app itself and denies all
+  // network and data URLs, so the locale files are mirrored here.
+  var MESSAGES = {
+    en: {
+      "app.title": "Rongroi Connect",
+      "common.quit": "Quit",
+      "common.continue": "Continue",
+      "common.scan": "Scan",
+      "common.send": "Send",
+      "common.tryAgain": "Try again",
+      "common.countdown": "{time} left",
+      "paste.title": "Paste your code",
+      "paste.label": "Code",
+      "paste.placeholder": "rr1....",
+      "paste.warning": "Only paste a code shown to you inside the game",
+      "checking.contacting": "Contacting {origin}",
+      "consent.origin": "Server address",
+      "consent.serverCallsItself": "The server calls itself {name}",
+      "consent.collectors": "Collectors this server requires",
+      "consent.elevationYes": "Windows will ask for administrator rights",
+      "consent.elevationNo": "Windows will not ask for administrator rights",
+      "consent.localAddress": "This is a local address. Only continue if you trust this server.",
+      "consent.decline": "Decline and tell the server",
+      "scanning.title": "Scanning",
+      "scanning.elevationPending": "Windows will ask for permission",
+      "hash.see": "See what will be sent",
+      "uploading.sentence": "Sending the report to the server",
+      "uploading.progress": "Uploading {done} of {total}",
+      "done.sent": "Sent to {origin}. Code on this screen: {hash}.",
+      "declined.message": "You declined. {origin} was told.",
+      "error.title": "Something went wrong",
+      "error.bad_code": "The code is not one this app can read.",
+      "error.bad_origin": "The code points at an address this app cannot use.",
+      "error.policy_mismatch": "The server policy does not match this code.",
+      "error.unknown_ticket": "The server does not know this code.",
+      "error.expired": "This code has expired. Ask staff for a new one.",
+      "error.ticket_used": "This code was already used. Ask staff for a new one.",
+      "error.too_large": "This report is too large for the server to accept.",
+      "error.redirect_refused": "The server tried to send the request somewhere else. Nothing was sent.",
+      "error.network": "The server could not be reached.",
+      "error.timeout": "The server did not answer in time.",
+      "error.server_error": "The server could not accept the request.",
+      "error.sidecar_failed": "The scan program failed.",
+      "error.record_refused": "The scanner report was not in the expected form.",
+      "error.internal": "Something went wrong inside the app.",
+      "error.sentYes": "The report was sent.",
+      "error.sentNo": "Nothing was sent."
+    },
+    th: {
+      "app.title": "Rongroi Connect",
+      "common.quit": "ออก",
+      "common.continue": "ดำเนินการต่อ",
+      "common.scan": "Scan",
+      "common.send": "ส่ง",
+      "common.tryAgain": "ลองอีกครั้ง",
+      "common.countdown": "เหลืออีก {time}",
+      "paste.title": "วางโค้ดของคุณ",
+      "paste.label": "โค้ด",
+      "paste.placeholder": "rr1....",
+      "paste.warning": "วางเฉพาะโค้ดที่แสดงให้คุณเห็นในเกม",
+      "checking.contacting": "กำลังติดต่อ {origin}",
+      "consent.origin": "ที่อยู่เซิร์ฟเวอร์",
+      "consent.serverCallsItself": "เซิร์ฟเวอร์นี้เรียกตัวเองว่า {name}",
+      "consent.collectors": "Collectors ที่เซิร์ฟเวอร์นี้ต้องการ",
+      "consent.elevationYes": "Windows จะขอสิทธิ์ผู้ดูแลระบบ",
+      "consent.elevationNo": "Windows จะไม่ขอสิทธิ์ผู้ดูแลระบบ",
+      "consent.localAddress": "ที่อยู่นี้อยู่ในเครือข่ายท้องถิ่น ดำเนินการต่อเฉพาะเมื่อคุณไว้วางใจเซิร์ฟเวอร์นี้",
+      "consent.decline": "ปฏิเสธและแจ้งเซิร์ฟเวอร์",
+      "scanning.title": "กำลัง Scan",
+      "scanning.elevationPending": "Windows จะขออนุญาต",
+      "hash.see": "ดูสิ่งที่ถูกส่ง",
+      "uploading.sentence": "กำลังส่งรายงานไปยังเซิร์ฟเวอร์",
+      "uploading.progress": "กำลัง Upload {done} จาก {total}",
+      "done.sent": "ส่งไปยัง {origin} แล้ว โค้ดบนหน้าจอนี้: {hash}",
+      "declined.message": "คุณปฏิเสธแล้ว แจ้ง {origin} แล้ว",
+      "error.title": "เกิดข้อผิดพลาด",
+      "error.bad_code": "แอปนี้อ่านโค้ดนี้ไม่ได้",
+      "error.bad_origin": "โค้ดนี้ชี้ไปยังที่อยู่ที่แอปนี้ใช้ไม่ได้",
+      "error.policy_mismatch": "policy ของเซิร์ฟเวอร์ไม่ตรงกับโค้ดนี้",
+      "error.unknown_ticket": "เซิร์ฟเวอร์ไม่รู้จักโค้ดนี้",
+      "error.expired": "โค้ดนี้หมดอายุแล้ว ขอโค้ดใหม่จากทีมงาน",
+      "error.ticket_used": "โค้ดนี้ถูกใช้ไปแล้ว ขอโค้ดใหม่จากทีมงาน",
+      "error.too_large": "รายงานนี้ใหญ่เกินกว่าที่เซิร์ฟเวอร์จะรับได้",
+      "error.redirect_refused": "เซิร์ฟเวอร์พยายามส่งคำขอไปที่อื่น ไม่มีอะไรถูกส่ง",
+      "error.network": "ติดต่อเซิร์ฟเวอร์ไม่ได้",
+      "error.timeout": "เซิร์ฟเวอร์ไม่ตอบภายในเวลา",
+      "error.server_error": "เซิร์ฟเวอร์รับคำขอไม่ได้",
+      "error.sidecar_failed": "โปรแกรม Scan ล้มเหลว",
+      "error.record_refused": "รายงานจาก Scan ไม่อยู่ในรูปแบบที่คาดไว้",
+      "error.internal": "เกิดข้อผิดพลาดภายในแอป",
+      "error.sentYes": "รายงานถูกส่งแล้ว",
+      "error.sentNo": "ไม่มีอะไรถูกส่ง"
+    }
+  };
+
+  function chooseLanguage() {
+    var tag = typeof navigator !== 'undefined' && navigator.language
+      ? String(navigator.language)
+      : 'en';
+    return /^th([-_]|$)/i.test(tag) ? 'th' : 'en';
+  }
+
+  var language = chooseLanguage();
+  var messages = MESSAGES[language];
+
+  function t(key, params) {
+    var template = Object.prototype.hasOwnProperty.call(messages, key)
+      ? messages[key]
+      : (MESSAGES.en[key] || key);
+    return String(template).replace(/\{([a-z]+)\}/gi, function (match, name) {
+      return params && Object.prototype.hasOwnProperty.call(params, name)
+        ? String(params[name])
+        : match;
+    });
+  }
+
+  function build(node) {
+    if (!node || typeof node !== 'object') {
+      return document.createTextNode('');
+    }
+    if (node.tag === null || node.tag === undefined) {
+      return document.createTextNode(node.text === null || node.text === undefined
+        ? ''
+        : String(node.text));
+    }
+
+    var element = document.createElement(node.tag);
+    var attrs = node.attrs || {};
+    Object.keys(attrs).forEach(function (name) {
+      var value = attrs[name];
+      if (value === null || value === undefined || value === false) return;
+      element.setAttribute(name, String(value));
+    });
+
+    if (node.text !== null && node.text !== undefined && node.text !== '') {
+      element.textContent = String(node.text);
+    }
+    (node.children || []).forEach(function (child) {
+      element.appendChild(build(child));
+    });
+    return element;
+  }
+
+  function submitCode() {
+    var input = document.getElementById('pairing-code');
+    if (!input || typeof input.value !== 'string') return;
+    window.connect.submitCode(input.value.trim());
+  }
+
+  function runAction(action) {
+    if (action === 'submit') {
+      submitCode();
+    } else if (action === 'consent') {
+      window.connect.consent();
+    } else if (action === 'decline') {
+      window.connect.decline();
+    } else if (action === 'send') {
+      window.connect.send();
+    } else if (action === 'quit') {
+      window.connect.quit();
+    }
+  }
+
+  function draw(state) {
+    var app = document.getElementById('app');
+    if (!app || !window.RongroiView || typeof window.RongroiView.render !== 'function') {
+      return;
+    }
+
+    var tree = window.RongroiView.render(state, t);
+    app.textContent = '';
+    app.appendChild(build(tree));
+
+    if (state && state.name === 'paste') {
+      var input = document.getElementById('pairing-code');
+      if (input) input.focus();
+    }
+  }
+
+  if (typeof document !== 'undefined') {
+    document.addEventListener('click', function (event) {
+      var target = event.target;
+      if (!target || typeof target.closest !== 'function') return;
+      var trigger = target.closest('[data-action]');
+      if (!trigger) return;
+      runAction(trigger.getAttribute('data-action'));
+    });
+
+    document.addEventListener('keydown', function (event) {
+      if (event.key !== 'Enter') return;
+      var target = event.target;
+      if (target && target.id === 'pairing-code') {
+        event.preventDefault();
+        submitCode();
+      }
+    });
+
+    document.documentElement.lang = language;
+  }
+
+  if (typeof window !== 'undefined' && window.connect
+      && typeof window.connect.onState === 'function') {
+    window.connect.onState(draw);
+  }
+}());
