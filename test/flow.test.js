@@ -176,7 +176,11 @@ test('the happy path moves from paste to done with one upload', async () => {
   assert.equal(await h.flow.submitCode('rr1.test'), true);
   assert.deepEqual(names(), ['checking', 'consent']);
 
-  assert.deepEqual(h.makeClientCalls[0], { origin: ORIGIN, ticket: TICKET });
+  assert.deepEqual(h.makeClientCalls[0], {
+    origin: ORIGIN,
+    ticket: TICKET,
+    expiresAt: EXPIRES_AT,
+  });
   const consent = lastState(h);
   assert.equal(consent.serverOrigin, ORIGIN);
   assert.equal(consent.serverName, POLICY.server_name);
@@ -495,6 +499,23 @@ test('a typed too-large sidecar failure becomes too_large, not sidecar_failed', 
   assert.deepEqual(lastState(h).error, { key: 'too_large', sent: false });
   assert.equal(lastState(h).canRetry, false);
   assert.equal(h.flow.exitCode(), 14);
+  assert.equal(h.uploadCalls.length, 0);
+});
+
+test('a request_too_large sidecar failure is sidecar_failed with exit code 13', async () => {
+  const h = makeHarness({
+    sidecarError: new SidecarError(
+      'request_too_large',
+      'the sidecar request is too large (request_too_large, 16384 bytes)',
+    ),
+  });
+  await reachConsent(h);
+  assert.equal(await h.flow.consent(), true);
+  assert.equal(h.flow.state().name, 'error');
+  assert.deepEqual(lastState(h).error, { key: 'sidecar_failed', sent: false });
+  assert.equal(lastState(h).canRetry, false);
+  assert.equal(h.flow.exitCode(), 13);
+  assert.equal(h.emitted.some((state) => state.name === 'hash'), false);
   assert.equal(h.uploadCalls.length, 0);
 });
 

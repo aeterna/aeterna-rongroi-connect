@@ -166,6 +166,10 @@ function createSidecarRunner(options = {}) {
       const wait = Math.min(elevatedConnectTimeout, remaining);
       elevatedTimer = setTimeout(() => {
         elevatedTimer = null;
+        // Accept and this callback can become ready in the same tick.  A real
+        // connect that won the race must not be replaced by a timeout just
+        // because the timer had already been queued.
+        if (connected) return;
         signalExit({
           error: new SidecarError(
             'timeout',

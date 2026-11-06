@@ -311,13 +311,12 @@ function createFlow(options = {}) {
   async function fetchPolicy() {
     try {
       if (client === null) {
-        const pairing = { origin: parsed.serverOrigin, ticket: parsed.ticket };
-        // The code, not the policy, carries the expiry.  Attach it without
-        // changing the visible pairing shape the client is built from.
-        Object.defineProperty(pairing, 'expiresAt', {
-          value: parsed.expiresAt,
-          enumerable: false,
-        });
+        // The code, not the policy, carries the expiry.
+        const pairing = {
+          origin: parsed.serverOrigin,
+          ticket: parsed.ticket,
+          expiresAt: parsed.expiresAt,
+        };
         client = await makeClient(pairing);
       }
       const received = await client.getPolicy(parsed.policyHash);
@@ -415,7 +414,12 @@ function createFlow(options = {}) {
         });
       } catch (error) {
         if (scanCanceled || quitRequested || current.name !== 'scanning') return false;
-        const tooLarge = error !== null && error !== undefined
+        // A request the sidecar refuses for size is a failed scan, not a
+        // too-large record.  Check the typed code before the message regex so
+        // its "too large" wording cannot report the wrong key.
+        const requestTooLarge = error !== null && error !== undefined
+          && error.code === 'request_too_large';
+        const tooLarge = !requestTooLarge && error !== null && error !== undefined
           && (error.code === 'too_large'
             || /too_large|too large/i.test(String(error.message ?? '')));
         fail(tooLarge ? 'too_large' : 'sidecar_failed', tooLarge ? 14 : 13, false);

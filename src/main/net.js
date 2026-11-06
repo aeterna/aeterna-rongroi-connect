@@ -215,9 +215,13 @@ class PairedClient {
 
     const suppliedExpiry = expiresAt ?? expires_at
       ?? (origin !== null && typeof origin === 'object' ? origin.expiresAt ?? origin.expires_at : undefined);
-    this.expiresAtMs = suppliedExpiry === undefined || suppliedExpiry === null
+    // Keep the pairing code's expiry untouched.  Every Date-header correction
+    // recomputes the effective expiry from this value so a second policy fetch
+    // cannot apply the same offset twice.
+    this.codeExpiresAtMs = suppliedExpiry === undefined || suppliedExpiry === null
       ? null
       : expiresMillis(suppliedExpiry);
+    this.expiresAtMs = this.codeExpiresAtMs;
   }
 
   // Resolve a request path without fetching. The fetch path calls this too, so
@@ -348,7 +352,7 @@ class PairedClient {
     // expires_at is refused by the flow before this point, so always correct
     // the code's expiry rather than trusting the policy body.
     if (policy === null || typeof policy !== 'object') return;
-    const expires = this.expiresAtMs;
+    const expires = this.codeExpiresAtMs;
     if (!Number.isFinite(expires)) return;
 
     let offset = 0;

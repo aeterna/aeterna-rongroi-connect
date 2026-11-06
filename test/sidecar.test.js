@@ -4,6 +4,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const {
   createSidecarRunner,
   verifySidecar,
@@ -23,10 +24,12 @@ const POLICY = {
 const PRODUCER = { name: 'rongroi-connect', version: '0.1.0', mode: 'single-shot' };
 const MAX_RECORD_BYTES = 2 * 1024 * 1024;
 
-function makeChild() {
+// A real EventEmitter exercises the launcher's stdout paths.  `stdout: false`
+// keeps the "we cannot tell what the launcher printed" case available.
+function makeChild(options = {}) {
   const handlers = {};
   return {
-    stdout: {},
+    stdout: options.stdout === false ? {} : new EventEmitter(),
     killed: 0,
     on(event, handler) {
       if (handlers[event] === undefined) handlers[event] = [];
@@ -89,7 +92,7 @@ function makePipe(child, behaves = {}) {
 }
 
 function makeHarness(options = {}) {
-  const child = makeChild();
+  const child = makeChild({ stdout: options.stdout !== false });
   const pipe = options.pipe ? options.pipe(child) : makePipe(child, options.pipeBehaves);
   const spawnCalls = [];
   const commandCalls = [];
@@ -330,6 +333,7 @@ test('exit code 3 before connecting resolves as declined and closes the pipe', a
 
 test('exit code 0 before connecting fails after the elevated connect window', async () => {
   const h = makeHarness({
+    stdout: false,
     timeouts: { connect: 60_000, record: 120_000, exit: 20, elevatedConnect: 50 },
     pipe: (child) => makePipe(child, {
       accept() {
@@ -365,6 +369,98 @@ test('exit code 0 before connecting can still accept inside the elevated window'
   assert.equal(callNames(h.pipe).includes('clientImage'), true);
   assert.equal(callNames(h.pipe).includes('writeLine'), true);
   assert.equal(callNames(h.pipe).includes('readUntilClose'), true);
+});
+
+test('the launcher stdout request opens the window for a late accept', async () => {
+  const h = makeHarness({
+    timeouts: { connect: 60_000, record: 120_000, exit: 20, elevatedConnect: 1000 },
+    pipe: (child) => makePipe(child, {
+      accept() {
+        child.stdout.emit('data', '{"elevate":"requested"}');
+        child.emit('exit', 0);
+        return new Promise((resolve) => setTimeout(resolve, 20));
+      },
+      recordText: '{"schema":2}',
+    }),
+  });
+
+  assert.deepEqual(await h.call(), { recordText: '{"schema":2}' });
+  assert.equal(callNames(h.pipe).includes('clientImage'), true);
+  assert.equal(callNames(h.pipe).includes('writeLine'), true);
+  assert.equal(callNames(h.pipe).includes('readUntilClose'), true);
+});
+
+test('a launcher exit 0 without the stdout line fails as soon as stdout ends', async () => {
+  const h = makeHarness({
+    timeouts: { connect: 60_000, record: 120_000, exit: 20, elevatedConnect: 10_000 },
+    pipe: (child) => makePipe(child, {
+      accept() {
+        setTimeout(() => {
+          child.emit('exit', 0);
+          child.stdout.emit('end');
+        }, 5);
+        return new Promise(() => {});
+      },
+    }),
+  });
+
+  const started = Date.now();
+  await assert.rejects(h.call(), (failure) => {
+    assert.equal(failure instanceof SidecarError, true);
+    assert.equal(failure.code, 'sidecar_failed');
+    return true;
+  });
+  assert.ok(Date.now() - started < 5000);
+  assert.equal(callNames(h.pipe).includes('clientImage'), false);
+  assert.equal(callNames(h.pipe).includes('writeLine'), false);
+  assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
+});
+
+test('an exit before the launcher stdout line still waits for a later accept', async () => {
+  const h = makeHarness({
+    timeouts: { connect: 60_000, record: 120_000, exit: 20, elevatedConnect: 1000 },
+    pipe: (child) => makePipe(child, {
+      accept() {
+        child.emit('exit', 0);
+        setTimeout(() => {
+          child.stdout.emit('data', '{"elevate":"requested"}');
+        }, 5);
+        return new Promise((resolve) => setTimeout(resolve, 20));
+      },
+      recordText: '{"schema":2}',
+    }),
+  });
+
+  assert.deepEqual(await h.call(), { recordText: '{"schema":2}' });
+  assert.equal(callNames(h.pipe).includes('clientImage'), true);
+  assert.equal(callNames(h.pipe).includes('writeLine'), true);
+  assert.equal(callNames(h.pipe).includes('readUntilClose'), true);
+});
+
+test('stdout closing before an exit 0 launcher fails as a sidecar failure', async () => {
+  const h = makeHarness({
+    timeouts: { connect: 60_000, record: 120_000, exit: 20, elevatedConnect: 10_000 },
+    pipe: (child) => makePipe(child, {
+      accept() {
+        setTimeout(() => {
+          child.stdout.emit('close');
+          child.emit('exit', 0);
+        }, 5);
+        return new Promise(() => {});
+      },
+    }),
+  });
+
+  const started = Date.now();
+  await assert.rejects(h.call(), (failure) => {
+    assert.equal(failure instanceof SidecarError, true);
+    assert.equal(failure.code, 'sidecar_failed');
+    return true;
+  });
+  assert.ok(Date.now() - started < 5000);
+  assert.equal(callNames(h.pipe).includes('clientImage'), false);
+  assert.equal(callNames(h.pipe).includes('writeLine'), false);
+  assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
 });
 
 test('the elevated window does not outlive the remaining connect timeout', async () => {
