@@ -362,7 +362,7 @@ Lane 3c connected Connect to the real `rongroi-scan` sidecar (#3, #4, #6, #8). D
 and from "As built: 2c", each found while building or measuring:
 
 - **The sidecar is built from source at a pinned commit until 0.1.0** (owner, 2026-11-06). `sidecar.lock.json` names
-  aeterna-rongroi `3a08e2d`. CI checks out that commit, refuses a lock whose commit is not exactly 40 lowercase hex,
+  aeterna-rongroi `3a08e2d`. CI refuses a lock whose commit is not exactly 40 lowercase hex, checks out that commit,
   builds `rongroi-scan` with `--locked`, and `scripts/build.js` copies it next to the asar and writes its SHA-256 into
   `src/sidecar.json`. A missing `vendor/rongroi-scan.exe` fails the build. This build is not an official one
   (ADR 0007). Section 7's release asset, `SHA256SUMS` and attestation check are not built yet. 0.1.0 needs an
@@ -372,8 +372,10 @@ and from "As built: 2c", each found while building or measuring:
   player could replace it in between. The pipe check below compares the image path, not its bytes. Both stop a wrong
   or damaged file and other users' processes. Neither stops code that already runs as the player, which the Context
   above already puts outside what the client controls.
-- **The policy is checked as strictly as the sidecar checks it.** It has exactly five members, and `policy_hash` must
-  equal the canonical hash of the other four. Only the Standard tier's 20 collectors are accepted. A request line over
+- **The policy check is stricter.** The policy has exactly five members. The canonical hash of the policy without its
+  `policy_hash` member must equal the hash in the pairing code (`net.js`), and `policy_hash` must be 16 lowercase hex
+  characters. Each collector must be one of the 20 ids this build knows, with no duplicates (1 to 64 entries). The
+  profile may be `posture`, `standard` or `custom`, and nothing requires the whole Standard set. A request line over
   16 KiB is refused before any process starts.
 - **The client image check is in** (C3). The 2c gap above is closed: Connect compares the pipe client's image path
   with the bundled sidecar and drops a mismatch. Section 4's open question is answered for one PC: on Windows, with
