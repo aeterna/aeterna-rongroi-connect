@@ -6,7 +6,8 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 - Status: accepted — owner, 2026-11-01 (local-address origins and the 14-day patch rule accepted)
 - Date: 2026-11-01
-- Amended: 2026-11-05, lane 2c as built ("As built: 2c"); Claude Code - Claude Opus 5.5
+- Amended: 2026-11-05, lane 2c as built ("As built: 2c"); 2026-11-07, lane 3c as built ("As built: 3c");
+  Claude Code - Claude Opus 5.5
 - Related: aeterna-rongroi ADR 0089 (product line and schema 2,
   [aeterna-rongroi#252](https://github.com/aeterna/aeterna-rongroi/pull/252), not merged yet; this ADR follows
   its revision of 2026-11-01), ADR 0002 (evidence, never a verdict), ADR 0007 (official builds), ADR 0012
@@ -354,6 +355,56 @@ Differences from the sections above, each found while building:
 - A refused code or policy, and any other error without "Try again", is final for the run: the player closes Connect and starts it again to enter a new code. This is `single-shot` as defined above.
 - **The client image check of section 4 is not in 2c.** The pipe module exposes it and nothing calls it yet. Until lane 3c adds it, a process running as the same user that opens the pipe first gets the binding, policy and producer, and can supply the record. 0.1.0 does not ship without it.
 - **What the release smoke shows.** The release folder's exe stayed running for 8 seconds, with embedded asar integrity on. It does not show that the window drew or that the release build completes a flow, since the test hook is not in it. The byte comparison with the test build carries the rest.
+
+## As built: 3c
+
+Lane 3c connected Connect to the real `rongroi-scan` sidecar (#3, #4, #6, #8). Differences from the sections above
+and from "As built: 2c", each found while building or measuring:
+
+- **The sidecar is built from source at a pinned commit until 0.1.0** (owner, 2026-11-06). `sidecar.lock.json` names
+  aeterna-rongroi `3a08e2d`. CI checks out that commit, refuses a lock whose commit is not exactly 40 lowercase hex,
+  builds `rongroi-scan` with `--locked`, and `scripts/build.js` copies it next to the asar and writes its SHA-256 into
+  `src/sidecar.json`. A missing `vendor/rongroi-scan.exe` fails the build. This build is not an official one
+  (ADR 0007). Section 7's release asset, `SHA256SUMS` and attestation check are not built yet. 0.1.0 needs an
+  aeterna-rongroi release that carries the asset.
+- **Connect checks the sidecar's SHA-256 before every launch.** This is a time-of-check to time-of-use pair: Connect
+  hashes the file and the operating system opens it again when it starts the process, so a process running as the
+  player could replace it in between. The pipe check below compares the image path, not its bytes. Both stop a wrong
+  or damaged file and other users' processes. Neither stops code that already runs as the player, which the Context
+  above already puts outside what the client controls.
+- **The policy is checked as strictly as the sidecar checks it.** It has exactly five members, and `policy_hash` must
+  equal the canonical hash of the other four. Only the Standard tier's 20 collectors are accepted. A request line over
+  16 KiB is refused before any process starts.
+- **The client image check is in** (C3). The 2c gap above is closed: Connect compares the pipe client's image path
+  with the bundled sidecar and drops a mismatch. Section 4's open question is answered for one PC: on Windows, with
+  Connect at Medium integrity and the player answering Yes to UAC, Connect read the elevated copy's image path and the
+  scan completed (2026-11-07). Other Windows versions and security products are unmeasured.
+- **After the launcher prints `{"elevate":"requested"}` and exits 0, the elevated copy has 15 s to connect**, inside
+  the 60 s connect limit. A launcher that exits 0 without that line has scanned already, or failed if no connection came.
+- **Declining UAC works end to end.** The launcher exits 3, Connect sends the declined answer, and the state is
+  "Declined" 2.6 s after scanning began (2026-11-07). The mock Kit had refused that answer with 400 because it took only
+  schema 2 records. #8 made it follow the real Kit's rule (binding ticket and nonce for both kinds, `scan: "declined"`
+  without a schema).
+- **A Standard scan is far inside section 4's limits.** Measured with 20 collectors:
+
+  | Where | Run | Scan | Record |
+  |---|---|---:|---:|
+  | Hosted Windows runner (High integrity), run 42307666982 | elevated, first and cold | 29.0 s (run) | 112,450 B |
+  | same | unelevated, after it | 6.0 s (run) | 112,446 B |
+  | Development PC, Connect at Medium integrity, UAC Yes | elevated | 18.8 s | 199,766 B |
+  | same | unelevated | 4.2 s | 49,953 B |
+
+  The first scan on a machine is the slow one, about 27 s on the runner with or without elevation. Records are at
+  most a tenth of the 2 MiB limit. These are two machines, not a range for players' PCs.
+- **CI does not exercise the UAC relaunch.** The hosted runner's job runs at High integrity, so `--elevate` scans in
+  place with no prompt. The prompt, Yes and No, was checked by hand on a PC. An elevated run that waited 120 s in
+  `scanning` during wave 2 did not happen again once each run's policy reached the mock Kit (two traced runs, debug PR #5).
+  Its cause is not proven.
+- **Still open before 0.1.0:** Windows with a working IPv6 route (the 2c socket exception above, measured with
+  `pktmon` and a control that sends); quitting during an elevated scan, which only unit tests cover because a scan ends
+  too fast to quit by hand; the release asset, `SHA256SUMS` and attestation of section 7. The real-sidecar runs found
+  none of the run's ticket, nonce or Kit key in the files left in `%TEMP%` (run 42307666982); the 2c limits of that
+  search still apply.
 
 ## Consequences
 
