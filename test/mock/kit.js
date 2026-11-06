@@ -115,6 +115,7 @@ async function startKit(options = {}) {
   const uploads = new Map();
   const hashes = new Map();
   let storedRecord = null;
+  let storedDeclined = false;
   let storedHash = null;
   let storedRecordVisualHash = null;
   let storedRecordBytes = null;
@@ -156,14 +157,33 @@ async function startKit(options = {}) {
     } catch {
       return null;
     }
-    if (record === null || typeof record !== 'object' || Array.isArray(record)
-        || record.schema !== 2) {
+    if (record === null || typeof record !== 'object' || Array.isArray(record)) {
       return null;
     }
+    // The real Kit validates the binding for reports and declined answers
+    // alike: it must be an object naming both the ticket and the nonce.
     if (record.binding === null || typeof record.binding !== 'object'
+        || Array.isArray(record.binding)
+        || record.binding.ticket !== ticket
         || record.binding.nonce !== nonce) {
       return null;
     }
+
+    const declined = record.scan === 'declined';
+    if (!declined && record.schema !== 2) {
+      return null;
+    }
+
+    if (declined) {
+      // A declined answer carries no report: there is nothing to hash and the
+      // stored report and policy facts stay exactly as they were.
+      storedDeclined = true;
+      received += 1;
+      if (print) console.log(JSON.stringify({ received: true, declined: true }));
+      return true;
+    }
+
+    storedDeclined = false;
 
     let computed;
     try {
@@ -449,6 +469,9 @@ async function startKit(options = {}) {
     },
     get record() {
       return storedRecord;
+    },
+    get declined() {
+      return storedDeclined;
     },
     get received() {
       return received;
