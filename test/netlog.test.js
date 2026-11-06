@@ -1007,8 +1007,8 @@ test('real mode runs posture and Standard without elevation in CI', () => {
   assert.equal(standard.policy.profile, 'standard');
   assert.equal(standard.policy.required_collectors.length, 20);
   assert.deepEqual(standard.policy.required_collectors, STANDARD_COLLECTORS);
-  // A hosted CI runner cannot answer a UAC prompt, so the elevated path is
-  // checked by hand on a real PC (lane 3c M1).
+  // With --elevate on the hosted CI runner, Connect stayed in `scanning`
+  // (elevationPending) for 120 s; cause unknown, lane 3c follow-up + M1 manual PC check.
   assert.equal(standard.policy.require_elevation, false);
 });
 

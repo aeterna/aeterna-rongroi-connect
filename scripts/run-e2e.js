@@ -36,9 +36,8 @@ const REAL_RUNS = Object.freeze([
     policy: Object.freeze({
       profile: 'standard',
       required_collectors: STANDARD_COLLECTORS,
-      // A hosted CI runner cannot answer a UAC prompt, so an elevated run
-      // would wait in `scanning` until the 120 s limit.  Test elevation by
-      // hand on a real PC instead (lane 3c M1).
+      // With --elevate on the hosted CI runner, Connect stayed in `scanning`
+      // (elevationPending) for 120 s; cause unknown, lane 3c follow-up + M1 manual PC check.
       require_elevation: false,
     }),
   }),
