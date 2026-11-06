@@ -23,11 +23,18 @@ const {
   runSpecs,
   parseArguments,
   kitEnvironment,
+  applicationEnv,
+  parseHookStates,
+  summarizeHookStates,
   listTempTopLevel,
   newTempEntries,
   captureNewTempEntries,
   LEFTOVER_MAX_BYTES,
 } = require('../scripts/run-e2e');
+const {
+  DEFAULT_STATE_TIMEOUT_MS,
+  parseStateTimeoutMs,
+} = require('../test/hook/test-hook');
 const { STANDARD_COLLECTORS } = require('./mock/kit');
 
 const ALLOWED = '127.0.0.1:30120';
@@ -1033,6 +1040,109 @@ test('the Kit child environment drops a policy inherited from the parent', () =>
       process.env.RONGROI_MOCK_KIT_POLICY = original;
     }
   }
+});
+
+test('a real run gives the test hook five minutes for a Standard scan', () => {
+  const original = process.env.CONNECT_TEST_STATE_TIMEOUT_MS;
+  process.env.CONNECT_TEST_STATE_TIMEOUT_MS = '1';
+
+  try {
+    const env = applicationEnv({ code: 'pair-code' }, 'real');
+    assert.equal(env.CONNECT_TEST_STATE_TIMEOUT_MS, '300000');
+    assert.equal(env.CONNECT_TEST_CODE, 'pair-code');
+    assert.equal('CONNECT_TEST_NODE' in env, false);
+    assert.equal('CONNECT_TEST_SIDECAR' in env, false);
+  } finally {
+    if (original === undefined) {
+      delete process.env.CONNECT_TEST_STATE_TIMEOUT_MS;
+    } else {
+      process.env.CONNECT_TEST_STATE_TIMEOUT_MS = original;
+    }
+  }
+});
+
+test('a mock run leaves the test hook on its default timeout', () => {
+  const original = process.env.CONNECT_TEST_STATE_TIMEOUT_MS;
+  process.env.CONNECT_TEST_STATE_TIMEOUT_MS = '1';
+
+  try {
+    const env = applicationEnv({ code: 'pair-code' }, 'mock');
+    assert.equal('CONNECT_TEST_STATE_TIMEOUT_MS' in env, false);
+    assert.equal(env.CONNECT_TEST_NODE, process.execPath);
+    assert.ok(env.CONNECT_TEST_SIDECAR.endsWith(path.join('test', 'mock', 'sidecar.js')));
+  } finally {
+    if (original === undefined) {
+      delete process.env.CONNECT_TEST_STATE_TIMEOUT_MS;
+    } else {
+      process.env.CONNECT_TEST_STATE_TIMEOUT_MS = original;
+    }
+  }
+});
+
+test('the test hook reads a positive integer state timeout', () => {
+  assert.equal(DEFAULT_STATE_TIMEOUT_MS, 60 * 1000);
+  assert.equal(parseStateTimeoutMs('300000'), 300000);
+  assert.equal(parseStateTimeoutMs('1'), 1);
+  assert.equal(parseStateTimeoutMs(' 45000 '), 45000);
+});
+
+test('an invalid state timeout falls back to the sixty second default', () => {
+  for (const value of [
+    undefined,
+    null,
+    '',
+    ' ',
+    'not-a-number',
+    '0',
+    '000',
+    '-1',
+    '-60000',
+    '1.5',
+    'NaN',
+    'Infinity',
+    '12x',
+  ]) {
+    assert.equal(parseStateTimeoutMs(value), 60 * 1000, String(value));
+  }
+});
+
+test('the hook state lines measure a scan that left the scanning state', () => {
+  const states = parseHookStates([
+    '{"name":"consent","observedAt":1000}',
+    '[hook] a line that is not a state',
+    '{"name":"scanning","observedAt":2000}',
+    '{"name":"hash","observedAt":32000}',
+  ].join('\n'));
+
+  assert.deepEqual(summarizeHookStates(states), {
+    scanningSeconds: 30,
+    lastState: 'hash',
+  });
+});
+
+test('a failed scan is measured up to the hook failure line', () => {
+  const states = parseHookStates([
+    '{"name":"scanning","observedAt":2000}',
+    '{"name":"scanning","observedAt":62000,"failed":true}',
+  ].join('\n'));
+
+  assert.deepEqual(summarizeHookStates(states), {
+    scanningSeconds: 60,
+    lastState: 'scanning',
+  });
+});
+
+test('a run with no observed scanning state records null seconds', () => {
+  assert.deepEqual(summarizeHookStates([]), {
+    scanningSeconds: null,
+    lastState: null,
+  });
+  assert.deepEqual(summarizeHookStates([
+    { name: 'done', observedAt: 5, failed: false },
+  ]), {
+    scanningSeconds: null,
+    lastState: 'done',
+  });
 });
 
 test('--sidecar selects real by default and accepts real or mock', () => {

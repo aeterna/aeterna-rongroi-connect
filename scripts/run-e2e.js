@@ -41,6 +41,7 @@ const REAL_RUNS = Object.freeze([
   }),
 ]);
 const APP_LIMIT_MS = 120 * 1000;
+const REAL_STATE_TIMEOUT_MS = 300 * 1000;
 const RELEASE_SMOKE_MS = 8 * 1000;
 const REQUIRED_PATHS = [...DEFAULT_REQUIRED_PATHS];
 const LEFTOVER_MAX_BYTES = 1024 * 1024;
@@ -85,6 +86,74 @@ function readLines(stream, onLine) {
     if (line !== '') onLine(line);
     buffered = '';
   });
+}
+
+// The test hook prints a JSON line for each state it sees and marks the final
+// line of a failed run.  These lines are only diagnostics for the report; the
+// outcome still comes from the exit code and the Kit.
+function parseHookStates(text) {
+  const states = [];
+  for (const rawLine of String(text ?? '').split('\n')) {
+    const line = rawLine.trim();
+    if (line === '' || line[0] !== '{') continue;
+
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (message === null || typeof message !== 'object' || Array.isArray(message)) continue;
+    if (typeof message.name !== 'string' || message.name === '') continue;
+
+    states.push({
+      name: message.name,
+      observedAt: typeof message.observedAt === 'number'
+        && Number.isFinite(message.observedAt)
+        ? message.observedAt
+        : null,
+      failed: message.failed === true,
+    });
+  }
+  return states;
+}
+
+function summarizeHookStates(states) {
+  const list = Array.isArray(states) ? states : [];
+  let lastState = null;
+  for (const state of list) {
+    if (state !== null && typeof state === 'object' && typeof state.name === 'string') {
+      lastState = state.name;
+    }
+  }
+
+  const scanning = list.findIndex((state) => (
+    state !== null && typeof state === 'object' && state.name === 'scanning'
+  ));
+  if (scanning === -1) return { scanningSeconds: null, lastState };
+
+  const start = list[scanning].observedAt;
+  let end = null;
+  for (let index = scanning + 1; index < list.length; index += 1) {
+    const state = list[index];
+    if (state === null || typeof state !== 'object') continue;
+    if (state.name !== 'scanning' && state.observedAt !== null) {
+      end = state.observedAt;
+      break;
+    }
+  }
+  if (end === null) {
+    // A scan that never left `scanning` ends at the hook's failed line.
+    const final = list[list.length - 1];
+    if (final !== null && typeof final === 'object'
+        && final.failed === true && final.observedAt !== null) {
+      end = final.observedAt;
+    }
+  }
+  if (typeof start !== 'number' || typeof end !== 'number' || end < start) {
+    return { scanningSeconds: null, lastState };
+  }
+  return { scanningSeconds: (end - start) / 1000, lastState };
 }
 
 // The Kit child can only serve the run's policy if the parent hands it over in
@@ -612,11 +681,16 @@ function applicationEnv(kitInfo, sidecarMode) {
   if (sidecarMode === 'mock') {
     env.CONNECT_TEST_NODE = process.execPath;
     env.CONNECT_TEST_SIDECAR = path.join(ROOT, 'test', 'mock', 'sidecar.js');
+    // The mock sidecar finishes inside the hook's default one-minute guard.
+    delete env.CONNECT_TEST_STATE_TIMEOUT_MS;
   } else {
     // Real mode uses the bundled resources/rongroi-scan.exe, so the test hook
     // must see no override at all.  The hash and image checks stay active.
     delete env.CONNECT_TEST_NODE;
     delete env.CONNECT_TEST_SIDECAR;
+    // A real Standard scan can stay in `scanning` past one minute.  Give the
+    // hook five minutes; Connect's own record timeout still bounds the scan.
+    env.CONNECT_TEST_STATE_TIMEOUT_MS = String(REAL_STATE_TIMEOUT_MS);
   }
   return env;
 }
@@ -643,6 +717,10 @@ function createRunReport(name, policy, negativeControl, sidecarMode) {
     kitHashEqualsRecord: false,
     recordBytes: null,
     scanSeconds: null,
+    // Filled from the hook's state lines.  Both stay null when the hook never
+    // printed the state they need (for example an app killed before it wrote).
+    scanningSeconds: null,
+    lastState: null,
     rongroi_version: null,
     recordKind: null,
     officialBuild: null,
@@ -791,6 +869,13 @@ async function runOnce(options) {
     runReport.timedOut = run.timedOut;
     runReport.error = run.error === null ? null : run.error.message;
 
+    const hookStates = parseHookStates(run.stdout);
+    const hookSummary = summarizeHookStates(hookStates);
+    // The hook prints the state lines; if it never printed `scanning` (for
+    // example the app was killed before the watcher saw it) this stays null.
+    runReport.scanningSeconds = hookSummary.scanningSeconds;
+    runReport.lastState = hookSummary.lastState;
+
     if (!run.error && !run.timedOut && run.exitCode === 0 && !kit.received) {
       try {
         await withTimeout(kit.receivedPromise, 5 * 1000, 'the mock kit did not report received');
@@ -816,6 +901,8 @@ async function runOnce(options) {
       && runReport.error === null
       && !runReport.timedOut
       && runReport.exitCode === 0;
+    // `lastState` is a diagnostic for a run that did not finish.
+    if (runReport.done) runReport.lastState = null;
 
     runReport.netlogCopyPath = netlogCopyPath;
     if (fs.existsSync(netlogPath)) {
@@ -1060,6 +1147,8 @@ async function main(argv) {
     kitHashEqualsRecord: false,
     recordBytes: null,
     scanSeconds: null,
+    scanningSeconds: null,
+    lastState: null,
     rongroi_version: null,
     netlogOk: false,
     netlogRepaired: false,
@@ -1159,6 +1248,8 @@ async function main(argv) {
     && runs.every((run) => run.kitHashEqualsRecord === true);
   report.recordBytes = last === null ? null : last.recordBytes;
   report.scanSeconds = last === null ? null : last.scanSeconds;
+  report.scanningSeconds = last === null ? null : last.scanningSeconds;
+  report.lastState = firstMessage(runs, 'lastState');
   report.rongroi_version = last === null ? null : last.rongroi_version;
   report.netlogOk = runs.length > 0 && runs.every((run) => run.netlogOk);
   report.netlogRepaired = runs.some((run) => run.netlogRepaired);
@@ -1239,6 +1330,9 @@ module.exports = {
   runSucceeded,
   runSpecs,
   kitEnvironment,
+  applicationEnv,
+  parseHookStates,
+  summarizeHookStates,
   runApplication,
   releaseSmoke,
   main,
