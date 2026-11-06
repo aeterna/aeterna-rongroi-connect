@@ -11,6 +11,7 @@ const {
 } = require('../src/main/sidecar');
 
 const PIPE_NAME = '\\\\.\\pipe\\rongroi-0123456789abcdef0123456789abcdef';
+const DEFAULT_COMMAND_FILE = 'C:\\Program Files\\Rongroi Connect\\rongroi-scan.exe';
 const TICKET = '9f82c4e1b07a412891d604e38a291bf0';
 const NONCE = 'nonce-abc-123';
 const POLICY = {
@@ -59,6 +60,12 @@ function makePipe(child, behaves = {}) {
       if (behaves.accept) return behaves.accept({ id, timeoutMs, child, calls });
       return undefined;
     },
+    async clientImage(id) {
+      calls.push(['clientImage', id]);
+      if (behaves.clientImage) return behaves.clientImage({ id, child, calls });
+      if (behaves.clientImageError) throw behaves.clientImageError;
+      return behaves.clientImagePath ?? DEFAULT_COMMAND_FILE;
+    },
     async writeLine(id, text, timeoutMs) {
       calls.push(['writeLine', id, text, timeoutMs]);
       if (behaves.writeLine) return behaves.writeLine({ id, text, timeoutMs, child, calls });
@@ -102,14 +109,19 @@ function makeHarness(options = {}) {
 
   const sidecarCommand = options.sidecarCommand ?? (() => {
     commandCalls.push(true);
-    return { file: 'C:\\Program Files\\Rongroi Connect\\rongroi-scan.exe', args: ['--version', 'x'] };
+    return { file: DEFAULT_COMMAND_FILE, args: ['--version', 'x'] };
   });
+
+  const fs = options.fs ?? { existsSync: () => false };
+  const realpath = options.realpath ?? ((value) => value);
 
   const runner = createSidecarRunner({
     pipe,
     spawn,
     randomBytes,
     sidecarCommand,
+    fs,
+    realpath,
     timeouts: options.timeouts ?? { connect: 60_000, record: 120_000, exit: 20 },
     verifySidecar: options.verifySidecar,
   });
@@ -136,6 +148,25 @@ function makeHarness(options = {}) {
 
 function callNames(pipe) {
   return pipe.calls.map((call) => call[0]);
+}
+
+function policyWithLineBytes(bytes) {
+  const base = { ...POLICY, server_name: '' };
+  const withoutPadding = JSON.stringify({
+    binding: { ticket: TICKET, nonce: NONCE },
+    policy: base,
+    producer: PRODUCER,
+  });
+  const padding = bytes - Buffer.byteLength(withoutPadding, 'utf8');
+  assert.ok(padding >= 0);
+  const policy = { ...base, server_name: 'x'.repeat(padding) };
+  const line = JSON.stringify({
+    binding: { ticket: TICKET, nonce: NONCE },
+    policy,
+    producer: PRODUCER,
+  });
+  assert.equal(Buffer.byteLength(line, 'utf8'), bytes);
+  return policy;
 }
 
 test('the runner builds the pipe, spawns the sidecar and returns the record text', async () => {
@@ -218,6 +249,69 @@ test('elevation adds --elevate and announces the pending UAC prompt', async () =
   assert.equal(pending, 1);
 });
 
+test('the pipe client image is checked after accept and before writeLine', async () => {
+  const h = makeHarness();
+  const result = await h.call();
+  const names = callNames(h.pipe);
+  const accept = names.indexOf('accept');
+  const image = names.indexOf('clientImage');
+  const write = names.indexOf('writeLine');
+
+  assert.deepEqual(result, { recordText: '{"ok":true}' });
+  assert.equal(image, accept + 1);
+  assert.equal(write, image + 1);
+  assert.deepEqual(h.pipe.calls[image], ['clientImage', 7]);
+});
+
+test('a client image that differs only in case is the spawned sidecar', async () => {
+  const h = makeHarness({
+    pipeBehaves: {
+      clientImagePath: 'c:\\program files\\rongroi connect\\RONGROI-SCAN.EXE',
+    },
+  });
+
+  assert.deepEqual(await h.call(), { recordText: '{"ok":true}' });
+  assert.equal(callNames(h.pipe).includes('clientImage'), true);
+});
+
+test('the image check resolves both paths with realpath when they exist', async () => {
+  const real = 'C:\\Program Files\\Rongroi Connect\\rongroi-scan.exe';
+  const h = makeHarness({
+    fs: { existsSync: () => true },
+    realpath(value) {
+      return value === 'C:\\link\\scan.exe' ? real : value;
+    },
+    pipeBehaves: { clientImagePath: 'C:\\link\\scan.exe' },
+  });
+
+  assert.deepEqual(await h.call(), { recordText: '{"ok":true}' });
+  assert.equal(callNames(h.pipe).includes('clientImage'), true);
+});
+
+test('a client image that is not the spawned sidecar fails before writing', async () => {
+  const cases = [
+    ['another path', { clientImagePath: 'C:\\Windows\\System32\\cmd.exe' }],
+    ['null', { clientImage: () => null }],
+    ['an error', { clientImageError: new Error('cannot read image') }],
+  ];
+
+  for (const [name, behaves] of cases) {
+    const h = makeHarness({
+      pipe: (child) => makePipe(child, behaves),
+    });
+
+    await assert.rejects(h.call(), (failure) => {
+      assert.equal(failure instanceof SidecarError, true, name);
+      assert.equal(failure.code, 'sidecar_failed', name);
+      return true;
+    });
+    assert.equal(callNames(h.pipe).includes('writeLine'), false, name);
+    assert.equal(callNames(h.pipe).includes('readUntilClose'), false, name);
+    assert.equal(callNames(h.pipe).filter((call) => call === 'close').length, 1, name);
+    assert.equal(h.child.killed, 1, name);
+  }
+});
+
 test('exit code 3 before connecting resolves as declined and closes the pipe', async () => {
   const h = makeHarness({
     pipe: (child) => makePipe(child, {
@@ -234,20 +328,86 @@ test('exit code 3 before connecting resolves as declined and closes the pipe', a
   assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
 });
 
-test('exit code 0 before connecting does not stop the wait for accept', async () => {
+test('exit code 0 before connecting fails after the elevated connect window', async () => {
   const h = makeHarness({
+    timeouts: { connect: 60_000, record: 120_000, exit: 20, elevatedConnect: 50 },
     pipe: (child) => makePipe(child, {
       accept() {
-        child.emit('exit', 0);
-        return Promise.resolve();
+        queueMicrotask(() => child.emit('exit', 0));
+        return new Promise(() => {});
+      },
+    }),
+  });
+
+  await assert.rejects(h.call(), (failure) => {
+    assert.equal(failure instanceof SidecarError, true);
+    assert.equal(failure.code, 'timeout');
+    return true;
+  });
+  assert.equal(callNames(h.pipe).includes('clientImage'), false);
+  assert.equal(callNames(h.pipe).includes('writeLine'), false);
+  assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
+});
+
+test('exit code 0 before connecting can still accept inside the elevated window', async () => {
+  const h = makeHarness({
+    timeouts: { connect: 60_000, record: 120_000, exit: 20, elevatedConnect: 1000 },
+    pipe: (child) => makePipe(child, {
+      accept() {
+        setTimeout(() => child.emit('exit', 0), 5);
+        return new Promise((resolve) => setTimeout(resolve, 20));
       },
       recordText: '{"schema":2}',
     }),
   });
 
   assert.deepEqual(await h.call(), { recordText: '{"schema":2}' });
+  assert.equal(callNames(h.pipe).includes('clientImage'), true);
   assert.equal(callNames(h.pipe).includes('writeLine'), true);
   assert.equal(callNames(h.pipe).includes('readUntilClose'), true);
+});
+
+test('the elevated window does not outlive the remaining connect timeout', async () => {
+  const h = makeHarness({
+    timeouts: { connect: 40, record: 120_000, exit: 20, elevatedConnect: 10_000 },
+    pipe: (child) => makePipe(child, {
+      accept() {
+        setTimeout(() => child.emit('exit', 0), 5);
+        return new Promise(() => {});
+      },
+    }),
+  });
+
+  const started = Date.now();
+  await assert.rejects(h.call(), (failure) => {
+    assert.equal(failure instanceof SidecarError, true);
+    assert.equal(failure.code, 'timeout');
+    return true;
+  });
+  assert.ok(Date.now() - started < 5000);
+  assert.equal(callNames(h.pipe).filter((name) => name === 'close').length, 1);
+});
+
+test('a request line over 16 KiB is refused before spawn', async () => {
+  const h = makeHarness();
+  const policy = policyWithLineBytes(16 * 1024 + 1);
+
+  await assert.rejects(h.call({ policy }), (failure) => {
+    assert.equal(failure instanceof SidecarError, true);
+    assert.equal(failure.code, 'request_too_large');
+    return true;
+  });
+  assert.equal(h.spawnCalls.length, 0);
+  assert.equal(h.commandCalls.length, 1);
+  assert.deepEqual(h.pipe.calls[h.pipe.calls.length - 1], ['close', 7]);
+});
+
+test('a request line of exactly 16 KiB is accepted', async () => {
+  const h = makeHarness();
+  const policy = policyWithLineBytes(16 * 1024);
+
+  assert.deepEqual(await h.call({ policy }), { recordText: '{"ok":true}' });
+  assert.equal(h.spawnCalls.length, 1);
 });
 
 test('any other exit code before connecting rejects and closes the pipe', async () => {
