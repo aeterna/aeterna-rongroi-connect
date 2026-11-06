@@ -135,6 +135,17 @@ function recordFor(kit, mutate) {
   return record;
 }
 
+function declinedRecordFor(kit, mutate) {
+  // The real declined answer carries only the scan marker and the binding;
+  // it has no schema and no visual hash.
+  const record = {
+    scan: 'declined',
+    binding: { ticket: kit.ticket, nonce: kit.nonce },
+  };
+  if (typeof mutate === 'function') mutate(record);
+  return record;
+}
+
 function sealedBytes(kit, record) {
   const envelope = sealEnvelope(JSON.stringify(record), kit.publicKey, kit.ticket);
   return Buffer.from(JSON.stringify(envelope), 'utf8');
@@ -320,6 +331,78 @@ test('refuses a record whose binding nonce does not match the code', async () =>
     );
     assert.equal(kit.requests, 1);
     assert.equal(kit.visualHash, null);
+  } finally {
+    await kit.close();
+  }
+});
+
+test('refuses a record whose binding ticket does not match the code', async () => {
+  const kit = await startKit({ print: false });
+  try {
+    const record = recordFor(kit, (candidate) => {
+      candidate.binding.ticket = 'not-the-code-ticket';
+    });
+    await assert.rejects(
+      clientFor(kit).upload(sealedBytes(kit, record)),
+      isCode('bad_request'),
+    );
+    assert.equal(kit.requests, 1);
+    assert.equal(kit.received, 0);
+    assert.equal(kit.visualHash, null);
+  } finally {
+    await kit.close();
+  }
+});
+
+test('accepts a sealed declined answer without a schema or a visual hash', async () => {
+  const kit = await startKit({ print: false });
+  try {
+    const record = declinedRecordFor(kit);
+    assert.equal('schema' in record, false);
+    assert.equal('visual_hash' in record, false);
+
+    assert.deepEqual(
+      await clientFor(kit).decline(sealedBytes(kit, record)),
+      { status: 'declined' },
+    );
+    assert.equal(kit.declined, true);
+    assert.equal(kit.received, 1);
+    assert.equal(kit.record, null);
+    assert.equal(kit.visualHash, null);
+  } finally {
+    await kit.close();
+  }
+});
+
+test('refuses a declined answer whose binding nonce does not match the code', async () => {
+  const kit = await startKit({ print: false });
+  try {
+    const record = declinedRecordFor(kit, (candidate) => {
+      candidate.binding.nonce = 'not-the-code-nonce';
+    });
+    await assert.rejects(
+      clientFor(kit).decline(sealedBytes(kit, record)),
+      isCode('bad_request'),
+    );
+    assert.equal(kit.declined, false);
+    assert.equal(kit.received, 0);
+  } finally {
+    await kit.close();
+  }
+});
+
+test('refuses a declined answer whose binding ticket does not match the code', async () => {
+  const kit = await startKit({ print: false });
+  try {
+    const record = declinedRecordFor(kit, (candidate) => {
+      candidate.binding.ticket = 'not-the-code-ticket';
+    });
+    await assert.rejects(
+      clientFor(kit).decline(sealedBytes(kit, record)),
+      isCode('bad_request'),
+    );
+    assert.equal(kit.declined, false);
+    assert.equal(kit.received, 0);
   } finally {
     await kit.close();
   }
