@@ -343,8 +343,12 @@ class PairedClient {
   }
 
   rememberExpiry(policy, dateHeader) {
-    if (policy === null || typeof policy !== 'object' || typeof policy.expires_at !== 'string') return;
-    const expires = Date.parse(policy.expires_at);
+    // The real Kit's policy has exactly five members and never carries
+    // expires_at; the pairing code holds the expiry.  A policy that still has
+    // expires_at is refused by the flow before this point, so always correct
+    // the code's expiry rather than trusting the policy body.
+    if (policy === null || typeof policy !== 'object') return;
+    const expires = this.expiresAtMs;
     if (!Number.isFinite(expires)) return;
 
     let offset = 0;

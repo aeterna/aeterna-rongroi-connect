@@ -311,7 +311,14 @@ function createFlow(options = {}) {
   async function fetchPolicy() {
     try {
       if (client === null) {
-        client = await makeClient({ origin: parsed.serverOrigin, ticket: parsed.ticket });
+        const pairing = { origin: parsed.serverOrigin, ticket: parsed.ticket };
+        // The code, not the policy, carries the expiry.  Attach it without
+        // changing the visible pairing shape the client is built from.
+        Object.defineProperty(pairing, 'expiresAt', {
+          value: parsed.expiresAt,
+          enumerable: false,
+        });
+        client = await makeClient(pairing);
       }
       const received = await client.getPolicy(parsed.policyHash);
       if (!validPolicy(received)) {
