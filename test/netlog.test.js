@@ -20,8 +20,23 @@ const {
   negativeControlMutations,
   reportFileNames,
   runSucceeded,
+  runSpecs,
+  REAL_RUNS,
+  parseArguments,
+  kitEnvironment,
+  applicationEnv,
+  parseHookStates,
+  summarizeHookStates,
+  listTempTopLevel,
+  newTempEntries,
+  captureNewTempEntries,
   LEFTOVER_MAX_BYTES,
 } = require('../scripts/run-e2e');
+const {
+  DEFAULT_STATE_TIMEOUT_MS,
+  parseStateTimeoutMs,
+} = require('../test/hook/test-hook');
+const { STANDARD_COLLECTORS } = require('./mock/kit');
 
 const ALLOWED = '127.0.0.1:30120';
 const REQUIRED_PATHS = [
@@ -802,21 +817,378 @@ test('negative-control mode uses separate report files', () => {
   });
 });
 
-test('a run fails when the netlog was repaired or the leftover search did not run', () => {
+test('a run fails when the netlog was repaired or a leftover search did not run', () => {
   const run = { error: null, timedOut: false, exitCode: 0 };
   const report = {
     kitReceived: true,
+    kitHashEqualsRecord: true,
     netlogOk: true,
     netlogRepaired: false,
     leftoverSearchRan: true,
+    newTempSearchRan: true,
     negativeControlOk: true,
     leftoverHits: [],
+    newTempHits: [],
   };
 
   assert.equal(runSucceeded(run, report), true);
   assert.equal(runSucceeded(run, { ...report, netlogRepaired: true }), false);
   assert.equal(runSucceeded(run, { ...report, leftoverSearchRan: false }), false);
+  assert.equal(runSucceeded(run, { ...report, newTempSearchRan: false }), false);
   assert.equal(runSucceeded({ ...run, exitCode: 1 }, report), false);
+});
+
+test('a mismatching Kit hash fails the run', () => {
+  const run = { error: null, timedOut: false, exitCode: 0 };
+  const report = {
+    kitReceived: true,
+    kitHashEqualsRecord: true,
+    netlogOk: true,
+    netlogRepaired: false,
+    leftoverSearchRan: true,
+    newTempSearchRan: true,
+    negativeControlOk: true,
+    leftoverHits: [],
+    newTempHits: [],
+  };
+
+  assert.equal(runSucceeded(run, report), true);
+  assert.equal(runSucceeded(run, { ...report, kitHashEqualsRecord: false }), false);
+});
+
+function successfulReport(overrides = {}) {
+  return {
+    sidecar: 'mock',
+    kitReceived: true,
+    kitHashEqualsRecord: true,
+    netlogOk: true,
+    netlogRepaired: false,
+    leftoverSearchRan: true,
+    newTempSearchRan: true,
+    negativeControlOk: true,
+    leftoverHits: [],
+    newTempHits: [],
+    ...overrides,
+  };
+}
+
+test('a real run requires a saved report that matches the run policy', () => {
+  const run = { error: null, timedOut: false, exitCode: 0 };
+  const posture = successfulReport({
+    sidecar: 'real',
+    name: 'posture',
+    profile: 'posture',
+    requireElevation: false,
+    collectorCount: 2,
+    recordKind: 'rongroi-saved-report',
+    rongroi_version: '0.3.0',
+    policyProfile: 'posture',
+    policyRequireElevation: false,
+    policyCollectorCount: 2,
+  });
+
+  assert.equal(runSucceeded(run, posture), true);
+
+  // A real-run report that still carries the mock marker proves nothing.
+  assert.equal(runSucceeded(run, { ...posture, rongroi_version: 'mock' }), false);
+  assert.equal(runSucceeded(run, { ...posture, rongroi_version: '' }), false);
+  assert.equal(runSucceeded(run, { ...posture, recordKind: null }), false);
+
+  // The record's policy must be the one the run asked for.
+  assert.equal(runSucceeded(run, { ...posture, policyCollectorCount: 3 }), false);
+  assert.equal(runSucceeded(run, { ...posture, policyProfile: 'standard' }), false);
+  assert.equal(runSucceeded(run, { ...posture, policyRequireElevation: true }), false);
+
+  const standard = {
+    ...posture,
+    name: 'standard',
+    profile: 'standard',
+    requireElevation: true,
+    collectorCount: 20,
+    policyProfile: 'standard',
+    policyRequireElevation: true,
+    policyCollectorCount: 20,
+  };
+
+  assert.equal(runSucceeded(run, standard), true);
+  assert.equal(runSucceeded(run, { ...standard, policyCollectorCount: 19 }), false);
+});
+
+test('a mock run keeps the existing checks without the real report facts', () => {
+  const run = { error: null, timedOut: false, exitCode: 0 };
+
+  assert.equal(runSucceeded(run, successfulReport()), true);
+});
+
+test('a ticket in a new top-level temp entry fails the run', () => {
+  const run = { error: null, timedOut: false, exitCode: 0 };
+  const report = {
+    kitReceived: true,
+    kitHashEqualsRecord: true,
+    netlogOk: true,
+    netlogRepaired: false,
+    leftoverSearchRan: true,
+    newTempSearchRan: true,
+    negativeControlOk: true,
+    leftoverHits: [],
+    newTempHits: [],
+  };
+
+  assert.equal(runSucceeded(run, report), true);
+  assert.equal(runSucceeded(run, {
+    ...report,
+    newTempHits: [{ file: 'new-file', what: 'nonce' }],
+  }), false);
+  // An origin hit in a new file is recorded but does not fail the job.
+  assert.equal(runSucceeded(run, {
+    ...report,
+    newTempHits: [{ file: 'new-file', what: 'origin' }],
+  }), true);
+});
+
+test('new top-level temp entries are the difference between the before and after listings', () => {
+  const first = path.join(os.tmpdir(), 'e2e-before-entry');
+  const second = path.join(os.tmpdir(), 'e2e-after-entry');
+  const netlog = path.join(os.tmpdir(), 'e2e-netlog-entry');
+
+  assert.deepEqual(newTempEntries([first], [first, second]), [second]);
+  assert.deepEqual(newTempEntries(
+    [{ path: first }],
+    [{ path: first }, { path: second }],
+  ), [second]);
+  assert.deepEqual(newTempEntries([first], [second, first], [netlog]), [second]);
+  assert.deepEqual(newTempEntries([first], [first, netlog], [netlog]), []);
+});
+
+test('a new temp file holding a ticket is found and fails the run', () => {
+  const ticket = 'c5e2e0123456789abcdef0123456789';
+  const before = listTempTopLevel(os.tmpdir());
+  const entry = path.join(os.tmpdir(), `e2e-new-entry-${process.pid}-${Date.now()}`);
+  const report = {};
+
+  try {
+    fs.writeFileSync(entry, `ticket ${ticket}`, 'utf8');
+    captureNewTempEntries(report, before, { ticket });
+
+    assert.ok(report.newTempEntries.includes(path.resolve(entry)));
+    assert.equal(report.newTempSearchRan, true);
+    assert.deepEqual(
+      report.newTempHits.filter((hit) => hit.file === path.resolve(entry)),
+      [{ file: path.resolve(entry), what: 'ticket' }],
+    );
+    assert.equal(runSucceeded(
+      { error: null, timedOut: false, exitCode: 0 },
+      {
+        kitReceived: true,
+        kitHashEqualsRecord: true,
+        netlogOk: true,
+        netlogRepaired: false,
+        leftoverSearchRan: true,
+        newTempSearchRan: report.newTempSearchRan,
+        negativeControlOk: true,
+        leftoverHits: [],
+        newTempHits: report.newTempHits,
+      },
+    ), false);
+  } finally {
+    fs.rmSync(entry, { force: true });
+  }
+});
+
+test('real mode runs posture and Standard without elevation in CI', () => {
+  assert.equal(REAL_RUNS.length, 2);
+  assert.deepEqual(REAL_RUNS.map((run) => run.name), ['posture', 'standard']);
+
+  const [posture, standard] = REAL_RUNS;
+  assert.equal(posture.policy.profile, 'posture');
+  assert.equal(posture.policy.required_collectors.length, 2);
+  assert.equal(posture.policy.require_elevation, false);
+
+  assert.equal(standard.policy.profile, 'standard');
+  assert.equal(standard.policy.required_collectors.length, 20);
+  assert.deepEqual(standard.policy.required_collectors, STANDARD_COLLECTORS);
+  // With --elevate on the hosted CI runner, Connect stayed in `scanning`
+  // (elevationPending) for 120 s; cause unknown, lane 3c follow-up + M1 manual PC check.
+  assert.equal(standard.policy.require_elevation, false);
+});
+
+test('real mode runs posture and the Standard policy without elevation', () => {
+  const specs = runSpecs('real', false);
+  assert.deepEqual(specs.map((spec) => spec.name), ['posture', 'standard']);
+  assert.equal(specs[0].policy.require_elevation, false);
+  assert.equal(specs[1].policy.profile, 'standard');
+  assert.equal(specs[1].policy.require_elevation, false);
+  assert.deepEqual(specs[1].policy.required_collectors, STANDARD_COLLECTORS);
+  assert.equal(STANDARD_COLLECTORS.length, 20);
+
+  assert.deepEqual(runSpecs('mock', false).map((spec) => spec.name), ['mock']);
+  assert.deepEqual(runSpecs('real', true).map((spec) => spec.name), ['posture']);
+});
+
+test('the Kit child environment carries the policy only when one is given', () => {
+  const policy = {
+    profile: 'standard',
+    required_collectors: STANDARD_COLLECTORS,
+    require_elevation: true,
+  };
+
+  const withPolicy = kitEnvironment({ policy });
+  assert.equal(withPolicy.RONGROI_MOCK_KIT_POLICY, JSON.stringify(policy));
+  assert.deepEqual(JSON.parse(withPolicy.RONGROI_MOCK_KIT_POLICY), {
+    profile: 'standard',
+    required_collectors: STANDARD_COLLECTORS,
+    require_elevation: true,
+  });
+
+  assert.equal('RONGROI_MOCK_KIT_POLICY' in kitEnvironment({}), false);
+  assert.equal('RONGROI_MOCK_KIT_POLICY' in kitEnvironment(), false);
+});
+
+test('the Kit child environment drops a policy inherited from the parent', () => {
+  const original = process.env.RONGROI_MOCK_KIT_POLICY;
+  process.env.RONGROI_MOCK_KIT_POLICY = '{"profile":"posture"}';
+
+  try {
+    const env = kitEnvironment({});
+    assert.equal('RONGROI_MOCK_KIT_POLICY' in env, false);
+  } finally {
+    if (original === undefined) {
+      delete process.env.RONGROI_MOCK_KIT_POLICY;
+    } else {
+      process.env.RONGROI_MOCK_KIT_POLICY = original;
+    }
+  }
+});
+
+test('a real run gives the test hook five minutes for a Standard scan', () => {
+  const original = process.env.CONNECT_TEST_STATE_TIMEOUT_MS;
+  process.env.CONNECT_TEST_STATE_TIMEOUT_MS = '1';
+
+  try {
+    const env = applicationEnv({ code: 'pair-code' }, 'real');
+    assert.equal(env.CONNECT_TEST_STATE_TIMEOUT_MS, '300000');
+    assert.equal(env.CONNECT_TEST_CODE, 'pair-code');
+    assert.equal('CONNECT_TEST_NODE' in env, false);
+    assert.equal('CONNECT_TEST_SIDECAR' in env, false);
+  } finally {
+    if (original === undefined) {
+      delete process.env.CONNECT_TEST_STATE_TIMEOUT_MS;
+    } else {
+      process.env.CONNECT_TEST_STATE_TIMEOUT_MS = original;
+    }
+  }
+});
+
+test('a mock run leaves the test hook on its default timeout', () => {
+  const original = process.env.CONNECT_TEST_STATE_TIMEOUT_MS;
+  process.env.CONNECT_TEST_STATE_TIMEOUT_MS = '1';
+
+  try {
+    const env = applicationEnv({ code: 'pair-code' }, 'mock');
+    assert.equal('CONNECT_TEST_STATE_TIMEOUT_MS' in env, false);
+    assert.equal(env.CONNECT_TEST_NODE, process.execPath);
+    assert.ok(env.CONNECT_TEST_SIDECAR.endsWith(path.join('test', 'mock', 'sidecar.js')));
+  } finally {
+    if (original === undefined) {
+      delete process.env.CONNECT_TEST_STATE_TIMEOUT_MS;
+    } else {
+      process.env.CONNECT_TEST_STATE_TIMEOUT_MS = original;
+    }
+  }
+});
+
+test('the test hook reads a positive integer state timeout', () => {
+  assert.equal(DEFAULT_STATE_TIMEOUT_MS, 60 * 1000);
+  assert.equal(parseStateTimeoutMs('300000'), 300000);
+  assert.equal(parseStateTimeoutMs('1'), 1);
+  assert.equal(parseStateTimeoutMs(' 45000 '), 45000);
+});
+
+test('an invalid state timeout falls back to the sixty second default', () => {
+  for (const value of [
+    undefined,
+    null,
+    '',
+    ' ',
+    'not-a-number',
+    '0',
+    '000',
+    '-1',
+    '-60000',
+    '1.5',
+    'NaN',
+    'Infinity',
+    '12x',
+  ]) {
+    assert.equal(parseStateTimeoutMs(value), 60 * 1000, String(value));
+  }
+});
+
+test('the hook state lines measure a scan that left the scanning state', () => {
+  const states = parseHookStates([
+    '{"name":"consent","observedAt":1000}',
+    '[hook] a line that is not a state',
+    '{"name":"scanning","observedAt":2000}',
+    '{"name":"hash","observedAt":32000}',
+  ].join('\n'));
+
+  assert.deepEqual(summarizeHookStates(states), {
+    scanningSeconds: 30,
+    lastState: 'hash',
+  });
+});
+
+test('a failed scan is measured up to the hook failure line', () => {
+  const states = parseHookStates([
+    '{"name":"scanning","observedAt":2000}',
+    '{"name":"scanning","observedAt":62000,"failed":true}',
+  ].join('\n'));
+
+  assert.deepEqual(summarizeHookStates(states), {
+    scanningSeconds: 60,
+    lastState: 'scanning',
+  });
+});
+
+test('a run with no observed scanning state records null seconds', () => {
+  assert.deepEqual(summarizeHookStates([]), {
+    scanningSeconds: null,
+    lastState: null,
+  });
+  assert.deepEqual(summarizeHookStates([
+    { name: 'done', observedAt: 5, failed: false },
+  ]), {
+    scanningSeconds: null,
+    lastState: 'done',
+  });
+});
+
+test('--sidecar selects real by default and accepts real or mock', () => {
+  const fallback = parseArguments(['dist/test']);
+  assert.equal(fallback.error, null);
+  assert.equal(fallback.sidecar, 'real');
+  assert.equal(fallback.buildDir, 'dist/test');
+  assert.equal(fallback.negativeControl, false);
+
+  const mock = parseArguments(['dist/test', '--sidecar', 'mock']);
+  assert.equal(mock.error, null);
+  assert.equal(mock.sidecar, 'mock');
+  assert.equal(mock.buildDir, 'dist/test');
+
+  const real = parseArguments(['--sidecar=real', 'dist/test']);
+  assert.equal(real.error, null);
+  assert.equal(real.sidecar, 'real');
+  assert.equal(real.buildDir, 'dist/test');
+
+  const negative = parseArguments(['dist/test', '--sidecar', 'mock', '--negative-control']);
+  assert.equal(negative.error, null);
+  assert.equal(negative.sidecar, 'mock');
+  assert.equal(negative.negativeControl, true);
+
+  assert.notEqual(parseArguments(['dist/test', '--sidecar']).error, null);
+  assert.notEqual(parseArguments(['dist/test', '--sidecar', 'tape']).error, null);
+  assert.notEqual(parseArguments(['dist/test', '--sidecar=']).error, null);
+  assert.notEqual(parseArguments([]).error, null);
 });
 
 test('negative-control mutations change every probe port and paired host', () => {

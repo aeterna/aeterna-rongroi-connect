@@ -4,6 +4,7 @@
 
 const { app, BrowserWindow, ipcMain, session } = require('electron');
 const path = require('node:path');
+const fs = require('node:fs');
 const { pathToFileURL } = require('node:url');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
@@ -25,6 +26,7 @@ const PairedClient = require('./net');
 const testHook = require('../test-hook');
 const { createFlow } = require('./flow');
 const { createSidecarRunner } = require('./sidecar');
+const { createSidecarVerifier } = require('./verify-sidecar');
 
 let userDataDirectory = null;
 let flow = null;
@@ -140,6 +142,17 @@ function runSidecar(...args) {
       spawn,
       randomBytes: crypto.randomBytes,
       sidecarCommand,
+      // ADR 0001 section 4: hash the bundled sidecar before every launch, no
+      // matter what test-hook lets sidecarCommand() spawn.  The hash record
+      // lives in the asar at src/sidecar.json, written by the build from
+      // vendor/rongroi-scan.exe (see sidecar.lock.json).  A mismatch is a
+      // SidecarError('sidecar_hash'), which the flow maps to exit 13.
+      verifySidecar: createSidecarVerifier({
+        file: path.join(process.resourcesPath, SIDECAR_NAME),
+        expected: path.join(__dirname, '..', 'sidecar.json'),
+        readFile: fs.readFileSync,
+        createHash: crypto.createHash,
+      }),
       timeouts: { connect: 60000, record: 120000 },
     });
   }

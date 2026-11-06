@@ -12,10 +12,15 @@ const crypto = require('node:crypto');
 const { createHash } = require('node:crypto');
 const { openEnvelope } = require('../../src/core/envelope');
 const { policyHash, visualHash } = require('../../src/core/canonical');
+const { KNOWN_COLLECTORS } = require('../../src/main/collectors');
 
 const HOST = '127.0.0.1';
 const PREFIX = '/nakara_rongroi';
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
+
+// The Standard tier is exactly the 20 collectors this client knows.  The e2e
+// run asks the Kit for the same list the real Standard policy names.
+const STANDARD_COLLECTORS = Object.freeze([...KNOWN_COLLECTORS]);
 
 function sha256Hex(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
@@ -111,6 +116,16 @@ async function startKit(options = {}) {
   const hashes = new Map();
   let storedRecord = null;
   let storedHash = null;
+  let storedRecordVisualHash = null;
+  let storedRecordBytes = null;
+  let storedRecordVersion = null;
+  let storedRecordKind = null;
+  let storedOfficialBuild = null;
+  let storedPolicyProfile = null;
+  let storedPolicyRequireElevation = null;
+  let storedPolicyCollectorCount = null;
+  let storedScanSeconds = null;
+  let policyServedAt = null;
   let received = 0;
   let requests = 0;
 
@@ -161,9 +176,49 @@ async function startKit(options = {}) {
     // in the record is the one the player saw and is not trusted here.
     storedRecord = record;
     storedHash = computed;
+    storedRecordVisualHash = typeof record.visual_hash === 'string'
+      ? record.visual_hash
+      : null;
+    storedRecordBytes = Buffer.byteLength(text, 'utf8');
+    storedRecordVersion = typeof record.rongroi_version === 'string'
+      ? record.rongroi_version
+      : null;
+    storedRecordKind = typeof record.kind === 'string' ? record.kind : null;
+    storedOfficialBuild = typeof record.official_build === 'boolean'
+      ? record.official_build
+      : null;
+    const recordPolicy = record.policy !== null && typeof record.policy === 'object'
+      ? record.policy
+      : {};
+    storedPolicyProfile = typeof recordPolicy.profile === 'string'
+      ? recordPolicy.profile
+      : null;
+    storedPolicyRequireElevation = typeof recordPolicy.require_elevation === 'boolean'
+      ? recordPolicy.require_elevation
+      : null;
+    storedPolicyCollectorCount = Array.isArray(recordPolicy.required_collectors)
+      ? recordPolicy.required_collectors.length
+      : null;
+    storedScanSeconds = policyServedAt === null
+      ? null
+      : (Date.now() - policyServedAt) / 1000;
     hashes.set(ticket, computed);
     received += 1;
-    if (print) console.log(JSON.stringify({ received: true, visual_hash: computed }));
+    if (print) {
+      console.log(JSON.stringify({
+        received: true,
+        visual_hash: computed,
+        record_visual_hash: storedRecordVisualHash,
+        record_bytes: storedRecordBytes,
+        rongroi_version: storedRecordVersion,
+        kind: storedRecordKind,
+        official_build: storedOfficialBuild,
+        policy_profile: storedPolicyProfile,
+        policy_require_elevation: storedPolicyRequireElevation,
+        policy_collector_count: storedPolicyCollectorCount,
+        scan_seconds: storedScanSeconds,
+      }));
+    }
     return computed;
   }
 
@@ -180,6 +235,7 @@ async function startKit(options = {}) {
           response.end();
           return;
         }
+        policyServedAt = Date.now();
         response.writeHead(200, {
           'Content-Type': 'application/json',
           Date: new Date().toUTCString(),
@@ -364,6 +420,33 @@ async function startKit(options = {}) {
     get visualHash() {
       return storedHash;
     },
+    get recordVisualHash() {
+      return storedRecordVisualHash;
+    },
+    get recordBytes() {
+      return storedRecordBytes;
+    },
+    get rongroiVersion() {
+      return storedRecordVersion;
+    },
+    get recordKind() {
+      return storedRecordKind;
+    },
+    get officialBuild() {
+      return storedOfficialBuild;
+    },
+    get policyProfile() {
+      return storedPolicyProfile;
+    },
+    get policyRequireElevation() {
+      return storedPolicyRequireElevation;
+    },
+    get policyCollectorCount() {
+      return storedPolicyCollectorCount;
+    },
+    get scanSeconds() {
+      return storedScanSeconds;
+    },
     get record() {
       return storedRecord;
     },
@@ -395,12 +478,33 @@ function statusFromArguments(argv) {
   return undefined;
 }
 
+// The e2e runner hands the per-run policy to this child process.  A broken
+// value must stop the child instead of silently serving the default posture.
+function policyFromEnvironment(environment = process.env) {
+  const raw = environment.RONGROI_MOCK_KIT_POLICY;
+  if (raw === undefined) return undefined;
+
+  const policy = JSON.parse(raw);
+  if (policy === null || typeof policy !== 'object' || Array.isArray(policy)) {
+    throw new Error('RONGROI_MOCK_KIT_POLICY must contain a JSON object');
+  }
+  return policy;
+}
+
 const kitArguments = process.argv.slice(2);
 const kitRequested = kitArguments
   .some((token) => token === '--status' || token.startsWith('--status='));
 if (require.main === module
     && (!process.env.NODE_TEST_CONTEXT || kitRequested)) {
-  startKit({ status: statusFromArguments(kitArguments), print: true })
+  let policy;
+  try {
+    policy = policyFromEnvironment();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
+
+  startKit({ status: statusFromArguments(kitArguments), policy, print: true })
     .then((kit) => {
       const stop = () => {
         kit.close().then(() => process.exit(0));
@@ -416,3 +520,5 @@ if (require.main === module
 module.exports = startKit;
 module.exports.startKit = startKit;
 module.exports.encodeCode = encodeCode;
+module.exports.policyFromEnvironment = policyFromEnvironment;
+module.exports.STANDARD_COLLECTORS = STANDARD_COLLECTORS;

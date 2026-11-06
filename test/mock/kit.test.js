@@ -4,6 +4,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { spawn } = require('node:child_process');
+const path = require('node:path');
 
 const PairedClient = require('../../src/main/net');
 const { ConnectError } = PairedClient;
@@ -11,9 +13,104 @@ const { sealEnvelope } = require('../../src/core/envelope');
 const { policyHash, visualHash } = require('../../src/core/canonical');
 const { DIRECT_LIMIT, SLICE_SIZE } = require('../../src/core/upload-plan');
 const { parsePairingCode } = require('../../src/core/pairing');
-const { startKit } = require('./kit');
+const { startKit, STANDARD_COLLECTORS } = require('./kit');
+
+const ROOT = path.resolve(__dirname, '..', '..');
+const KIT_PATH = path.join(__dirname, 'kit.js');
 
 const isCode = (code) => (error) => error instanceof ConnectError && error.code === code;
+
+function spawnKitChild(environment = {}) {
+  const env = { ...process.env, ...environment };
+  delete env.NODE_TEST_CONTEXT;
+
+  const child = spawn(process.execPath, [KIT_PATH], {
+    cwd: ROOT,
+    env,
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+  });
+
+  const exited = new Promise((resolve) => {
+    const finish = (result) => {
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      finish({
+        code: null,
+        signal: null,
+        error: new Error(`the mock kit child did not exit: ${stderr}`),
+      });
+    }, 5000);
+
+    child.on('error', (error) => finish({ code: null, signal: null, error }));
+    child.on('exit', (code, signal) => finish({ code, signal, error: null }));
+  });
+
+  function firstMessage() {
+    return new Promise((resolve, reject) => {
+      let buffered = '';
+      let settled = false;
+
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        callback(value);
+      };
+
+      const timer = setTimeout(() => {
+        finish(reject, new Error(`the mock kit child did not print a code: ${stderr}`));
+      }, 5000);
+
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        if (settled) return;
+        buffered += chunk;
+        let newline = buffered.indexOf('\n');
+        while (newline !== -1) {
+          const line = buffered.slice(0, newline).trim();
+          buffered = buffered.slice(newline + 1);
+          if (line !== '') {
+            try {
+              const message = JSON.parse(line);
+              if (message !== null && typeof message === 'object'
+                  && typeof message.code === 'string' && Number.isInteger(message.port)) {
+                finish(resolve, message);
+                return;
+              }
+            } catch {
+              // A non-JSON line is not the pairing code.
+            }
+          }
+          newline = buffered.indexOf('\n');
+        }
+      });
+      child.on('error', (error) => finish(reject, error));
+      child.on('exit', (code, signal) => {
+        finish(reject, new Error(
+          `the mock kit child exited before printing a code (${code ?? signal}): ${stderr}`,
+        ));
+      });
+    });
+  }
+
+  return { child, exited, firstMessage, stderr: () => stderr };
+}
+
+async function stopKitChild(handle) {
+  if (handle.child.exitCode === null && handle.child.signalCode === null) {
+    handle.child.kill();
+  }
+  return handle.exited;
+}
 
 function clientFor(kit, options = {}) {
   return new PairedClient({
@@ -110,6 +207,57 @@ test('serves policy overrides and hashes them into the pairing code', async () =
   }
 });
 
+test('the child process serves the policy from RONGROI_MOCK_KIT_POLICY', async () => {
+  const policy = {
+    profile: 'standard',
+    required_collectors: STANDARD_COLLECTORS,
+    require_elevation: true,
+  };
+  const handle = spawnKitChild({
+    RONGROI_MOCK_KIT_POLICY: JSON.stringify(policy),
+  });
+
+  try {
+    const message = await handle.firstMessage();
+    const parsed = parsePairingCode(message.code);
+    assert.equal(parsed.serverOrigin, `http://127.0.0.1:${message.port}`);
+
+    const response = await fetch(
+      `${parsed.serverOrigin}/nakara_rongroi/policy/${parsed.ticket}`,
+    );
+    assert.equal(response.status, 200);
+    const served = await response.json();
+
+    assert.equal(served.profile, 'standard');
+    assert.deepEqual(served.required_collectors, [...STANDARD_COLLECTORS]);
+    assert.equal(served.required_collectors.length, 20);
+    assert.equal(served.require_elevation, true);
+    assert.equal(served.policy_hash, parsed.policyHash);
+    assert.deepEqual(Object.keys(served).sort(), [
+      'policy_hash',
+      'profile',
+      'require_elevation',
+      'required_collectors',
+      'server_name',
+    ]);
+  } finally {
+    await stopKitChild(handle);
+  }
+});
+
+test('the child process refuses an invalid RONGROI_MOCK_KIT_POLICY', async () => {
+  for (const raw of ['not-json', '[]', 'null']) {
+    const handle = spawnKitChild({ RONGROI_MOCK_KIT_POLICY: raw });
+    try {
+      const result = await handle.exited;
+      assert.equal(result.error, null, raw);
+      assert.notEqual(result.code, 0, raw);
+    } finally {
+      await stopKitChild(handle);
+    }
+  }
+});
+
 test('accepts an envelope, stores the recomputed hash and accepts it again', async () => {
   const kit = await startKit({ print: false });
   try {
@@ -126,6 +274,35 @@ test('accepts an envelope, stores the recomputed hash and accepts it again', asy
     assert.deepEqual(await client.upload(bytes), { status: 'accepted' });
     assert.equal(kit.received, 2);
     assert.equal(kit.visualHash, visualHash(record));
+  } finally {
+    await kit.close();
+  }
+});
+
+test('captures the report kind, official build and policy facts instead of elevation', async () => {
+  const kit = await startKit({
+    print: false,
+    policy: {
+      profile: 'standard',
+      required_collectors: ['posture', 'os_image'],
+      require_elevation: true,
+    },
+  });
+  try {
+    const record = recordFor(kit, (candidate) => {
+      candidate.kind = 'rongroi-saved-report';
+      candidate.official_build = true;
+    });
+    await clientFor(kit).upload(sealedBytes(kit, record));
+
+    assert.equal(kit.recordKind, 'rongroi-saved-report');
+    assert.equal(kit.officialBuild, true);
+    assert.equal(kit.policyProfile, kit.policy.profile);
+    assert.equal(kit.policyRequireElevation, kit.policy.require_elevation);
+    assert.equal(kit.policyCollectorCount, kit.policy.required_collectors.length);
+    // The real saved report has no `elevated` member, so the mock must not
+    // pretend to measure elevation either.
+    assert.equal('elevated' in kit, false);
   } finally {
     await kit.close();
   }

@@ -19,8 +19,12 @@ const {
   listAsarFromDisk,
   repositoryHookCopies,
   checkFuseWire,
+  sidecarRecordDifferences,
+  checkSidecarRecords,
+  SIDECAR_EXE_PATH,
+  SIDECAR_RECORD_PATH,
 } = require('../scripts/compare-builds');
-const { stagedPackageJson } = require('../scripts/build');
+const { stagedPackageJson, stage } = require('../scripts/build');
 
 const HOOKS = repositoryHookCopies();
 const RELEASE_HOOK = HOOKS.release;
@@ -40,6 +44,7 @@ function baseTree(asarBytes = 'release asar bytes') {
   return {
     'rongroi-connect.exe': executableFor(asarBytes),
     'resources/app.asar': asarBytes,
+    'resources/rongroi-scan.exe': 'the same pinned sidecar',
     'resources/other.pak': 'the same pak',
     LICENSE: 'the same license',
   };
@@ -594,4 +599,242 @@ test('the staged package.json drops devDependencies without changing the input',
   });
   assert.equal('devDependencies' in staged, false);
   assert.equal(pkg.devDependencies.electron, '44.7.1');
+});
+
+test('sidecar.lock.json pins the source build of rongroi-scan', () => {
+  const lockFile = path.join(__dirname, '..', 'sidecar.lock.json');
+  const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+
+  assert.deepEqual(lock, {
+    source: 'build',
+    repository: 'aeterna/aeterna-rongroi',
+    commit: '3a08e2dcabd940780dd314579f6345306eae7143',
+    package: 'rongroi-scan',
+  });
+  assert.equal(fs.existsSync(`${lockFile}.license`), true);
+});
+
+test('the pinned sidecar travels next to the asar in both builds', () => {
+  const release = baseTree('release asar bytes');
+  const testTree = baseTree('test asar bytes');
+
+  const result = compareTrees(release, testTree, asarPair(), HOOKS);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.differences, []);
+});
+
+test('a missing resources/rongroi-scan.exe in the test build fails', () => {
+  const release = baseTree('release asar bytes');
+  const testTree = baseTree('test asar bytes');
+  delete testTree[SIDECAR_EXE_PATH];
+
+  const result = compareTrees(release, testTree, asarPair(), HOOKS);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.differences.some((entry) => (
+    entry.includes(SIDECAR_EXE_PATH) && entry.includes('missing from the test build')
+  )), true);
+  assert.equal(result.differences.some((entry) => (
+    entry.includes(SIDECAR_EXE_PATH) && entry.includes('missing from the release build')
+  )), false);
+});
+
+test('a missing resources/rongroi-scan.exe in the release build fails', () => {
+  const release = baseTree('release asar bytes');
+  const testTree = baseTree('test asar bytes');
+  delete release[SIDECAR_EXE_PATH];
+
+  const result = compareTrees(release, testTree, asarPair(), HOOKS);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.differences.some((entry) => (
+    entry.includes(SIDECAR_EXE_PATH) && entry.includes('missing from the release build')
+  )), true);
+});
+
+test('a missing resources/rongroi-scan.exe in both builds fails twice', () => {
+  const release = baseTree('release asar bytes');
+  const testTree = baseTree('test asar bytes');
+  delete release[SIDECAR_EXE_PATH];
+  delete testTree[SIDECAR_EXE_PATH];
+
+  const result = compareTrees(release, testTree, asarPair(), HOOKS);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.differences.some((entry) => (
+    entry.includes(SIDECAR_EXE_PATH) && entry.includes('missing from the release build')
+  )), true);
+  assert.equal(result.differences.some((entry) => (
+    entry.includes(SIDECAR_EXE_PATH) && entry.includes('missing from the test build')
+  )), true);
+});
+
+test('a sidecar record that matches its bundled exe and commit passes', () => {
+  const exe = Buffer.from('the pinned sidecar bytes');
+  const record = {
+    sha256: crypto.createHash('sha256').update(exe).digest('hex'),
+    commit: 'a'.repeat(40),
+  };
+
+  assert.deepEqual(sidecarRecordDifferences(record, exe, 'release'), []);
+  assert.deepEqual(
+    sidecarRecordDifferences(JSON.stringify(record), exe, 'test'),
+    [],
+  );
+});
+
+test('a sidecar record with a wrong sha256 or a bad commit fails', () => {
+  const exe = Buffer.from('the pinned sidecar bytes');
+  const digest = crypto.createHash('sha256').update(exe).digest('hex');
+
+  const wrongHash = sidecarRecordDifferences(
+    { sha256: '0'.repeat(64), commit: 'a'.repeat(40) },
+    exe,
+    'release',
+  );
+  assert.equal(wrongHash.length, 1);
+  assert.match(wrongHash[0], /sha256/);
+
+  for (const commit of ['A'.repeat(40), 'a'.repeat(39), 'a'.repeat(41), 'g'.repeat(40)]) {
+    const differences = sidecarRecordDifferences(
+      { sha256: digest, commit },
+      exe,
+      'test',
+    );
+    assert.equal(differences.length, 1, commit);
+    assert.match(differences[0], /commit/);
+    assert.match(differences[0], /40 lowercase hex/);
+  }
+});
+
+test('checkSidecarRecords reads src/sidecar.json from each asar and its own exe', () => {
+  const releaseExe = Buffer.from('release sidecar bytes');
+  const testExe = Buffer.from('test sidecar bytes');
+  const releaseTree = {
+    'resources/app.asar': Buffer.from('release archive'),
+    [SIDECAR_EXE_PATH]: releaseExe,
+  };
+  const testTree = {
+    'resources/app.asar': Buffer.from('test archive'),
+    [SIDECAR_EXE_PATH]: testExe,
+  };
+  const recordFor = (exe) => Buffer.from(JSON.stringify({
+    sha256: crypto.createHash('sha256').update(exe).digest('hex'),
+    commit: 'b'.repeat(40),
+  }));
+  const records = {
+    release: recordFor(releaseExe),
+    test: recordFor(testExe),
+  };
+  const lister = (bytes, side) => asar({ [SIDECAR_RECORD_PATH]: records[side] });
+
+  const matching = [];
+  checkSidecarRecords(releaseTree, testTree, lister, matching);
+  assert.deepEqual(matching, []);
+
+  const mismatched = [];
+  checkSidecarRecords(
+    releaseTree,
+    testTree,
+    (bytes, side) => asar({
+      [SIDECAR_RECORD_PATH]: side === 'release' ? records.release : records.release,
+    }),
+    mismatched,
+  );
+  assert.equal(mismatched.length, 1);
+  assert.match(mismatched[0], /test/);
+  assert.match(mismatched[0], /sha256/);
+});
+
+test('checkSidecarRecords reports a record missing from an asar', () => {
+  const exe = Buffer.from('sidecar bytes');
+  const tree = {
+    'resources/app.asar': Buffer.from('archive'),
+    [SIDECAR_EXE_PATH]: exe,
+  };
+
+  const differences = [];
+  checkSidecarRecords(tree, tree, () => asar({}), differences);
+
+  assert.equal(differences.length, 2);
+  for (const difference of differences) {
+    assert.equal(difference.includes(SIDECAR_RECORD_PATH), true);
+    assert.equal(difference.includes('missing'), true);
+  }
+});
+
+function stageFixtures(root) {
+  const lockFile = path.join(root, 'lock', 'sidecar.lock.json');
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  fs.writeFileSync(lockFile, `${JSON.stringify({
+    source: 'build',
+    repository: 'aeterna/aeterna-rongroi',
+    commit: '0'.repeat(40),
+    package: 'rongroi-scan',
+  }, null, 2)}\n`, 'utf8');
+  return lockFile;
+}
+
+test('stage() fails without vendor/rongroi-scan.exe, naming the lock file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sidecar-stage-missing-'));
+
+  try {
+    const lockFile = stageFixtures(root);
+
+    assert.throws(
+      () => stage({ vendorExe: path.join(root, 'vendor', 'rongroi-scan.exe'), lockFile }),
+      (error) => {
+        assert.equal(
+          error.message.includes('rongroi-scan.exe'),
+          true,
+          `the error should name the sidecar: ${error.message}`,
+        );
+        assert.equal(
+          error.message.includes('sidecar.lock.json'),
+          true,
+          `the error should name the lock file: ${error.message}`,
+        );
+        assert.equal(
+          error.message.includes('\n'),
+          false,
+          `the error should be one line: ${error.message}`,
+        );
+        return true;
+      },
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('stage() writes src/sidecar.json with the vendor SHA-256 and the lock commit', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sidecar-stage-record-'));
+
+  try {
+    const lockFile = stageFixtures(root);
+    const vendorExe = path.join(root, 'rongroi-scan.exe');
+    fs.writeFileSync(vendorExe, Buffer.alloc(4096, 0x52));
+    // A stand-in for the native module, whose absence the stage reports
+    // separately from the sidecar (the real build may not exist in the tree).
+    const nativeModule = path.join(root, 'rongroi_connect_pipe.node');
+    fs.writeFileSync(nativeModule, Buffer.alloc(16, 0x01));
+
+    const { stageDir, sidecarExe } = stage({ vendorExe, lockFile, nativeModule });
+    try {
+      assert.equal(sidecarExe, vendorExe);
+      const record = JSON.parse(
+        fs.readFileSync(path.join(stageDir, 'src', 'sidecar.json'), 'utf8'),
+      );
+      const digest = crypto
+        .createHash('sha256')
+        .update(fs.readFileSync(vendorExe))
+        .digest('hex');
+      assert.deepEqual(record, { sha256: digest, commit: '0'.repeat(40) });
+    } finally {
+      fs.rmSync(stageDir, { recursive: true, force: true });
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
