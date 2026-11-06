@@ -17,19 +17,21 @@ const HASH = '0123456789abcdef';
 const ORIGIN = 'http://127.0.0.1:30120';
 const VERSION = '0.1.0';
 const MAX_RECORD_BYTES = 2 * 1024 * 1024;
+const EXPIRES_AT = '2099-01-01T00:00:00Z';
 
 const POLICY = {
+  profile: 'posture',
   required_collectors: ['posture', 'os_image'],
   require_elevation: false,
   server_name: 'Example City',
-  expires_at: '2099-01-01T00:00:00Z',
+  policy_hash: '0123456789abcdef',
 };
 const PRODUCER = { name: 'rongroi-connect', version: VERSION, mode: 'single-shot' };
 const CODE = {
   serverOrigin: ORIGIN,
   ticket: TICKET,
   nonce: NONCE,
-  expiresAt: POLICY.expires_at,
+  expiresAt: EXPIRES_AT,
   policyHash: '0123456789abcdef',
   kitPublicKey: KIT,
   isLocalAddress: true,
@@ -174,7 +176,11 @@ test('the happy path moves from paste to done with one upload', async () => {
   assert.equal(await h.flow.submitCode('rr1.test'), true);
   assert.deepEqual(names(), ['checking', 'consent']);
 
-  assert.deepEqual(h.makeClientCalls[0], { origin: ORIGIN, ticket: TICKET });
+  assert.deepEqual(h.makeClientCalls[0], {
+    origin: ORIGIN,
+    ticket: TICKET,
+    expiresAt: EXPIRES_AT,
+  });
   const consent = lastState(h);
   assert.equal(consent.serverOrigin, ORIGIN);
   assert.equal(consent.serverName, POLICY.server_name);
@@ -251,6 +257,62 @@ test('a policy with a bad collectors list or server name is refused before conse
     assert.equal(h.flow.exitCode(), 12);
     assert.equal(h.emitted.some((state) => state.name === 'consent'), false);
   }
+});
+
+test('a policy is refused before consent unless it has exactly the five sidecar members', async () => {
+  const withoutPolicyHash = { ...POLICY };
+  delete withoutPolicyHash.policy_hash;
+  const sixtyFiveCollectors = Array.from(
+    { length: 65 },
+    (_, index) => KNOWN_COLLECTORS[index % KNOWN_COLLECTORS.length],
+  );
+  const cases = [
+    ['a sixth member', { ...POLICY, expires_at: EXPIRES_AT }],
+    ['a missing member', withoutPolicyHash],
+    ['an unknown profile', { ...POLICY, profile: 'full' }],
+    ['a non-boolean elevation flag', { ...POLICY, require_elevation: 'yes' }],
+    ['an empty collector list', { ...POLICY, required_collectors: [] }],
+    ['65 collectors', { ...POLICY, required_collectors: sixtyFiveCollectors }],
+    ['a repeated collector', { ...POLICY, required_collectors: ['posture', 'posture'] }],
+    ['an unknown collector', { ...POLICY, required_collectors: ['posture', 'not_a_collector'] }],
+    ['an empty server name', { ...POLICY, server_name: '' }],
+    ['a 129-code-point server name', { ...POLICY, server_name: 'x'.repeat(129) }],
+    ['a control character in the server name', { ...POLICY, server_name: 'Example\u0007City' }],
+    ['an uppercase policy hash', { ...POLICY, policy_hash: '0123456789ABCDEF' }],
+  ];
+
+  for (const [label, policy] of cases) {
+    const h = makeHarness({ policy });
+    await h.flow.submitCode('rr1.test');
+    assert.equal(h.flow.state().name, 'error', label);
+    assert.deepEqual(lastState(h).error, { key: 'policy_mismatch', sent: false }, label);
+    assert.equal(lastState(h).canRetry, false, label);
+    assert.equal(h.flow.exitCode(), 12, label);
+    assert.equal(h.emitted.some((state) => state.name === 'consent'), false, label);
+    assert.equal(h.flow.consent(), false, label);
+    assert.equal(h.sidecarCalls.length, 0, label);
+  }
+});
+
+test('a valid custom policy reaches consent without running the sidecar', async () => {
+  const wideName = '\u{1F600}'.repeat(128);
+  assert.equal([...wideName].length, 128);
+  const policy = {
+    ...POLICY,
+    profile: 'custom',
+    required_collectors: ['posture', 'os_image', 'defender_exclusion'],
+    require_elevation: true,
+    server_name: wideName,
+  };
+  const h = makeHarness({ policy });
+  await h.flow.submitCode('rr1.test');
+  assert.equal(h.flow.state().name, 'consent');
+  const consent = lastState(h);
+  assert.equal(consent.serverName, wideName);
+  assert.deepEqual(consent.collectors, policy.required_collectors);
+  assert.equal(consent.elevation, true);
+  assert.equal(h.sidecarCalls.length, 0);
+  assert.equal(h.flow.exitCode(), null);
 });
 
 test('the known collector list is frozen and holds every locale collector id', () => {
@@ -437,6 +499,23 @@ test('a typed too-large sidecar failure becomes too_large, not sidecar_failed', 
   assert.deepEqual(lastState(h).error, { key: 'too_large', sent: false });
   assert.equal(lastState(h).canRetry, false);
   assert.equal(h.flow.exitCode(), 14);
+  assert.equal(h.uploadCalls.length, 0);
+});
+
+test('a request_too_large sidecar failure is sidecar_failed with exit code 13', async () => {
+  const h = makeHarness({
+    sidecarError: new SidecarError(
+      'request_too_large',
+      'the sidecar request is too large (request_too_large, 16384 bytes)',
+    ),
+  });
+  await reachConsent(h);
+  assert.equal(await h.flow.consent(), true);
+  assert.equal(h.flow.state().name, 'error');
+  assert.deepEqual(lastState(h).error, { key: 'sidecar_failed', sent: false });
+  assert.equal(lastState(h).canRetry, false);
+  assert.equal(h.flow.exitCode(), 13);
+  assert.equal(h.emitted.some((state) => state.name === 'hash'), false);
   assert.equal(h.uploadCalls.length, 0);
 });
 
@@ -896,7 +975,13 @@ test('the record displayed on hash is the record redacted for the renderer', asy
 });
 
 test('the canonical comparison accepts objects with the same members in another order', async () => {
-  const policy = { server_name: POLICY.server_name, expires_at: POLICY.expires_at, require_elevation: POLICY.require_elevation, required_collectors: POLICY.required_collectors };
+  const policy = {
+    server_name: POLICY.server_name,
+    policy_hash: POLICY.policy_hash,
+    require_elevation: POLICY.require_elevation,
+    required_collectors: POLICY.required_collectors,
+    profile: POLICY.profile,
+  };
   const h = makeHarness({ policy, recordOverrides: { policy } });
   await reachHash(h);
   assert.equal(canonicalize(policy), canonicalize(POLICY));

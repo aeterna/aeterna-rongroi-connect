@@ -8,7 +8,6 @@
 // told what the scan would collect.
 const KNOWN_COLLECTORS = Object.freeze([
   'posture',
-  'powershell_text',
   'driver_service',
   'antivirus_product',
   'autostart',
@@ -28,8 +27,6 @@ const KNOWN_COLLECTORS = Object.freeze([
   'windows_start',
   'event_fields',
   'usn',
-  'fivem_servers',
-  'recorded_files',
 ]);
 
 module.exports = {

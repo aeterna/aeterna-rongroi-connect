@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 'use strict';
 
+const nodeFs = require('node:fs');
+
 const MAX_RECORD_BYTES = 2 * 1024 * 1024;
+const MAX_REQUEST_BYTES = 16 * 1024;
+const MAX_LAUNCHER_STDOUT_BYTES = 256;
 
 class SidecarError extends Error {
   constructor(code, message, options) {
@@ -40,6 +44,35 @@ function recordBytes(value) {
   return Buffer.byteLength(String(value), 'utf8');
 }
 
+// Windows paths are case-insensitive, and the image the pipe reports may be a
+// link to the file that was spawned. Resolve both only when the file exists so
+// a missing path is still compared literally instead of being rejected early.
+function imageKey(value, fs, realpath) {
+  if (typeof value !== 'string' || value.length === 0) return null;
+  let text = value;
+  try {
+    if (fs !== null && fs !== undefined && typeof fs.existsSync === 'function'
+        && fs.existsSync(value)) {
+      text = realpath(value);
+    }
+  } catch {
+    // An unreadable path is compared as it was reported.
+  }
+  if (typeof text !== 'string' || text.length === 0) return null;
+  return text.toLowerCase();
+}
+
+function realpathFor(options, fs) {
+  if (typeof options.realpath === 'function') return options.realpath;
+  if (typeof options.realpathSync === 'function') return options.realpathSync;
+  if (fs !== null && fs !== undefined && typeof fs.realpathSync === 'function') {
+    return typeof fs.realpathSync.native === 'function'
+      ? (value) => fs.realpathSync.native(value)
+      : (value) => fs.realpathSync(value);
+  }
+  return (value) => value;
+}
+
 function createSidecarRunner(options = {}) {
   const pipe = options.pipe;
   const spawn = options.spawn;
@@ -47,9 +80,12 @@ function createSidecarRunner(options = {}) {
   const sidecarCommand = options.sidecarCommand;
   const timeouts = options.timeouts ?? {};
   const connectTimeout = timeouts.connect ?? 60_000;
+  const elevatedConnectTimeout = timeouts.elevatedConnect ?? 15_000;
   const recordTimeout = timeouts.record ?? 120_000;
   const writeTimeout = timeouts.write ?? connectTimeout;
   const exitGrace = timeouts.exit ?? 2_000;
+  const fs = options.fs ?? nodeFs;
+  const realpath = realpathFor(options, fs);
   const verify = typeof options.verifySidecar === 'function'
     ? options.verifySidecar
     : (typeof module.exports.verifySidecar === 'function'
@@ -70,6 +106,13 @@ function createSidecarRunner(options = {}) {
     let signalError = null;
     let signalCancel = null;
     let resolveProcessExit = null;
+    let connectStartedAt = 0;
+    let elevatedTimer = null;
+    let elevatedWindowStarted = false;
+    let launcherExitPending = false;
+    let launcherStdout = '';
+    let launcherStdoutReadable = false;
+    let launcherStdoutEnded = false;
 
     const exitSignal = new Promise((resolve) => {
       signalExit = resolve;
@@ -85,6 +128,7 @@ function createSidecarRunner(options = {}) {
     });
 
     async function close() {
+      clearElevatedTimer();
       if (closed) return;
       const id = handle;
       handle = undefined;
@@ -105,6 +149,56 @@ function createSidecarRunner(options = {}) {
       } catch {
         // The process may already be gone.
       }
+    }
+
+    function clearElevatedTimer() {
+      if (elevatedTimer !== null) {
+        clearTimeout(elevatedTimer);
+        elevatedTimer = null;
+      }
+    }
+
+    function startElevatedWindow() {
+      if (elevatedWindowStarted) return;
+      elevatedWindowStarted = true;
+      const elapsed = Math.max(0, Date.now() - connectStartedAt);
+      const remaining = Math.max(0, connectTimeout - elapsed);
+      const wait = Math.min(elevatedConnectTimeout, remaining);
+      elevatedTimer = setTimeout(() => {
+        elevatedTimer = null;
+        // Accept and this callback can become ready in the same tick.  A real
+        // connect that won the race must not be replaced by a timeout just
+        // because the timer had already been queued.
+        if (connected) return;
+        signalExit({
+          error: new SidecarError(
+            'timeout',
+            'the elevated sidecar did not connect before the timeout',
+          ),
+        });
+      }, wait);
+    }
+
+    // An unelevated or already-elevated sidecar exits 0 only after it scanned
+    // into the pipe, so a launcher that exits 0 must have printed the elevation
+    // request. Without a readable stdout we cannot tell, and wait the window.
+    function settleLauncherExit() {
+      if (!launcherExitPending || connected || cancelled) return;
+      if (!launcherStdoutReadable || launcherStdout.includes('{"elevate":"requested"}')) {
+        launcherExitPending = false;
+        startElevatedWindow();
+        return;
+      }
+      if (launcherStdoutEnded) {
+        launcherExitPending = false;
+        signalExit({
+          error: new SidecarError('sidecar_failed', 'the sidecar exited before connecting'),
+        });
+        return;
+      }
+      // The launcher's line may still be in flight. Wait for accept inside the
+      // same window; if stdout ends without the line, fail at once above.
+      startElevatedWindow();
     }
 
     function cancel() {
@@ -163,6 +257,17 @@ function createSidecarRunner(options = {}) {
       if (command === null || command === undefined || typeof command.file !== 'string') {
         throw new Error('sidecarCommand did not return a file');
       }
+
+      // RQ refuses an over-long request line, so refuse it here before any
+      // process is started at all.
+      const line = JSON.stringify({ binding, policy, producer });
+      if (Buffer.byteLength(line, 'utf8') > MAX_REQUEST_BYTES) {
+        throw new SidecarError(
+          'request_too_large',
+          `the sidecar request is too large (request_too_large, ${MAX_REQUEST_BYTES} bytes)`,
+        );
+      }
+
       const baseArgs = Array.isArray(command.args) ? command.args : [];
       const args = [...baseArgs, '--pipe', name];
       if (elevate) {
@@ -175,6 +280,24 @@ function createSidecarRunner(options = {}) {
         throw new Error('spawn did not return a child process');
       }
       throwIfCancelled();
+
+      const stdout = child.stdout;
+      launcherStdoutReadable = stdout !== null && stdout !== undefined
+        && typeof stdout.on === 'function';
+      if (launcherStdoutReadable) {
+        stdout.on('data', (chunk) => {
+          if (launcherStdout.length >= MAX_LAUNCHER_STDOUT_BYTES) return;
+          launcherStdout += recordText(chunk)
+            .slice(0, MAX_LAUNCHER_STDOUT_BYTES - launcherStdout.length);
+          settleLauncherExit();
+        });
+        const launcherStdoutDone = () => {
+          launcherStdoutEnded = true;
+          settleLauncherExit();
+        };
+        stdout.on('end', launcherStdoutDone);
+        stdout.on('close', launcherStdoutDone);
+      }
 
       child.on('exit', (code) => {
         exited = true;
@@ -189,6 +312,9 @@ function createSidecarRunner(options = {}) {
           signalExit({ declined: true });
         } else if (code !== 0) {
           signalExit({ error: new Error(`sidecar exited with code ${code}`) });
+        } else {
+          launcherExitPending = true;
+          settleLauncherExit();
         }
       });
 
@@ -208,11 +334,13 @@ function createSidecarRunner(options = {}) {
         signalError({ error: failure });
       });
 
+      connectStartedAt = Date.now();
       const acceptResult = Promise.resolve()
         .then(() => pipe.accept(handle, connectTimeout))
         .then(
           () => {
             connected = true;
+            clearElevatedTimer();
             return { accepted: true };
           },
           (error) => ({ acceptError: error }),
@@ -235,9 +363,31 @@ function createSidecarRunner(options = {}) {
         throw decision.acceptError;
       }
 
+      let image;
+      try {
+        image = await pipe.clientImage(handle);
+      } catch (error) {
+        throwIfCancelled();
+        killIfOurs();
+        await close();
+        throw new SidecarError(
+          'sidecar_failed',
+          'the pipe client image could not be read',
+          { cause: error },
+        );
+      }
+      throwIfCancelled();
+      const expectedImage = imageKey(command.file, fs, realpath);
+      const actualImage = imageKey(image, fs, realpath);
+      if (expectedImage === null || actualImage === null || expectedImage !== actualImage) {
+        killIfOurs();
+        await close();
+        throw new SidecarError('sidecar_failed', 'the pipe client is not the bundled sidecar');
+      }
+      throwIfCancelled();
+
       try {
         const exchange = (async () => {
-          const line = JSON.stringify({ binding, policy, producer });
           await pipe.writeLine(handle, line, writeTimeout);
           throwIfCancelled();
           const record = await pipe.readUntilClose(handle, MAX_RECORD_BYTES, recordTimeout);
@@ -304,3 +454,4 @@ module.exports.createSidecarRunner = createSidecarRunner;
 module.exports.SidecarError = SidecarError;
 module.exports.verifySidecar = verifySidecar;
 module.exports.MAX_RECORD_BYTES = MAX_RECORD_BYTES;
+module.exports.MAX_REQUEST_BYTES = MAX_REQUEST_BYTES;

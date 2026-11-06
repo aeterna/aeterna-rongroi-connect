@@ -90,13 +90,19 @@ async function startKit(options = {}) {
   const ticket = crypto.randomBytes(16).toString('hex');
   const nonce = crypto.randomBytes(8).toString('hex');
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  const policyOptions = options.policy !== null && typeof options.policy === 'object'
+    ? options.policy
+    : {};
 
+  // The real Kit's policy has exactly five members: the four below plus the
+  // policy_hash added after hashing.  The expiry stays in the pairing code.
   const basePolicy = {
-    profile: 'posture',
-    required_collectors: ['posture', 'os_image'],
-    require_elevation: false,
+    profile: policyOptions.profile ?? 'posture',
+    required_collectors: Array.isArray(policyOptions.required_collectors)
+      ? [...policyOptions.required_collectors]
+      : ['posture', 'os_image'],
+    require_elevation: policyOptions.require_elevation ?? false,
     server_name: 'Mock Server Kit',
-    expires_at: expiresAt,
   };
   const hash = policyHash(basePolicy);
   const policy = { ...basePolicy, policy_hash: hash };

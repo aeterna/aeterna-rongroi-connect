@@ -149,9 +149,14 @@ function base64urlBytes(value, code, label, length) {
   return bytes;
 }
 
+// JavaScript's \s covers spaces, tabs, line breaks, NBSP, the Unicode space
+// separators (including U+2009 thin space) and U+FEFF. The remaining
+// zero-width and format characters are listed explicitly.
+const CODE_NOISE = /[\s\u180E\u200B\u200C\u200D\u2060]/g;
+
 function parsePairingCode(code) {
   if (typeof code !== 'string') fail('BAD_PREFIX', 'pairing code must be a string');
-  const text = code.trim();
+  const text = code.replace(CODE_NOISE, '');
   if (!text.startsWith('rr1.')) fail('BAD_PREFIX', 'pairing code must start with rr1.');
   const body = text.slice(4);
   if (body.length > 8192) fail('BAD_BASE64', 'pairing payload is too large');

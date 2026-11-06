@@ -43,7 +43,7 @@ function sealedBytes(kit, record) {
   return Buffer.from(JSON.stringify(envelope), 'utf8');
 }
 
-test('issues a parseable code and serves the policy it hashes', async () => {
+test('issues a parseable code and serves the five-member policy it hashes', async () => {
   const kit = await startKit({ print: false });
   try {
     const parsed = parsePairingCode(kit.code);
@@ -52,17 +52,59 @@ test('issues a parseable code and serves the policy it hashes', async () => {
     assert.equal(parsed.nonce, kit.nonce);
     assert.equal(parsed.policyHash, policyHash(kit.policy));
     assert.equal(parsed.policyHash, kit.policy.policy_hash);
+    assert.equal(parsed.expiresAt, kit.expiresAt);
+    assert.deepEqual(Object.keys(kit.policy).sort(), [
+      'policy_hash',
+      'profile',
+      'require_elevation',
+      'required_collectors',
+      'server_name',
+    ]);
 
     const response = await fetch(`${kit.origin}/nakara_rongroi/policy/${kit.ticket}`);
     assert.equal(response.status, 200);
     assert.match(response.headers.get('date') || '', /GMT$/);
-    assert.equal((await response.json()).policy_hash, parsed.policyHash);
+    const served = await response.json();
+    assert.deepEqual(served, kit.policy);
+    assert.equal(served.policy_hash, parsed.policyHash);
 
     const client = clientFor(kit);
     const policy = await client.getPolicy(parsed.policyHash);
     assert.equal(policy.server_name, kit.policy.server_name);
-    assert.equal(policy.expires_at, kit.expiresAt);
     assert.equal(kit.requests, 0);
+  } finally {
+    await kit.close();
+  }
+});
+
+test('serves policy overrides and hashes them into the pairing code', async () => {
+  const kit = await startKit({
+    print: false,
+    policy: {
+      profile: 'custom',
+      required_collectors: ['posture', 'os_image', 'defender_exclusion'],
+      require_elevation: true,
+    },
+  });
+  try {
+    const parsed = parsePairingCode(kit.code);
+    assert.equal(kit.policy.profile, 'custom');
+    assert.deepEqual(
+      kit.policy.required_collectors,
+      ['posture', 'os_image', 'defender_exclusion'],
+    );
+    assert.equal(kit.policy.require_elevation, true);
+    assert.equal(kit.policy.policy_hash, policyHash(kit.policy));
+    assert.equal(parsed.policyHash, kit.policy.policy_hash);
+
+    const response = await fetch(`${kit.origin}/nakara_rongroi/policy/${kit.ticket}`);
+    assert.deepEqual(await response.json(), kit.policy);
+
+    const client = clientFor(kit);
+    const policy = await client.getPolicy(parsed.policyHash);
+    assert.equal(policy.profile, 'custom');
+    assert.deepEqual(policy.required_collectors, kit.policy.required_collectors);
+    assert.equal(policy.require_elevation, true);
   } finally {
     await kit.close();
   }

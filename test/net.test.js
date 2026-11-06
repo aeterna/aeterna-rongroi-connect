@@ -612,25 +612,34 @@ test('the policy GET uses 10 s and upload POSTs use 15 s', async () => {
   ]);
 });
 
-test('a Date header offset over 24 hours in either direction is ignored', () => {
+test('the Date header corrects the pairing code expiry and keeps the 24 hour cap', () => {
   const nowMs = Date.parse('2026-01-01T00:00:00Z');
   const expiresAt = '2026-01-01T00:10:00Z';
   const expiresMs = Date.parse(expiresAt);
+  const policy = {
+    profile: 'posture',
+    required_collectors: ['posture', 'os_image'],
+    require_elevation: false,
+    server_name: 'Example City',
+    policy_hash: '1111111111111111',
+  };
 
   function clientWithServerDate(headerMs) {
     const client = new PairedClient({
       origin: 'http://127.0.0.1:9',
       ticket: TICKET,
       fetchImpl: async () => ({}),
+      expiresAt,
     });
     client.now = () => nowMs;
-    client.rememberExpiry({ expires_at: expiresAt }, new Date(headerMs).toUTCString());
+    client.rememberExpiry(policy, new Date(headerMs).toUTCString());
     return client;
   }
 
   const oneHour = 60 * 60 * 1000;
   const oneDay = 24 * oneHour;
 
+  assert.equal('expires_at' in policy, false);
   assert.equal(clientWithServerDate(nowMs + oneHour).expiresAtMs, expiresMs - oneHour);
   assert.equal(clientWithServerDate(nowMs - oneHour).expiresAtMs, expiresMs + oneHour);
   assert.equal(clientWithServerDate(nowMs + oneDay).expiresAtMs, expiresMs - oneDay);
@@ -639,4 +648,41 @@ test('a Date header offset over 24 hours in either direction is ignored', () => 
   // Over the clamp: the header is treated as a bad clock and ignored.
   assert.equal(clientWithServerDate(nowMs + oneDay + 1000).expiresAtMs, expiresMs);
   assert.equal(clientWithServerDate(nowMs - oneDay - 1000).expiresAtMs, expiresMs);
+});
+
+test('remembering the same Date header twice corrects the expiry only once', () => {
+  const nowMs = Date.parse('2026-01-01T00:00:00Z');
+  const expiresAt = '2026-01-01T00:10:00Z';
+  const expiresMs = Date.parse(expiresAt);
+  const oneHour = 60 * 60 * 1000;
+  const header = new Date(nowMs + oneHour).toUTCString();
+  const policy = {
+    profile: 'posture',
+    required_collectors: ['posture', 'os_image'],
+    require_elevation: false,
+    server_name: 'Example City',
+    policy_hash: '1111111111111111',
+  };
+
+  function correctedClient() {
+    const client = new PairedClient({
+      origin: 'http://127.0.0.1:9',
+      ticket: TICKET,
+      fetchImpl: async () => ({}),
+      expiresAt,
+    });
+    client.now = () => nowMs;
+    return client;
+  }
+
+  const once = correctedClient();
+  once.rememberExpiry(policy, header);
+
+  const twice = correctedClient();
+  twice.rememberExpiry(policy, header);
+  twice.rememberExpiry(policy, header);
+
+  assert.equal(once.expiresAtMs, expiresMs - oneHour);
+  assert.equal(twice.expiresAtMs, once.expiresAtMs);
+  assert.equal(twice.codeExpiresAtMs, expiresMs);
 });
