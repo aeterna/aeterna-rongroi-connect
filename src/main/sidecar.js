@@ -4,6 +4,12 @@
 
 const nodeFs = require('node:fs');
 
+// DEBUG BRANCH ONLY (never merged): trace the elevated stall.
+const TRACE_FILE = process.env.CONNECT_DEBUG_TRACE;
+function trace(...parts) {
+  if (!TRACE_FILE) return;
+  try { nodeFs.appendFileSync(TRACE_FILE, `${new Date().toISOString()} ${parts.map((p) => (typeof p === 'string' ? p : JSON.stringify(p))).join(' ')}\n`); } catch {}
+}
 const MAX_RECORD_BYTES = 2 * 1024 * 1024;
 const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_LAUNCHER_STDOUT_BYTES = 256;
@@ -275,7 +281,9 @@ function createSidecarRunner(options = {}) {
         if (typeof onElevationPending === 'function') onElevationPending();
       }
 
+      trace('spawn', command.file, args);
       child = spawn(command.file, args, { windowsHide: true });
+      trace('spawned pid', child && child.pid);
       if (child === null || child === undefined || typeof child.on !== 'function') {
         throw new Error('spawn did not return a child process');
       }
@@ -287,11 +295,13 @@ function createSidecarRunner(options = {}) {
       if (launcherStdoutReadable) {
         stdout.on('data', (chunk) => {
           if (launcherStdout.length >= MAX_LAUNCHER_STDOUT_BYTES) return;
+          trace('stdout', recordText(chunk));
           launcherStdout += recordText(chunk)
             .slice(0, MAX_LAUNCHER_STDOUT_BYTES - launcherStdout.length);
           settleLauncherExit();
         });
         const launcherStdoutDone = () => {
+          trace('stdout done');
           launcherStdoutEnded = true;
           settleLauncherExit();
         };
@@ -300,6 +310,7 @@ function createSidecarRunner(options = {}) {
       }
 
       child.on('exit', (code) => {
+        trace('exit', code, 'connected', connected);
         exited = true;
         exitCode = code;
         if (resolveProcessExit !== null) {
@@ -322,6 +333,7 @@ function createSidecarRunner(options = {}) {
       // as a thrown spawn call.  Treat it as the sidecar failing so the flow
       // reaches `sidecar_failed` instead of the process-level handler.
       child.on('error', (error) => {
+        trace('child error', String(error));
         if (exited) return;
         exited = true;
         if (resolveProcessExit !== null) {
@@ -340,13 +352,15 @@ function createSidecarRunner(options = {}) {
         .then(
           () => {
             connected = true;
+            trace('accepted');
             clearElevatedTimer();
             return { accepted: true };
           },
-          (error) => ({ acceptError: error }),
+          (error) => { trace('accept error', String(error)); return { acceptError: error }; },
         );
 
       const decision = await Promise.race([acceptResult, exitSignal, cancelSignal]);
+      trace('decision', Object.keys(decision), decision.error ? String(decision.error) : '');
       throwIfCancelled();
 
       if (decision.declined === true) {
@@ -377,6 +391,7 @@ function createSidecarRunner(options = {}) {
         );
       }
       throwIfCancelled();
+      trace('clientImage', image, 'expected', command.file);
       const expectedImage = imageKey(command.file, fs, realpath);
       const actualImage = imageKey(image, fs, realpath);
       if (expectedImage === null || actualImage === null || expectedImage !== actualImage) {
@@ -388,9 +403,12 @@ function createSidecarRunner(options = {}) {
 
       try {
         const exchange = (async () => {
+          trace('writeLine start', line.length);
           await pipe.writeLine(handle, line, writeTimeout);
+          trace('writeLine done');
           throwIfCancelled();
           const record = await pipe.readUntilClose(handle, MAX_RECORD_BYTES, recordTimeout);
+          trace('read done', recordBytes(record));
           if (recordBytes(record) > MAX_RECORD_BYTES) {
             throw new SidecarError(
               'too_large',
@@ -410,6 +428,7 @@ function createSidecarRunner(options = {}) {
           // the ADR's 2 s to report its exit, but do not hold a live elevated
           // sidecar's relaunching parent to that rule.
           const code = await waitForExit(exitGrace);
+          trace('waitForExit', code);
           throwIfCancelled();
           if (typeof code === 'number' && code !== 0) {
             throw new SidecarError('sidecar_failed', `sidecar exited with code ${code}`);
@@ -422,6 +441,7 @@ function createSidecarRunner(options = {}) {
         );
 
         const outcome = await Promise.race([exchange, errorSignal, cancelSignal]);
+        trace('outcome', Object.keys(outcome), outcome.exchangeError ? String(outcome.exchangeError) : '');
         throwIfCancelled();
         if (outcome.error !== undefined) throw outcome.error;
         if (outcome.exchangeError !== undefined) throw outcome.exchangeError;

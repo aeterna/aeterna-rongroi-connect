@@ -125,7 +125,30 @@ jobs:
           whoami
           whoami /groups | Select-String -Pattern "Mandatory Label"
       - name: Run the whole flow and check the netlog
-        run: npm run e2e
+        # DEBUG BRANCH ONLY: trace the elevated stall.
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          CONNECT_DEBUG_TRACE: ${{ github.workspace }}\sidecar-trace.log
+        run: |
+          $watch = Start-Job -ArgumentList "$env:GITHUB_WORKSPACE\proc-watch.log" -ScriptBlock {
+            param($out)
+            $seen = @{}
+            while ($true) {
+              $t = (Get-Date).ToString('o')
+              Get-CimInstance Win32_Process -Filter "Name='rongroi-scan.exe'" | ForEach-Object {
+                $k = "$($_.ProcessId)"
+                if (-not $seen.ContainsKey($k)) { $seen[$k] = 1; "$t NEW pid=$($_.ProcessId) ppid=$($_.ParentProcessId) cmd=$($_.CommandLine)" | Add-Content $out }
+              }
+              $pipes = [System.IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -match 'rongroi' }
+              foreach ($p in $pipes) { if (-not $seen.ContainsKey($p)) { $seen[$p] = 1; "$t PIPE $p" | Add-Content $out } }
+              Start-Sleep -Milliseconds 200
+            }
+          }
+          npm run e2e
+          $code = $LASTEXITCODE
+          Stop-Job $watch; Remove-Job $watch
+          exit $code
       - name: The netlog check can fail
         run: node scripts/run-e2e.js dist/test --negative-control
       - name: The release folder stays running for 8 seconds
@@ -148,4 +171,6 @@ jobs:
             e2e-negative-report.json
             e2e-negative-netlog.json
             sidecar-timing.json
+            sidecar-trace.log
+            proc-watch.log
           if-no-files-found: warn

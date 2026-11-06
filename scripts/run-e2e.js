@@ -41,6 +41,14 @@ const REAL_RUNS = Object.freeze([
       require_elevation: false,
     }),
   }),
+  Object.freeze({
+    name: 'standard-elevated',
+    policy: Object.freeze({
+      profile: 'standard',
+      required_collectors: STANDARD_COLLECTORS,
+      require_elevation: true,
+    }),
+  }),
 ]);
 const APP_LIMIT_MS = 120 * 1000;
 const REAL_STATE_TIMEOUT_MS = 300 * 1000;
