@@ -8,6 +8,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const view = require('../src/renderer/view.js');
+const { KNOWN_COLLECTORS } = require('../src/main/collectors.js');
 const en = require('../src/locales/en.json');
 const th = require('../src/locales/th.json');
 
@@ -18,7 +19,6 @@ const RECORD = '{"binding":"example","policy":"posture"}';
 const RESULT_WORDS = /verified|clean|passed|safe|ผ่าน|ปลอดภัย|สะอาด/i;
 const COLLECTOR_IDS = [
   'posture',
-  'powershell_text',
   'driver_service',
   'antivirus_product',
   'autostart',
@@ -38,8 +38,6 @@ const COLLECTOR_IDS = [
   'windows_start',
   'event_fields',
   'usn',
-  'fivem_servers',
-  'recorded_files',
 ];
 
 function makeT(messages) {
@@ -284,6 +282,82 @@ test('both locales name every collector the server can ask for', function () {
         `${locale} is missing collector.${id}`,
       );
     }
+  }
+});
+
+test('the client knows only the 20 Standard-tier collectors in order', function () {
+  assert.deepEqual(KNOWN_COLLECTORS, [
+    'posture',
+    'driver_service',
+    'antivirus_product',
+    'autostart',
+    'defender_exclusion',
+    'fivem_dir',
+    'net_config',
+    'os_image',
+    'install_marker',
+    'process',
+    'evtx',
+    'prefetch',
+    'bam',
+    'pca',
+    'userassist',
+    'pci_device',
+    'hid_device',
+    'windows_start',
+    'event_fields',
+    'usn',
+  ]);
+});
+
+test('no rendered state or locale carries a Full-tier collector key', function () {
+  const fullTier = ['powershell_text', 'fivem_servers', 'recorded_files'];
+  for (const [locale, messages] of Object.entries(LOCALES)) {
+    const t = makeT(messages);
+    for (const [label, factory] of Object.entries(STATES)) {
+      const text = flatText(view.render(factory(), t));
+      for (const id of fullTier) {
+        assert.equal(
+          text.includes('collector.' + id),
+          false,
+          `${locale}: ${label} renders collector.${id}`,
+        );
+      }
+    }
+    for (const id of fullTier) {
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(messages, 'collector.' + id),
+        false,
+        `${locale} still carries collector.${id}`,
+      );
+    }
+  }
+
+  const source = fs.readFileSync(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  for (const id of fullTier) {
+    assert.equal(
+      source.includes(`"collector.${id}":`),
+      false,
+      `app mirror still carries collector.${id}`,
+    );
+  }
+});
+
+test('every known Standard collector is named in both locales and the app mirror', function () {
+  const source = fs.readFileSync(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  for (const id of KNOWN_COLLECTORS) {
+    for (const [locale, messages] of Object.entries(LOCALES)) {
+      assert.equal(
+        typeof messages['collector.' + id],
+        'string',
+        `${locale} is missing collector.${id}`,
+      );
+    }
+    assert.equal(
+      (source.match(new RegExp(`"collector.${id}":`, 'g')) || []).length,
+      2,
+      `app mirror is missing an en or th entry for collector.${id}`,
+    );
   }
 });
 
