@@ -11,6 +11,16 @@ const RETRYABLE_CODES = new Set(['network', 'timeout', 'server_error', 'upload_r
 const POLICY_RETRY_CODES = new Set(['network', 'timeout', 'server_error']);
 const KNOWN_COLLECTOR_IDS = new Set(KNOWN_COLLECTORS);
 const COUNTDOWN_STATES = new Set(['consent', 'scanning', 'hash']);
+const POLICY_MEMBERS = Object.freeze([
+  'profile',
+  'required_collectors',
+  'require_elevation',
+  'server_name',
+  'policy_hash',
+]);
+const POLICY_PROFILES = new Set(['posture', 'standard', 'custom']);
+const POLICY_HASH_PATTERN = /^[0-9a-f]{16}$/;
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001F\u007F-\u009F]/;
 
 function noop() {}
 
@@ -214,11 +224,40 @@ function createFlow(options = {}) {
 
   function validPolicy(value) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
-    if (!Array.isArray(value.required_collectors)) return false;
-    if (value.required_collectors.some(
-      (collector) => typeof collector !== 'string' || !KNOWN_COLLECTOR_IDS.has(collector),
-    )) return false;
-    return typeof value.server_name === 'string';
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return false;
+
+    // The sidecar refuses unknown members, so only the exact five are accepted.
+    const members = Object.keys(value);
+    if (members.length !== POLICY_MEMBERS.length) return false;
+    for (const member of POLICY_MEMBERS) {
+      if (!Object.prototype.hasOwnProperty.call(value, member)) return false;
+    }
+
+    if (!POLICY_PROFILES.has(value.profile)) return false;
+
+    const collectors = value.required_collectors;
+    if (!Array.isArray(collectors) || collectors.length < 1 || collectors.length > 64) {
+      return false;
+    }
+    const seen = new Set();
+    for (const collector of collectors) {
+      if (typeof collector !== 'string'
+          || !KNOWN_COLLECTOR_IDS.has(collector)
+          || seen.has(collector)) {
+        return false;
+      }
+      seen.add(collector);
+    }
+
+    if (typeof value.require_elevation !== 'boolean') return false;
+
+    if (typeof value.server_name !== 'string') return false;
+    const nameLength = [...value.server_name].length;
+    if (nameLength < 1 || nameLength > 128) return false;
+    if (CONTROL_CHARACTER_PATTERN.test(value.server_name)) return false;
+
+    return typeof value.policy_hash === 'string' && POLICY_HASH_PATTERN.test(value.policy_hash);
   }
 
   function checkRecord(text) {
