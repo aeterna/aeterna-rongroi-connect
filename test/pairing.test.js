@@ -109,3 +109,35 @@ test('refuses malformed codes and members', () => {
   assert.throws(() => parse({ policy_hash: 'A1B2C3D4E5F60718' }), isPairingError('BAD_POLICY_HASH'));
   assert.throws(() => parse({ kit_public_key: Buffer.alloc(31).toString('base64url') }), isPairingError('BAD_KIT_KEY'));
 });
+
+test('strips whitespace and zero-width characters anywhere in a pasted code', () => {
+  const code = encode(BASE);
+  const middle = Math.floor(code.length / 2);
+  const variants = {
+    'CRLF inside': `${code.slice(0, middle)}\r\n${code.slice(middle)}`,
+    'thin space and NBSP between groups': `${code.slice(0, middle)}\u2009\u00A0${code.slice(middle)}`,
+    'zero-width space at start, middle and end': `\u200B${code.slice(0, middle)}\u200B${code.slice(middle)}\u200B`,
+    'BOM prefix': `\uFEFF${code}`,
+    'word joiner inside': `${code.slice(0, middle)}\u2060${code.slice(middle)}`,
+  };
+  const expected = parsePairingCode(code);
+  for (const [label, variant] of Object.entries(variants)) {
+    assert.deepEqual(parsePairingCode(variant), expected, label);
+  }
+});
+
+test('still refuses visible non-base64url characters inside a pasted code', () => {
+  const code = encode(BASE);
+  const middle = Math.floor(code.length / 2);
+  assert.throws(
+    () => parsePairingCode(`${code.slice(0, middle)}!${code.slice(middle)}`),
+    isPairingError('BAD_BASE64'),
+  );
+});
+
+test('refuses a pairing code that is only whitespace', () => {
+  assert.throws(
+    () => parsePairingCode(' \t\r\n\u00A0\u2009\u200B\uFEFF'),
+    isPairingError('BAD_PREFIX'),
+  );
+});
