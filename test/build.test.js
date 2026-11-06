@@ -19,8 +19,9 @@ const {
   listAsarFromDisk,
   repositoryHookCopies,
   checkFuseWire,
+  SIDECAR_EXE_PATH,
 } = require('../scripts/compare-builds');
-const { stagedPackageJson } = require('../scripts/build');
+const { stagedPackageJson, stage } = require('../scripts/build');
 
 const HOOKS = repositoryHookCopies();
 const RELEASE_HOOK = HOOKS.release;
@@ -40,6 +41,7 @@ function baseTree(asarBytes = 'release asar bytes') {
   return {
     'rongroi-connect.exe': executableFor(asarBytes),
     'resources/app.asar': asarBytes,
+    'resources/rongroi-scan.exe': 'the same pinned sidecar',
     'resources/other.pak': 'the same pak',
     LICENSE: 'the same license',
   };
@@ -594,4 +596,148 @@ test('the staged package.json drops devDependencies without changing the input',
   });
   assert.equal('devDependencies' in staged, false);
   assert.equal(pkg.devDependencies.electron, '44.7.1');
+});
+
+test('sidecar.lock.json pins the source build of rongroi-scan', () => {
+  const lockFile = path.join(__dirname, '..', 'sidecar.lock.json');
+  const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+
+  assert.deepEqual(lock, {
+    source: 'build',
+    repository: 'aeterna/aeterna-rongroi',
+    commit: '3a08e2dcabd940780dd314579f6345306eae7143',
+    package: 'rongroi-scan',
+  });
+  assert.equal(fs.existsSync(`${lockFile}.license`), true);
+});
+
+test('the pinned sidecar travels next to the asar in both builds', () => {
+  const release = baseTree('release asar bytes');
+  const testTree = baseTree('test asar bytes');
+
+  const result = compareTrees(release, testTree, asarPair(), HOOKS);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.differences, []);
+});
+
+test('a missing resources/rongroi-scan.exe in the test build fails', () => {
+  const release = baseTree('release asar bytes');
+  const testTree = baseTree('test asar bytes');
+  delete testTree[SIDECAR_EXE_PATH];
+
+  const result = compareTrees(release, testTree, asarPair(), HOOKS);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.differences.some((entry) => (
+    entry.includes(SIDECAR_EXE_PATH) && entry.includes('missing from the test build')
+  )), true);
+  assert.equal(result.differences.some((entry) => (
+    entry.includes(SIDECAR_EXE_PATH) && entry.includes('missing from the release build')
+  )), false);
+});
+
+test('a missing resources/rongroi-scan.exe in the release build fails', () => {
+  const release = baseTree('release asar bytes');
+  const testTree = baseTree('test asar bytes');
+  delete release[SIDECAR_EXE_PATH];
+
+  const result = compareTrees(release, testTree, asarPair(), HOOKS);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.differences.some((entry) => (
+    entry.includes(SIDECAR_EXE_PATH) && entry.includes('missing from the release build')
+  )), true);
+});
+
+test('a missing resources/rongroi-scan.exe in both builds fails twice', () => {
+  const release = baseTree('release asar bytes');
+  const testTree = baseTree('test asar bytes');
+  delete release[SIDECAR_EXE_PATH];
+  delete testTree[SIDECAR_EXE_PATH];
+
+  const result = compareTrees(release, testTree, asarPair(), HOOKS);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.differences.some((entry) => (
+    entry.includes(SIDECAR_EXE_PATH) && entry.includes('missing from the release build')
+  )), true);
+  assert.equal(result.differences.some((entry) => (
+    entry.includes(SIDECAR_EXE_PATH) && entry.includes('missing from the test build')
+  )), true);
+});
+
+function stageFixtures(root) {
+  const lockFile = path.join(root, 'lock', 'sidecar.lock.json');
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  fs.writeFileSync(lockFile, `${JSON.stringify({
+    source: 'build',
+    repository: 'aeterna/aeterna-rongroi',
+    commit: '0'.repeat(40),
+    package: 'rongroi-scan',
+  }, null, 2)}\n`, 'utf8');
+  return lockFile;
+}
+
+test('stage() fails without vendor/rongroi-scan.exe, naming the lock file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sidecar-stage-missing-'));
+
+  try {
+    const lockFile = stageFixtures(root);
+
+    assert.throws(
+      () => stage({ vendorExe: path.join(root, 'vendor', 'rongroi-scan.exe'), lockFile }),
+      (error) => {
+        assert.equal(
+          error.message.includes('rongroi-scan.exe'),
+          true,
+          `the error should name the sidecar: ${error.message}`,
+        );
+        assert.equal(
+          error.message.includes('sidecar.lock.json'),
+          true,
+          `the error should name the lock file: ${error.message}`,
+        );
+        assert.equal(
+          error.message.includes('\n'),
+          false,
+          `the error should be one line: ${error.message}`,
+        );
+        return true;
+      },
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('stage() writes src/sidecar.json with the vendor SHA-256 and the lock commit', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sidecar-stage-record-'));
+
+  try {
+    const lockFile = stageFixtures(root);
+    const vendorExe = path.join(root, 'rongroi-scan.exe');
+    fs.writeFileSync(vendorExe, Buffer.alloc(4096, 0x52));
+    // A stand-in for the native module, whose absence the stage reports
+    // separately from the sidecar (the real build may not exist in the tree).
+    const nativeModule = path.join(root, 'rongroi_connect_pipe.node');
+    fs.writeFileSync(nativeModule, Buffer.alloc(16, 0x01));
+
+    const { stageDir, sidecarExe } = stage({ vendorExe, lockFile, nativeModule });
+    try {
+      assert.equal(sidecarExe, vendorExe);
+      const record = JSON.parse(
+        fs.readFileSync(path.join(stageDir, 'src', 'sidecar.json'), 'utf8'),
+      );
+      const digest = crypto
+        .createHash('sha256')
+        .update(fs.readFileSync(vendorExe))
+        .digest('hex');
+      assert.deepEqual(record, { sha256: digest, commit: '0'.repeat(40) });
+    } finally {
+      fs.rmSync(stageDir, { recursive: true, force: true });
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

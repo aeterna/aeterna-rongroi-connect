@@ -6,17 +6,54 @@
 //   node scripts/build.js <outDir> [--test]
 // The release folder gets src/test-hook.js (the stub); --test replaces it with
 // test/hook/test-hook.js.  Nothing else differs between the two staged trees.
+// Both folders carry the pinned sidecar next to their asar: build.js requires
+// vendor/rongroi-scan.exe, hashes it into staged src/sidecar.json, and copies
+// the exe to <output>/resources/rongroi-scan.exe.
 
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const ROOT = path.resolve(__dirname, '..');
 const PACKAGE_JSON = path.join(ROOT, 'package.json');
 const NATIVE_MODULE = path.join(ROOT, 'native', 'pipe', 'rongroi_connect_pipe.node');
+const LOCK_FILE = path.join(ROOT, 'sidecar.lock.json');
+const VENDOR_EXE = path.join(ROOT, 'vendor', 'rongroi-scan.exe');
+const SIDECAR_EXE_NAME = 'rongroi-scan.exe';
+const SIDECAR_RECORD = path.join('src', 'sidecar.json');
 
 function readJson(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+function sha256Hex(file) {
+  const hash = crypto.createHash('sha256');
+  hash.update(fs.readFileSync(file));
+  return hash.digest('hex');
+}
+
+// sidecar.lock.json pins which sidecar the build must carry.  Every failure
+// here is one line that names the lock file, per C4.
+function readSidecarLock(lockFile) {
+  let lock;
+  try {
+    lock = readJson(lockFile);
+  } catch (error) {
+    throw new Error(`cannot read sidecar.lock.json at ${lockFile}: ${error.message}`);
+  }
+  if (lock === null || typeof lock !== 'object' || Array.isArray(lock)
+      || typeof lock.commit !== 'string' || lock.commit.length === 0) {
+    throw new Error(`sidecar.lock.json (${lockFile}) must record the pinned sidecar commit`);
+  }
+  return lock;
+}
+
+function requireVendorSidecar(vendorExe, lockFile) {
+  if (fs.existsSync(vendorExe)) return;
+  throw new Error(
+    `missing ${vendorExe}; build the sidecar pinned by sidecar.lock.json (${lockFile}) into vendor/ first`,
+  );
 }
 
 function stagedPackageJson(pkg) {
@@ -38,11 +75,19 @@ function removeStaging(directory) {
   }
 }
 
-function stage({ test }) {
+function stage({
+  test,
+  vendorExe = VENDOR_EXE,
+  lockFile = LOCK_FILE,
+  nativeModule = NATIVE_MODULE,
+} = {}) {
   const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rongroi-connect-build-'));
   const pkg = readJson(PACKAGE_JSON);
 
   try {
+    const sidecar = readSidecarLock(lockFile);
+    requireVendorSidecar(vendorExe, lockFile);
+
     fs.writeFileSync(
       path.join(stageDir, 'package.json'),
       `${JSON.stringify(stagedPackageJson(pkg), null, 2)}\n`,
@@ -51,14 +96,24 @@ function stage({ test }) {
 
     fs.cpSync(path.join(ROOT, 'src'), path.join(stageDir, 'src'), { recursive: true });
 
+    fs.writeFileSync(
+      path.join(stageDir, SIDECAR_RECORD),
+      `${JSON.stringify(
+        { sha256: sha256Hex(vendorExe), commit: sidecar.commit },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    );
+
     copyFile(
       path.join(ROOT, 'native', 'pipe', 'index.js'),
       path.join(stageDir, 'native', 'pipe', 'index.js'),
     );
-    if (!fs.existsSync(NATIVE_MODULE)) {
-      throw new Error(`missing ${NATIVE_MODULE}; run npm run build:native first`);
+    if (!fs.existsSync(nativeModule)) {
+      throw new Error(`missing ${nativeModule}; run npm run build:native first`);
     }
-    copyFile(NATIVE_MODULE, path.join(stageDir, 'native', 'pipe', 'rongroi_connect_pipe.node'));
+    copyFile(nativeModule, path.join(stageDir, 'native', 'pipe', 'rongroi_connect_pipe.node'));
 
     if (test) {
       copyFile(
@@ -67,7 +122,7 @@ function stage({ test }) {
       );
     }
 
-    return { stageDir, pkg };
+    return { stageDir, pkg, sidecarExe: vendorExe };
   } catch (error) {
     removeStaging(stageDir);
     throw error;
@@ -118,7 +173,7 @@ async function main(argv) {
 
   const outDir = path.resolve(outArg);
   fs.mkdirSync(outDir, { recursive: true });
-  const { stageDir, pkg } = stage({ test });
+  const { stageDir, pkg, sidecarExe } = stage({ test });
 
   try {
     const electronVersion = pkg.devDependencies && pkg.devDependencies.electron;
@@ -149,6 +204,10 @@ async function main(argv) {
     if (!fs.existsSync(executable)) {
       throw new Error(`the packaged executable is missing: ${executable}`);
     }
+
+    // ADR 0001 section 4: the sidecar lives beside the asar, outside it, so the
+    // app can hash the very file it is about to run before every launch.
+    copyFile(sidecarExe, path.join(output, 'resources', SIDECAR_EXE_NAME));
 
     const { flipFuses, FuseVersion, FuseV1Options } = await loadFuses();
     await flipFuses(executable, {

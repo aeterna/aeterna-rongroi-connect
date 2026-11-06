@@ -5,13 +5,15 @@
 // Compare the release and test builds of ADR 0001 section 2.  The pure parts are
 // compareExecutables() and compareTrees(); the command line turns two folders
 // into file maps, gives compareTrees a way to read the two app.asar archives,
-// and reads the fuses of both executables.
+// and reads the fuses of both executables.  Both folders must carry the pinned
+// sidecar at resources/rongroi-scan.exe.
 
 const fs = require('node:fs');
 const path = require('node:path');
 
 const ASAR_PATH = 'resources/app.asar';
 const EXE_PATH = 'rongroi-connect.exe';
+const SIDECAR_EXE_PATH = 'resources/rongroi-scan.exe';
 const TEST_HOOK_PATH = 'src/test-hook.js';
 const ROOT = path.resolve(__dirname, '..');
 
@@ -288,6 +290,15 @@ function compareTrees(a, b, listAsar, expectedHooks) {
 
   if (left.size === 0) differences.push('the release tree is empty');
   if (right.size === 0) differences.push('the test tree is empty');
+
+  // Both builds must carry the pinned sidecar beside the asar (C4): the app
+  // hashes that very file before every launch.  Its bytes must then be equal
+  // like every other shared file below.
+  const present = (tree) => [...tree.keys()].some(
+    (rel) => rel === SIDECAR_EXE_PATH || rel.endsWith(`/${SIDECAR_EXE_PATH}`),
+  );
+  if (!present(left)) differences.push(`${SIDECAR_EXE_PATH}: missing from the release build`);
+  if (!present(right)) differences.push(`${SIDECAR_EXE_PATH}: missing from the test build`);
 
   const names = new Set([...left.keys(), ...right.keys()]);
   for (const rel of [...names].sort()) {
@@ -785,7 +796,8 @@ async function main(argv) {
   console.log(
     'builds match: every file is byte-identical except resources/app.asar, and the exes differ '
       + 'only in their embedded asar integrity hash; inside the asars only src/test-hook.js may '
-      + 'differ, and both exes hold the section 1 fuses and the same fuse wire.',
+      + 'differ, and both exes hold the section 1 fuses and the same fuse wire.  Both builds '
+      + 'carry the pinned resources/rongroi-scan.exe.',
   );
 }
 
@@ -799,6 +811,7 @@ if (require.main === module) {
 module.exports = {
   ASAR_PATH,
   EXE_PATH,
+  SIDECAR_EXE_PATH,
   TEST_HOOK_PATH,
   SECTION_1_FUSES,
   compareTrees,
