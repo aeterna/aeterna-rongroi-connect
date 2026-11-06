@@ -36,7 +36,10 @@ const REAL_RUNS = Object.freeze([
     policy: Object.freeze({
       profile: 'standard',
       required_collectors: STANDARD_COLLECTORS,
-      require_elevation: true,
+      // A hosted CI runner cannot answer a UAC prompt, so an elevated run
+      // would wait in `scanning` until the 120 s limit.  Test elevation by
+      // hand on a real PC instead (lane 3c M1).
+      require_elevation: false,
     }),
   }),
 ]);
@@ -1329,6 +1332,7 @@ module.exports = {
   captureNewTempEntries,
   runSucceeded,
   runSpecs,
+  REAL_RUNS,
   kitEnvironment,
   applicationEnv,
   parseHookStates,

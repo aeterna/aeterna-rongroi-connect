@@ -21,6 +21,7 @@ const {
   reportFileNames,
   runSucceeded,
   runSpecs,
+  REAL_RUNS,
   parseArguments,
   kitEnvironment,
   applicationEnv,
@@ -994,12 +995,29 @@ test('a new temp file holding a ticket is found and fails the run', () => {
   }
 });
 
-test('real mode runs posture and the elevated Standard policy', () => {
+test('real mode runs posture and Standard without elevation in CI', () => {
+  assert.equal(REAL_RUNS.length, 2);
+  assert.deepEqual(REAL_RUNS.map((run) => run.name), ['posture', 'standard']);
+
+  const [posture, standard] = REAL_RUNS;
+  assert.equal(posture.policy.profile, 'posture');
+  assert.equal(posture.policy.required_collectors.length, 2);
+  assert.equal(posture.policy.require_elevation, false);
+
+  assert.equal(standard.policy.profile, 'standard');
+  assert.equal(standard.policy.required_collectors.length, 20);
+  assert.deepEqual(standard.policy.required_collectors, STANDARD_COLLECTORS);
+  // A hosted CI runner cannot answer a UAC prompt, so the elevated path is
+  // checked by hand on a real PC (lane 3c M1).
+  assert.equal(standard.policy.require_elevation, false);
+});
+
+test('real mode runs posture and the Standard policy without elevation', () => {
   const specs = runSpecs('real', false);
   assert.deepEqual(specs.map((spec) => spec.name), ['posture', 'standard']);
   assert.equal(specs[0].policy.require_elevation, false);
   assert.equal(specs[1].policy.profile, 'standard');
-  assert.equal(specs[1].policy.require_elevation, true);
+  assert.equal(specs[1].policy.require_elevation, false);
   assert.deepEqual(specs[1].policy.required_collectors, STANDARD_COLLECTORS);
   assert.equal(STANDARD_COLLECTORS.length, 20);
 
