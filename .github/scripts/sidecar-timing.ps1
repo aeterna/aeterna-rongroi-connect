@@ -5,11 +5,10 @@
 param([string]$Exe = 'vendor/rongroi-scan.exe', [int]$LimitSeconds = 600)
 $ErrorActionPreference = 'Stop'
 $collectors = @('posture','driver_service','antivirus_product','autostart','defender_exclusion','fivem_dir','net_config','os_image','install_marker','process','evtx','prefetch','bam','pca','userassist','pci_device','hid_device','windows_start','event_fields','usn')
-$request = [ordered]@{
-  binding = [ordered]@{ ticket = '0123456789abcdef0123456789abcdef'; nonce = 'ci-timing-nonce' }
-  policy = [ordered]@{ profile = 'standard'; required_collectors = $collectors; require_elevation = $true; server_name = 'CI timing'; policy_hash = '0000000000000000' }
-  producer = [ordered]@{ name = 'rongroi-connect'; version = '0.1.0'; mode = 'single-shot' }
-} | ConvertTo-Json -Compress -Depth 5
+# Build the request with Connect's own canonical code so policy_hash matches what the sidecar recomputes.
+$env:TIMING_COLLECTORS = ($collectors -join ',')
+$request = node -e "const {policyHash}=require('./src/core/canonical');const p={profile:'standard',required_collectors:process.env.TIMING_COLLECTORS.split(','),require_elevation:true,server_name:'CI timing'};p.policy_hash=policyHash(p);process.stdout.write(JSON.stringify({binding:{ticket:'0123456789abcdef0123456789abcdef',nonce:'ci-timing-nonce'},policy:p,producer:{name:'rongroi-connect',version:'0.1.0',mode:'single-shot'}}))"
+if ($LASTEXITCODE -ne 0 -or -not $request) { throw 'could not build the timing request' }
 $exePath = (Resolve-Path $Exe).Path
 $results = @()
 foreach ($elevate in @($false, $true)) {
@@ -19,8 +18,9 @@ foreach ($elevate in @($false, $true)) {
   $argList = @('--pipe', "\\.\pipe\$name")
   if ($elevate) { $argList += '--elevate' }
   $out = Join-Path $env:RUNNER_TEMP "timing-$elevate.out"
+  $errFile = Join-Path $env:RUNNER_TEMP "timing-$elevate.err"
   $sw = [Diagnostics.Stopwatch]::StartNew()
-  $p = Start-Process -FilePath $exePath -ArgumentList $argList -PassThru -WindowStyle Hidden -RedirectStandardOutput $out
+  $p = Start-Process -FilePath $exePath -ArgumentList $argList -PassThru -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError $errFile
   $null = $p.Handle
   $wait = $server.WaitForConnectionAsync()
   $connected = $wait.Wait(60000)
@@ -44,10 +44,11 @@ foreach ($elevate in @($false, $true)) {
   if (-not $exited) { try { $p.Kill() } catch {} }
   $server.Dispose()
   $stdout = if (Test-Path $out) { (Get-Content $out -Raw) } else { '' }
+  $stderr = if (Test-Path $errFile) { (Get-Content $errFile -Raw) } else { '' }
   $results += [ordered]@{
     elevate = $elevate; connected = $connected; connect_ms = $connectMs; record_bytes = $bytes
     read_complete = $readDone; seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-    exit_code = $(if ($exited) { $p.ExitCode } else { $null }); stdout = "$stdout".Trim()
+    exit_code = $(if ($exited) { $p.ExitCode } else { $null }); stdout = "$stdout".Trim(); stderr = "$stderr".Trim()
   }
 }
 $results | ConvertTo-Json -Depth 4 | Tee-Object -FilePath sidecar-timing.json
