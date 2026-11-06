@@ -119,8 +119,9 @@ jobs:
       - name: Compare the two builds
         run: node scripts/compare-builds.js dist/release dist/test
       - name: How elevated is the runner
-        # Evidence for the e2e: a non-elevated runner cannot answer a UAC prompt, so the
-        # elevated path is checked on a real PC (lane 3c M1), not here.
+        # Evidence for the e2e: the runner is already High integrity, so the elevated
+        # Standard run scans in place with no UAC prompt. The prompt itself is checked on
+        # a real PC (lane 3c M1), not here.
         run: |
           whoami
           whoami /groups | Select-String -Pattern "Mandatory Label"
@@ -130,13 +131,6 @@ jobs:
         run: node scripts/run-e2e.js dist/test --negative-control
       - name: The release folder stays running for 8 seconds
         run: node scripts/run-e2e.js --release-smoke dist/release
-      - name: Time the sidecar on its own (diagnostic)
-        # Lane 3c: the elevated Standard run stalled in the e2e on a High-integrity runner.
-        # This times the bare sidecar so a slow elevated scan can be told from a hang.
-        if: always()
-        continue-on-error: true
-        timeout-minutes: 25
-        run: ./.github/scripts/sidecar-timing.ps1
       - name: Keep the report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -147,5 +141,4 @@ jobs:
             e2e-netlog.json
             e2e-negative-report.json
             e2e-negative-netlog.json
-            sidecar-timing.json
           if-no-files-found: warn

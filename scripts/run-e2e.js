@@ -32,12 +32,21 @@ const REAL_RUNS = Object.freeze([
     }),
   }),
   Object.freeze({
+    name: 'standard-elevated',
+    policy: Object.freeze({
+      profile: 'standard',
+      required_collectors: STANDARD_COLLECTORS,
+      // The hosted runner is already High integrity, so `--elevate` scans in
+      // place without a UAC prompt; the consent prompt path is checked by hand
+      // on a real PC (lane 3c M1).
+      require_elevation: true,
+    }),
+  }),
+  Object.freeze({
     name: 'standard',
     policy: Object.freeze({
       profile: 'standard',
       required_collectors: STANDARD_COLLECTORS,
-      // With --elevate on the hosted CI runner, Connect stayed in `scanning`
-      // (elevationPending) for 120 s; cause unknown, lane 3c follow-up + M1 manual PC check.
       require_elevation: false,
     }),
   }),
