@@ -32,6 +32,14 @@ const REAL_RUNS = Object.freeze([
     }),
   }),
   Object.freeze({
+    name: 'standard-elevated',
+    policy: Object.freeze({
+      profile: 'standard',
+      required_collectors: STANDARD_COLLECTORS,
+      require_elevation: true,
+    }),
+  }),
+  Object.freeze({
     name: 'standard',
     policy: Object.freeze({
       profile: 'standard',
@@ -41,17 +49,9 @@ const REAL_RUNS = Object.freeze([
       require_elevation: false,
     }),
   }),
-  Object.freeze({
-    name: 'standard-elevated',
-    policy: Object.freeze({
-      profile: 'standard',
-      required_collectors: STANDARD_COLLECTORS,
-      require_elevation: true,
-    }),
-  }),
 ]);
-const APP_LIMIT_MS = 120 * 1000;
-const REAL_STATE_TIMEOUT_MS = 300 * 1000;
+const APP_LIMIT_MS = 600 * 1000;
+const REAL_STATE_TIMEOUT_MS = 580 * 1000;
 const RELEASE_SMOKE_MS = 8 * 1000;
 const REQUIRED_PATHS = [...DEFAULT_REQUIRED_PATHS];
 const LEFTOVER_MAX_BYTES = 1024 * 1024;

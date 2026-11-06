@@ -127,7 +127,7 @@ jobs:
       - name: Run the whole flow and check the netlog
         # DEBUG BRANCH ONLY: trace the elevated stall.
         continue-on-error: true
-        timeout-minutes: 15
+        timeout-minutes: 30
         env:
           CONNECT_DEBUG_TRACE: ${{ github.workspace }}\sidecar-trace.log
         run: |

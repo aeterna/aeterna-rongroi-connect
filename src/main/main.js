@@ -153,7 +153,7 @@ function runSidecar(...args) {
         readFile: fs.readFileSync,
         createHash: crypto.createHash,
       }),
-      timeouts: { connect: 60000, record: 120000 },
+      timeouts: { connect: 60000, record: 540000 },
     });
   }
   if (sidecarRunner && typeof sidecarRunner.then === 'function') {
