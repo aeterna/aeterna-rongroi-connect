@@ -12,10 +12,15 @@ const crypto = require('node:crypto');
 const { createHash } = require('node:crypto');
 const { openEnvelope } = require('../../src/core/envelope');
 const { policyHash, visualHash } = require('../../src/core/canonical');
+const { KNOWN_COLLECTORS } = require('../../src/main/collectors');
 
 const HOST = '127.0.0.1';
 const PREFIX = '/nakara_rongroi';
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
+
+// The Standard tier is exactly the 20 collectors this client knows.  The e2e
+// run asks the Kit for the same list the real Standard policy names.
+const STANDARD_COLLECTORS = Object.freeze([...KNOWN_COLLECTORS]);
 
 function sha256Hex(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
@@ -111,6 +116,12 @@ async function startKit(options = {}) {
   const hashes = new Map();
   let storedRecord = null;
   let storedHash = null;
+  let storedRecordVisualHash = null;
+  let storedRecordBytes = null;
+  let storedRecordVersion = null;
+  let storedElevated = null;
+  let storedScanSeconds = null;
+  let policyServedAt = null;
   let received = 0;
   let requests = 0;
 
@@ -161,9 +172,35 @@ async function startKit(options = {}) {
     // in the record is the one the player saw and is not trusted here.
     storedRecord = record;
     storedHash = computed;
+    storedRecordVisualHash = typeof record.visual_hash === 'string'
+      ? record.visual_hash
+      : null;
+    storedRecordBytes = Buffer.byteLength(text, 'utf8');
+    storedRecordVersion = typeof record.rongroi_version === 'string'
+      ? record.rongroi_version
+      : null;
+    storedElevated = typeof record.elevated === 'boolean'
+      ? record.elevated
+      : (record.scan !== null && typeof record.scan === 'object'
+          && typeof record.scan.elevated === 'boolean'
+        ? record.scan.elevated
+        : null);
+    storedScanSeconds = policyServedAt === null
+      ? null
+      : (Date.now() - policyServedAt) / 1000;
     hashes.set(ticket, computed);
     received += 1;
-    if (print) console.log(JSON.stringify({ received: true, visual_hash: computed }));
+    if (print) {
+      console.log(JSON.stringify({
+        received: true,
+        visual_hash: computed,
+        record_visual_hash: storedRecordVisualHash,
+        record_bytes: storedRecordBytes,
+        rongroi_version: storedRecordVersion,
+        elevated: storedElevated,
+        scan_seconds: storedScanSeconds,
+      }));
+    }
     return computed;
   }
 
@@ -180,6 +217,7 @@ async function startKit(options = {}) {
           response.end();
           return;
         }
+        policyServedAt = Date.now();
         response.writeHead(200, {
           'Content-Type': 'application/json',
           Date: new Date().toUTCString(),
@@ -364,6 +402,21 @@ async function startKit(options = {}) {
     get visualHash() {
       return storedHash;
     },
+    get recordVisualHash() {
+      return storedRecordVisualHash;
+    },
+    get recordBytes() {
+      return storedRecordBytes;
+    },
+    get rongroiVersion() {
+      return storedRecordVersion;
+    },
+    get elevated() {
+      return storedElevated;
+    },
+    get scanSeconds() {
+      return storedScanSeconds;
+    },
     get record() {
       return storedRecord;
     },
@@ -416,3 +469,4 @@ if (require.main === module
 module.exports = startKit;
 module.exports.startKit = startKit;
 module.exports.encodeCode = encodeCode;
+module.exports.STANDARD_COLLECTORS = STANDARD_COLLECTORS;

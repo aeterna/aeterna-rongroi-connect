@@ -20,8 +20,14 @@ const {
   negativeControlMutations,
   reportFileNames,
   runSucceeded,
+  runSpecs,
+  parseArguments,
+  listTempTopLevel,
+  newTempEntries,
+  captureNewTempEntries,
   LEFTOVER_MAX_BYTES,
 } = require('../scripts/run-e2e');
+const { STANDARD_COLLECTORS } = require('./mock/kit');
 
 const ALLOWED = '127.0.0.1:30120';
 const REQUIRED_PATHS = [
@@ -802,21 +808,159 @@ test('negative-control mode uses separate report files', () => {
   });
 });
 
-test('a run fails when the netlog was repaired or the leftover search did not run', () => {
+test('a run fails when the netlog was repaired or a leftover search did not run', () => {
   const run = { error: null, timedOut: false, exitCode: 0 };
   const report = {
     kitReceived: true,
+    kitHashEqualsRecord: true,
     netlogOk: true,
     netlogRepaired: false,
     leftoverSearchRan: true,
+    newTempSearchRan: true,
     negativeControlOk: true,
     leftoverHits: [],
+    newTempHits: [],
   };
 
   assert.equal(runSucceeded(run, report), true);
   assert.equal(runSucceeded(run, { ...report, netlogRepaired: true }), false);
   assert.equal(runSucceeded(run, { ...report, leftoverSearchRan: false }), false);
+  assert.equal(runSucceeded(run, { ...report, newTempSearchRan: false }), false);
   assert.equal(runSucceeded({ ...run, exitCode: 1 }, report), false);
+});
+
+test('a mismatching Kit hash fails the run', () => {
+  const run = { error: null, timedOut: false, exitCode: 0 };
+  const report = {
+    kitReceived: true,
+    kitHashEqualsRecord: true,
+    netlogOk: true,
+    netlogRepaired: false,
+    leftoverSearchRan: true,
+    newTempSearchRan: true,
+    negativeControlOk: true,
+    leftoverHits: [],
+    newTempHits: [],
+  };
+
+  assert.equal(runSucceeded(run, report), true);
+  assert.equal(runSucceeded(run, { ...report, kitHashEqualsRecord: false }), false);
+});
+
+test('a ticket in a new top-level temp entry fails the run', () => {
+  const run = { error: null, timedOut: false, exitCode: 0 };
+  const report = {
+    kitReceived: true,
+    kitHashEqualsRecord: true,
+    netlogOk: true,
+    netlogRepaired: false,
+    leftoverSearchRan: true,
+    newTempSearchRan: true,
+    negativeControlOk: true,
+    leftoverHits: [],
+    newTempHits: [],
+  };
+
+  assert.equal(runSucceeded(run, report), true);
+  assert.equal(runSucceeded(run, {
+    ...report,
+    newTempHits: [{ file: 'new-file', what: 'nonce' }],
+  }), false);
+  // An origin hit in a new file is recorded but does not fail the job.
+  assert.equal(runSucceeded(run, {
+    ...report,
+    newTempHits: [{ file: 'new-file', what: 'origin' }],
+  }), true);
+});
+
+test('new top-level temp entries are the difference between the before and after listings', () => {
+  const first = path.join(os.tmpdir(), 'e2e-before-entry');
+  const second = path.join(os.tmpdir(), 'e2e-after-entry');
+  const netlog = path.join(os.tmpdir(), 'e2e-netlog-entry');
+
+  assert.deepEqual(newTempEntries([first], [first, second]), [second]);
+  assert.deepEqual(newTempEntries(
+    [{ path: first }],
+    [{ path: first }, { path: second }],
+  ), [second]);
+  assert.deepEqual(newTempEntries([first], [second, first], [netlog]), [second]);
+  assert.deepEqual(newTempEntries([first], [first, netlog], [netlog]), []);
+});
+
+test('a new temp file holding a ticket is found and fails the run', () => {
+  const ticket = 'c5e2e0123456789abcdef0123456789';
+  const before = listTempTopLevel(os.tmpdir());
+  const entry = path.join(os.tmpdir(), `e2e-new-entry-${process.pid}-${Date.now()}`);
+  const report = {};
+
+  try {
+    fs.writeFileSync(entry, `ticket ${ticket}`, 'utf8');
+    captureNewTempEntries(report, before, { ticket });
+
+    assert.ok(report.newTempEntries.includes(path.resolve(entry)));
+    assert.equal(report.newTempSearchRan, true);
+    assert.deepEqual(
+      report.newTempHits.filter((hit) => hit.file === path.resolve(entry)),
+      [{ file: path.resolve(entry), what: 'ticket' }],
+    );
+    assert.equal(runSucceeded(
+      { error: null, timedOut: false, exitCode: 0 },
+      {
+        kitReceived: true,
+        kitHashEqualsRecord: true,
+        netlogOk: true,
+        netlogRepaired: false,
+        leftoverSearchRan: true,
+        newTempSearchRan: report.newTempSearchRan,
+        negativeControlOk: true,
+        leftoverHits: [],
+        newTempHits: report.newTempHits,
+      },
+    ), false);
+  } finally {
+    fs.rmSync(entry, { force: true });
+  }
+});
+
+test('real mode runs posture and the elevated Standard policy', () => {
+  const specs = runSpecs('real', false);
+  assert.deepEqual(specs.map((spec) => spec.name), ['posture', 'standard']);
+  assert.equal(specs[0].policy.require_elevation, false);
+  assert.equal(specs[1].policy.profile, 'standard');
+  assert.equal(specs[1].policy.require_elevation, true);
+  assert.deepEqual(specs[1].policy.required_collectors, STANDARD_COLLECTORS);
+  assert.equal(STANDARD_COLLECTORS.length, 20);
+
+  assert.deepEqual(runSpecs('mock', false).map((spec) => spec.name), ['mock']);
+  assert.deepEqual(runSpecs('real', true).map((spec) => spec.name), ['posture']);
+});
+
+test('--sidecar selects real by default and accepts real or mock', () => {
+  const fallback = parseArguments(['dist/test']);
+  assert.equal(fallback.error, null);
+  assert.equal(fallback.sidecar, 'real');
+  assert.equal(fallback.buildDir, 'dist/test');
+  assert.equal(fallback.negativeControl, false);
+
+  const mock = parseArguments(['dist/test', '--sidecar', 'mock']);
+  assert.equal(mock.error, null);
+  assert.equal(mock.sidecar, 'mock');
+  assert.equal(mock.buildDir, 'dist/test');
+
+  const real = parseArguments(['--sidecar=real', 'dist/test']);
+  assert.equal(real.error, null);
+  assert.equal(real.sidecar, 'real');
+  assert.equal(real.buildDir, 'dist/test');
+
+  const negative = parseArguments(['dist/test', '--sidecar', 'mock', '--negative-control']);
+  assert.equal(negative.error, null);
+  assert.equal(negative.sidecar, 'mock');
+  assert.equal(negative.negativeControl, true);
+
+  assert.notEqual(parseArguments(['dist/test', '--sidecar']).error, null);
+  assert.notEqual(parseArguments(['dist/test', '--sidecar', 'tape']).error, null);
+  assert.notEqual(parseArguments(['dist/test', '--sidecar=']).error, null);
+  assert.notEqual(parseArguments([]).error, null);
 });
 
 test('negative-control mutations change every probe port and paired host', () => {

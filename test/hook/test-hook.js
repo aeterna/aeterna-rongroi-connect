@@ -9,8 +9,12 @@ const STATE_TIMEOUT_MS = 60 * 1000;
 const POLL_MS = 25;
 
 function sidecarCommand() {
+  const file = process.env.CONNECT_TEST_NODE;
+  // Real-sidecar runs leave CONNECT_TEST_NODE unset; CM then launches the
+  // bundled resources/rongroi-scan.exe with its hash and image checks active.
+  if (typeof file !== 'string' || file.length === 0) return undefined;
   return {
-    file: process.env.CONNECT_TEST_NODE,
+    file,
     args: [process.env.CONNECT_TEST_SIDECAR],
   };
 }
