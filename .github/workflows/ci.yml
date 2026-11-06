@@ -66,7 +66,7 @@ jobs:
     # ADR 0001 section 2: the proof runs on what ships. A hosted runner, never a shared one.
     name: quarantine proof (windows)
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -84,6 +84,32 @@ jobs:
         run: npm ci --ignore-scripts
       - name: Build the pipe module
         run: npm run build:native
+      # Lane 3c: until Connect 0.1.0 the sidecar is built from source at the commit in
+      # sidecar.lock.json (an unofficial build, decided 2026-11-06). 0.1.0 fetches a release asset.
+      - name: Read the pinned sidecar commit
+        id: lock
+        run: |
+          $ErrorActionPreference = "Stop"
+          $lock = Get-Content sidecar.lock.json -Raw | ConvertFrom-Json
+          if ($lock.source -ne "build" -or $lock.repository -ne "aeterna/aeterna-rongroi" -or $lock.commit -notmatch '^[0-9a-f]{40}$') {
+            throw "sidecar.lock.json must pin a 40-hex commit of aeterna/aeterna-rongroi"
+          }
+          "commit=$($lock.commit)" >> $env:GITHUB_OUTPUT
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: aeterna/aeterna-rongroi
+          ref: ${{ steps.lock.outputs.commit }}
+          path: _rongroi
+          persist-credentials: false
+      - name: Build the sidecar at the pinned commit
+        working-directory: _rongroi
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo build --release --locked -p rongroi-scan
+          New-Item -ItemType Directory -Force -Path ../vendor | Out-Null
+          Copy-Item target/release/rongroi-scan.exe ../vendor/rongroi-scan.exe
+          (Get-FileHash ../vendor/rongroi-scan.exe -Algorithm SHA256).Hash
       - name: Build the release folder
         run: npm run build
       - name: Build the test folder

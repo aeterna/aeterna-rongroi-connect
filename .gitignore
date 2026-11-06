@@ -10,3 +10,6 @@ native/pipe/target/
 e2e-report.json
 e2e-negative-report.json
 e2e-negative-netlog.json
+
+# Lane 3c: the sidecar built at the commit in sidecar.lock.json (CI fills it; never committed)
+vendor/
