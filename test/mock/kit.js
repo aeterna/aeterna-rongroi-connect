@@ -478,12 +478,33 @@ function statusFromArguments(argv) {
   return undefined;
 }
 
+// The e2e runner hands the per-run policy to this child process.  A broken
+// value must stop the child instead of silently serving the default posture.
+function policyFromEnvironment(environment = process.env) {
+  const raw = environment.RONGROI_MOCK_KIT_POLICY;
+  if (raw === undefined) return undefined;
+
+  const policy = JSON.parse(raw);
+  if (policy === null || typeof policy !== 'object' || Array.isArray(policy)) {
+    throw new Error('RONGROI_MOCK_KIT_POLICY must contain a JSON object');
+  }
+  return policy;
+}
+
 const kitArguments = process.argv.slice(2);
 const kitRequested = kitArguments
   .some((token) => token === '--status' || token.startsWith('--status='));
 if (require.main === module
     && (!process.env.NODE_TEST_CONTEXT || kitRequested)) {
-  startKit({ status: statusFromArguments(kitArguments), print: true })
+  let policy;
+  try {
+    policy = policyFromEnvironment();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
+
+  startKit({ status: statusFromArguments(kitArguments), policy, print: true })
     .then((kit) => {
       const stop = () => {
         kit.close().then(() => process.exit(0));
@@ -499,4 +520,5 @@ if (require.main === module
 module.exports = startKit;
 module.exports.startKit = startKit;
 module.exports.encodeCode = encodeCode;
+module.exports.policyFromEnvironment = policyFromEnvironment;
 module.exports.STANDARD_COLLECTORS = STANDARD_COLLECTORS;

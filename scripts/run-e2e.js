@@ -87,10 +87,25 @@ function readLines(stream, onLine) {
   });
 }
 
-function startKit() {
-  const kitPath = path.join(ROOT, 'test', 'mock', 'kit.js');
+// The Kit child can only serve the run's policy if the parent hands it over in
+// the environment, and it must never inherit an unrelated policy from us.
+function kitEnvironment(options = {}) {
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
+  delete env.RONGROI_MOCK_KIT_POLICY;
+
+  const policy = options !== null && typeof options === 'object'
+    ? options.policy
+    : undefined;
+  if (policy !== undefined && policy !== null) {
+    env.RONGROI_MOCK_KIT_POLICY = JSON.stringify(policy);
+  }
+  return env;
+}
+
+function startKit(options = {}) {
+  const kitPath = path.join(ROOT, 'test', 'mock', 'kit.js');
+  const env = kitEnvironment(options);
 
   const child = spawn(process.execPath, [kitPath], {
     cwd: ROOT,
@@ -1223,6 +1238,7 @@ module.exports = {
   captureNewTempEntries,
   runSucceeded,
   runSpecs,
+  kitEnvironment,
   runApplication,
   releaseSmoke,
   main,

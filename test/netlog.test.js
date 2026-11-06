@@ -22,6 +22,7 @@ const {
   runSucceeded,
   runSpecs,
   parseArguments,
+  kitEnvironment,
   listTempTopLevel,
   newTempEntries,
   captureNewTempEntries,
@@ -997,6 +998,41 @@ test('real mode runs posture and the elevated Standard policy', () => {
 
   assert.deepEqual(runSpecs('mock', false).map((spec) => spec.name), ['mock']);
   assert.deepEqual(runSpecs('real', true).map((spec) => spec.name), ['posture']);
+});
+
+test('the Kit child environment carries the policy only when one is given', () => {
+  const policy = {
+    profile: 'standard',
+    required_collectors: STANDARD_COLLECTORS,
+    require_elevation: true,
+  };
+
+  const withPolicy = kitEnvironment({ policy });
+  assert.equal(withPolicy.RONGROI_MOCK_KIT_POLICY, JSON.stringify(policy));
+  assert.deepEqual(JSON.parse(withPolicy.RONGROI_MOCK_KIT_POLICY), {
+    profile: 'standard',
+    required_collectors: STANDARD_COLLECTORS,
+    require_elevation: true,
+  });
+
+  assert.equal('RONGROI_MOCK_KIT_POLICY' in kitEnvironment({}), false);
+  assert.equal('RONGROI_MOCK_KIT_POLICY' in kitEnvironment(), false);
+});
+
+test('the Kit child environment drops a policy inherited from the parent', () => {
+  const original = process.env.RONGROI_MOCK_KIT_POLICY;
+  process.env.RONGROI_MOCK_KIT_POLICY = '{"profile":"posture"}';
+
+  try {
+    const env = kitEnvironment({});
+    assert.equal('RONGROI_MOCK_KIT_POLICY' in env, false);
+  } finally {
+    if (original === undefined) {
+      delete process.env.RONGROI_MOCK_KIT_POLICY;
+    } else {
+      process.env.RONGROI_MOCK_KIT_POLICY = original;
+    }
+  }
 });
 
 test('--sidecar selects real by default and accepts real or mock', () => {
