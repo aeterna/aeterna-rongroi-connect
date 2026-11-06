@@ -19,7 +19,10 @@ const {
   listAsarFromDisk,
   repositoryHookCopies,
   checkFuseWire,
+  sidecarRecordDifferences,
+  checkSidecarRecords,
   SIDECAR_EXE_PATH,
+  SIDECAR_RECORD_PATH,
 } = require('../scripts/compare-builds');
 const { stagedPackageJson, stage } = require('../scripts/build');
 
@@ -665,6 +668,100 @@ test('a missing resources/rongroi-scan.exe in both builds fails twice', () => {
   assert.equal(result.differences.some((entry) => (
     entry.includes(SIDECAR_EXE_PATH) && entry.includes('missing from the test build')
   )), true);
+});
+
+test('a sidecar record that matches its bundled exe and commit passes', () => {
+  const exe = Buffer.from('the pinned sidecar bytes');
+  const record = {
+    sha256: crypto.createHash('sha256').update(exe).digest('hex'),
+    commit: 'a'.repeat(40),
+  };
+
+  assert.deepEqual(sidecarRecordDifferences(record, exe, 'release'), []);
+  assert.deepEqual(
+    sidecarRecordDifferences(JSON.stringify(record), exe, 'test'),
+    [],
+  );
+});
+
+test('a sidecar record with a wrong sha256 or a bad commit fails', () => {
+  const exe = Buffer.from('the pinned sidecar bytes');
+  const digest = crypto.createHash('sha256').update(exe).digest('hex');
+
+  const wrongHash = sidecarRecordDifferences(
+    { sha256: '0'.repeat(64), commit: 'a'.repeat(40) },
+    exe,
+    'release',
+  );
+  assert.equal(wrongHash.length, 1);
+  assert.match(wrongHash[0], /sha256/);
+
+  for (const commit of ['A'.repeat(40), 'a'.repeat(39), 'a'.repeat(41), 'g'.repeat(40)]) {
+    const differences = sidecarRecordDifferences(
+      { sha256: digest, commit },
+      exe,
+      'test',
+    );
+    assert.equal(differences.length, 1, commit);
+    assert.match(differences[0], /commit/);
+    assert.match(differences[0], /40 lowercase hex/);
+  }
+});
+
+test('checkSidecarRecords reads src/sidecar.json from each asar and its own exe', () => {
+  const releaseExe = Buffer.from('release sidecar bytes');
+  const testExe = Buffer.from('test sidecar bytes');
+  const releaseTree = {
+    'resources/app.asar': Buffer.from('release archive'),
+    [SIDECAR_EXE_PATH]: releaseExe,
+  };
+  const testTree = {
+    'resources/app.asar': Buffer.from('test archive'),
+    [SIDECAR_EXE_PATH]: testExe,
+  };
+  const recordFor = (exe) => Buffer.from(JSON.stringify({
+    sha256: crypto.createHash('sha256').update(exe).digest('hex'),
+    commit: 'b'.repeat(40),
+  }));
+  const records = {
+    release: recordFor(releaseExe),
+    test: recordFor(testExe),
+  };
+  const lister = (bytes, side) => asar({ [SIDECAR_RECORD_PATH]: records[side] });
+
+  const matching = [];
+  checkSidecarRecords(releaseTree, testTree, lister, matching);
+  assert.deepEqual(matching, []);
+
+  const mismatched = [];
+  checkSidecarRecords(
+    releaseTree,
+    testTree,
+    (bytes, side) => asar({
+      [SIDECAR_RECORD_PATH]: side === 'release' ? records.release : records.release,
+    }),
+    mismatched,
+  );
+  assert.equal(mismatched.length, 1);
+  assert.match(mismatched[0], /test/);
+  assert.match(mismatched[0], /sha256/);
+});
+
+test('checkSidecarRecords reports a record missing from an asar', () => {
+  const exe = Buffer.from('sidecar bytes');
+  const tree = {
+    'resources/app.asar': Buffer.from('archive'),
+    [SIDECAR_EXE_PATH]: exe,
+  };
+
+  const differences = [];
+  checkSidecarRecords(tree, tree, () => asar({}), differences);
+
+  assert.equal(differences.length, 2);
+  for (const difference of differences) {
+    assert.equal(difference.includes(SIDECAR_RECORD_PATH), true);
+    assert.equal(difference.includes('missing'), true);
+  }
 });
 
 function stageFixtures(root) {

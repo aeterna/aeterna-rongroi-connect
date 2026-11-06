@@ -8,12 +8,14 @@
 // and reads the fuses of both executables.  Both folders must carry the pinned
 // sidecar at resources/rongroi-scan.exe.
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
 const ASAR_PATH = 'resources/app.asar';
 const EXE_PATH = 'rongroi-connect.exe';
 const SIDECAR_EXE_PATH = 'resources/rongroi-scan.exe';
+const SIDECAR_RECORD_PATH = 'src/sidecar.json';
 const TEST_HOOK_PATH = 'src/test-hook.js';
 const ROOT = path.resolve(__dirname, '..');
 
@@ -373,6 +375,93 @@ function readTree(directory) {
     throw new Error(`the build folder is empty: ${root}`);
   }
   return files;
+}
+
+function parseSidecarRecord(value) {
+  if (value !== null && typeof value === 'object'
+      && !Buffer.isBuffer(value) && !(value instanceof Uint8Array)) {
+    return value;
+  }
+  return JSON.parse(toBuffer(value).toString('utf8'));
+}
+
+// The build stages src/sidecar.json with the SHA-256 of the sidecar it copied
+// and the pinned commit.  A record that does not name this build's sidecar, or
+// a commit that is not a full lowercase git hash, means the two facts cannot
+// be trusted together.
+function sidecarRecordDifferences(recordBytes, exeBytes, label) {
+  const prefix = `${label}: ${SIDECAR_RECORD_PATH}`;
+
+  let record;
+  try {
+    record = parseSidecarRecord(recordBytes);
+  } catch (error) {
+    return [`${prefix}: cannot be read: ${error.message}`];
+  }
+  if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+    return [`${prefix}: is not an object`];
+  }
+
+  const differences = [];
+  const digest = crypto.createHash('sha256').update(toBuffer(exeBytes)).digest('hex');
+  if (record.sha256 !== digest) {
+    differences.push(
+      `${prefix}: sha256 ${String(record.sha256)} does not match ${label}'s `
+        + `${SIDECAR_EXE_PATH} (${digest})`,
+    );
+  }
+  if (typeof record.commit !== 'string' || !/^[0-9a-f]{40}$/.test(record.commit)) {
+    differences.push(`${prefix}: commit is not 40 lowercase hex`);
+  }
+  return differences;
+}
+
+function treeEntry(tree, relPath) {
+  return [...tree.keys()].find(
+    (rel) => rel === relPath || rel.endsWith(`/${relPath}`),
+  );
+}
+
+function checkSidecarRecords(releaseTree, testTree, listAsar, differences) {
+  const sides = [
+    ['release', normalizeTree(releaseTree)],
+    ['test', normalizeTree(testTree)],
+  ];
+
+  for (const [side, tree] of sides) {
+    const asarRel = treeEntry(tree, ASAR_PATH);
+    if (asarRel === undefined) {
+      differences.push(
+        `${side}: ${ASAR_PATH} is missing, so ${SIDECAR_RECORD_PATH} cannot be checked`,
+      );
+      continue;
+    }
+    const exeRel = treeEntry(tree, SIDECAR_EXE_PATH);
+    if (exeRel === undefined) {
+      differences.push(
+        `${side}: ${SIDECAR_EXE_PATH} is missing, so ${SIDECAR_RECORD_PATH} cannot be checked`,
+      );
+      continue;
+    }
+
+    let entries;
+    try {
+      entries = normalizeAsarList(listAsar(tree.get(asarRel), side, asarRel));
+    } catch (error) {
+      differences.push(
+        `${side}: cannot read ${ASAR_PATH} to check ${SIDECAR_RECORD_PATH}: ${error.message}`,
+      );
+      continue;
+    }
+
+    const record = entries.get(SIDECAR_RECORD_PATH);
+    if (record === undefined) {
+      differences.push(`${side}: ${SIDECAR_RECORD_PATH} is missing from ${ASAR_PATH}`);
+      continue;
+    }
+
+    differences.push(...sidecarRecordDifferences(record, tree.get(exeRel), side));
+  }
 }
 
 async function loadAsar() {
@@ -775,6 +864,11 @@ async function main(argv) {
 
   const result = compareTrees(releaseTree, testTree, listAsar);
   try {
+    checkSidecarRecords(releaseTree, testTree, listAsar, result.differences);
+  } catch (error) {
+    result.differences.push(`cannot check ${SIDECAR_RECORD_PATH}: ${error.message}`);
+  }
+  try {
     const fuses = await loadFuses();
     result.differences.push(
       ...await compareExecutableFuses(releaseDir, releaseTree, testDir, testTree, fuses),
@@ -797,7 +891,8 @@ async function main(argv) {
     'builds match: every file is byte-identical except resources/app.asar, and the exes differ '
       + 'only in their embedded asar integrity hash; inside the asars only src/test-hook.js may '
       + 'differ, and both exes hold the section 1 fuses and the same fuse wire.  Both builds '
-      + 'carry the pinned resources/rongroi-scan.exe.',
+      + 'carry the pinned resources/rongroi-scan.exe, and each src/sidecar.json names that '
+      + 'file\'s SHA-256 and a 40-character lowercase commit.',
   );
 }
 
@@ -812,10 +907,13 @@ module.exports = {
   ASAR_PATH,
   EXE_PATH,
   SIDECAR_EXE_PATH,
+  SIDECAR_RECORD_PATH,
   TEST_HOOK_PATH,
   SECTION_1_FUSES,
   compareTrees,
   compareExecutables,
+  sidecarRecordDifferences,
+  checkSidecarRecords,
   compareFuseWires,
   compareExecutableFuses,
   readTree,

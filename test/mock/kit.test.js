@@ -131,6 +131,35 @@ test('accepts an envelope, stores the recomputed hash and accepts it again', asy
   }
 });
 
+test('captures the report kind, official build and policy facts instead of elevation', async () => {
+  const kit = await startKit({
+    print: false,
+    policy: {
+      profile: 'standard',
+      required_collectors: ['posture', 'os_image'],
+      require_elevation: true,
+    },
+  });
+  try {
+    const record = recordFor(kit, (candidate) => {
+      candidate.kind = 'rongroi-saved-report';
+      candidate.official_build = true;
+    });
+    await clientFor(kit).upload(sealedBytes(kit, record));
+
+    assert.equal(kit.recordKind, 'rongroi-saved-report');
+    assert.equal(kit.officialBuild, true);
+    assert.equal(kit.policyProfile, kit.policy.profile);
+    assert.equal(kit.policyRequireElevation, kit.policy.require_elevation);
+    assert.equal(kit.policyCollectorCount, kit.policy.required_collectors.length);
+    // The real saved report has no `elevated` member, so the mock must not
+    // pretend to measure elevation either.
+    assert.equal('elevated' in kit, false);
+  } finally {
+    await kit.close();
+  }
+});
+
 test('refuses a record whose binding nonce does not match the code', async () => {
   const kit = await startKit({ print: false });
   try {

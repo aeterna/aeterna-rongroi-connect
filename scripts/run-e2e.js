@@ -112,7 +112,11 @@ function startKit() {
   let recordVisualHash = null;
   let recordBytes = null;
   let rongroiVersion = null;
-  let elevated = null;
+  let recordKind = null;
+  let officialBuild = null;
+  let policyProfile = null;
+  let policyRequireElevation = null;
+  let policyCollectorCount = null;
   let scanSeconds = null;
   let resolveReceived;
   const receivedPromise = new Promise((resolve) => {
@@ -145,7 +149,19 @@ function startKit() {
       rongroiVersion = typeof message.rongroi_version === 'string'
         ? message.rongroi_version
         : null;
-      elevated = typeof message.elevated === 'boolean' ? message.elevated : null;
+      recordKind = typeof message.kind === 'string' ? message.kind : null;
+      officialBuild = typeof message.official_build === 'boolean'
+        ? message.official_build
+        : null;
+      policyProfile = typeof message.policy_profile === 'string'
+        ? message.policy_profile
+        : null;
+      policyRequireElevation = typeof message.policy_require_elevation === 'boolean'
+        ? message.policy_require_elevation
+        : null;
+      policyCollectorCount = Number.isInteger(message.policy_collector_count)
+        ? message.policy_collector_count
+        : null;
       scanSeconds = typeof message.scan_seconds === 'number' ? message.scan_seconds : null;
       resolveReceived(true);
       return;
@@ -190,8 +206,20 @@ function startKit() {
     get rongroiVersion() {
       return rongroiVersion;
     },
-    get elevated() {
-      return elevated;
+    get recordKind() {
+      return recordKind;
+    },
+    get officialBuild() {
+      return officialBuild;
+    },
+    get policyProfile() {
+      return policyProfile;
+    },
+    get policyRequireElevation() {
+      return policyRequireElevation;
+    },
+    get policyCollectorCount() {
+      return policyCollectorCount;
     },
     get scanSeconds() {
       return scanSeconds;
@@ -506,8 +534,30 @@ function captureLeftovers(report, values) {
   report.leftoverSearchRan = leftovers.searchRan;
 }
 
+function isRealRunReport(report) {
+  if (report.sidecar === 'real' || report.sidecarMode === 'real') return true;
+  if (report.sidecar === 'mock' || report.sidecarMode === 'mock') return false;
+  // Older reports carry no mode, so the run name decides.  A mock run is
+  // named 'mock' and never matches either real spec.
+  return report.name === 'posture' || report.name === 'standard';
+}
+
+function realRunReportSucceeded(report) {
+  return report.recordKind === 'rongroi-saved-report'
+    && typeof report.rongroi_version === 'string'
+    && report.rongroi_version !== ''
+    && report.rongroi_version !== 'mock'
+    && typeof report.profile === 'string'
+    && report.profile !== ''
+    && typeof report.requireElevation === 'boolean'
+    && Number.isInteger(report.collectorCount)
+    && report.policyProfile === report.profile
+    && report.policyRequireElevation === report.requireElevation
+    && report.policyCollectorCount === report.collectorCount;
+}
+
 function runSucceeded(run, report) {
-  return run.error === null
+  const ok = run.error === null
     && !run.timedOut
     && run.exitCode === 0
     && report.kitReceived
@@ -519,6 +569,8 @@ function runSucceeded(run, report) {
     && report.negativeControlOk
     && !leftoverFailure(report.leftoverHits)
     && !leftoverFailure(report.newTempHits);
+  if (!ok) return false;
+  return isRealRunReport(report) ? realRunReportSucceeded(report) : true;
 }
 
 function runSpecs(sidecarMode, negativeControl) {
@@ -554,11 +606,15 @@ function applicationEnv(kitInfo, sidecarMode) {
   return env;
 }
 
-function createRunReport(name, policy, negativeControl) {
+function createRunReport(name, policy, negativeControl, sidecarMode) {
   return {
     name,
+    sidecar: sidecarMode,
     profile: policy === null ? null : policy.profile,
     requireElevation: policy === null ? false : policy.require_elevation === true,
+    collectorCount: policy === null || !Array.isArray(policy.required_collectors)
+      ? null
+      : policy.required_collectors.length,
     ok: false,
     done: false,
     error: null,
@@ -573,7 +629,11 @@ function createRunReport(name, policy, negativeControl) {
     recordBytes: null,
     scanSeconds: null,
     rongroi_version: null,
-    elevated: null,
+    recordKind: null,
+    officialBuild: null,
+    policyProfile: null,
+    policyRequireElevation: null,
+    policyCollectorCount: null,
     netlogOk: false,
     netlogRepaired: false,
     netlogNames: [],
@@ -677,7 +737,7 @@ async function runOnce(options) {
     negativeControl,
     netlogCopyPath,
   } = options;
-  const runReport = createRunReport(spec.name, spec.policy, negativeControl);
+  const runReport = createRunReport(spec.name, spec.policy, negativeControl, sidecarMode);
   let kit = null;
   let netlogPath = null;
   let leftoverValues = {};
@@ -732,7 +792,11 @@ async function runOnce(options) {
     runReport.recordBytes = kit.recordBytes;
     runReport.scanSeconds = kit.scanSeconds;
     runReport.rongroi_version = kit.rongroiVersion;
-    runReport.elevated = kit.elevated;
+    runReport.recordKind = kit.recordKind;
+    runReport.officialBuild = kit.officialBuild;
+    runReport.policyProfile = kit.policyProfile;
+    runReport.policyRequireElevation = kit.policyRequireElevation;
+    runReport.policyCollectorCount = kit.policyCollectorCount;
     runReport.done = runReport.kitReceived
       && runReport.error === null
       && !runReport.timedOut
@@ -982,7 +1046,6 @@ async function main(argv) {
     recordBytes: null,
     scanSeconds: null,
     rongroi_version: null,
-    elevated: null,
     netlogOk: false,
     netlogRepaired: false,
     netlogNames: [],
@@ -1082,7 +1145,6 @@ async function main(argv) {
   report.recordBytes = last === null ? null : last.recordBytes;
   report.scanSeconds = last === null ? null : last.scanSeconds;
   report.rongroi_version = last === null ? null : last.rongroi_version;
-  report.elevated = last === null ? null : last.elevated;
   report.netlogOk = runs.length > 0 && runs.every((run) => run.netlogOk);
   report.netlogRepaired = runs.some((run) => run.netlogRepaired);
   report.netlogNames = [...new Set(runs.flatMap((run) => run.netlogNames ?? []))];

@@ -847,6 +847,70 @@ test('a mismatching Kit hash fails the run', () => {
   assert.equal(runSucceeded(run, { ...report, kitHashEqualsRecord: false }), false);
 });
 
+function successfulReport(overrides = {}) {
+  return {
+    sidecar: 'mock',
+    kitReceived: true,
+    kitHashEqualsRecord: true,
+    netlogOk: true,
+    netlogRepaired: false,
+    leftoverSearchRan: true,
+    newTempSearchRan: true,
+    negativeControlOk: true,
+    leftoverHits: [],
+    newTempHits: [],
+    ...overrides,
+  };
+}
+
+test('a real run requires a saved report that matches the run policy', () => {
+  const run = { error: null, timedOut: false, exitCode: 0 };
+  const posture = successfulReport({
+    sidecar: 'real',
+    name: 'posture',
+    profile: 'posture',
+    requireElevation: false,
+    collectorCount: 2,
+    recordKind: 'rongroi-saved-report',
+    rongroi_version: '0.3.0',
+    policyProfile: 'posture',
+    policyRequireElevation: false,
+    policyCollectorCount: 2,
+  });
+
+  assert.equal(runSucceeded(run, posture), true);
+
+  // A real-run report that still carries the mock marker proves nothing.
+  assert.equal(runSucceeded(run, { ...posture, rongroi_version: 'mock' }), false);
+  assert.equal(runSucceeded(run, { ...posture, rongroi_version: '' }), false);
+  assert.equal(runSucceeded(run, { ...posture, recordKind: null }), false);
+
+  // The record's policy must be the one the run asked for.
+  assert.equal(runSucceeded(run, { ...posture, policyCollectorCount: 3 }), false);
+  assert.equal(runSucceeded(run, { ...posture, policyProfile: 'standard' }), false);
+  assert.equal(runSucceeded(run, { ...posture, policyRequireElevation: true }), false);
+
+  const standard = {
+    ...posture,
+    name: 'standard',
+    profile: 'standard',
+    requireElevation: true,
+    collectorCount: 20,
+    policyProfile: 'standard',
+    policyRequireElevation: true,
+    policyCollectorCount: 20,
+  };
+
+  assert.equal(runSucceeded(run, standard), true);
+  assert.equal(runSucceeded(run, { ...standard, policyCollectorCount: 19 }), false);
+});
+
+test('a mock run keeps the existing checks without the real report facts', () => {
+  const run = { error: null, timedOut: false, exitCode: 0 };
+
+  assert.equal(runSucceeded(run, successfulReport()), true);
+});
+
 test('a ticket in a new top-level temp entry fails the run', () => {
   const run = { error: null, timedOut: false, exitCode: 0 };
   const report = {

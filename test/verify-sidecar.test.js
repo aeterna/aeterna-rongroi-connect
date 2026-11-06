@@ -149,6 +149,27 @@ test('the verifier refuses a malformed sidecar.json', async () => {
   }
 });
 
+test('the verifier refuses a 64-character sha256 that is not hex', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-sidecar-non-hex-'));
+  const bytes = Buffer.alloc(512, 0x66);
+  const fixture = writeVerifierFixture(root, bytes, {
+    sha256: 'g'.repeat(64),
+    commit: '0'.repeat(40),
+  });
+
+  try {
+    const verify = verifierFor(fixture);
+    await assert.rejects(verify(), (error) => {
+      assert.equal(error instanceof SidecarError, true);
+      assert.equal(error.code, 'sidecar_hash');
+      assert.match(error.message, /sha256/);
+      return true;
+    });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('the verifier refuses a record without a sha256 string', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-sidecar-no-hash-'));
   const bytes = Buffer.alloc(512, 0x55);

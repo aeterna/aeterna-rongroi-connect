@@ -119,7 +119,11 @@ async function startKit(options = {}) {
   let storedRecordVisualHash = null;
   let storedRecordBytes = null;
   let storedRecordVersion = null;
-  let storedElevated = null;
+  let storedRecordKind = null;
+  let storedOfficialBuild = null;
+  let storedPolicyProfile = null;
+  let storedPolicyRequireElevation = null;
+  let storedPolicyCollectorCount = null;
   let storedScanSeconds = null;
   let policyServedAt = null;
   let received = 0;
@@ -179,12 +183,22 @@ async function startKit(options = {}) {
     storedRecordVersion = typeof record.rongroi_version === 'string'
       ? record.rongroi_version
       : null;
-    storedElevated = typeof record.elevated === 'boolean'
-      ? record.elevated
-      : (record.scan !== null && typeof record.scan === 'object'
-          && typeof record.scan.elevated === 'boolean'
-        ? record.scan.elevated
-        : null);
+    storedRecordKind = typeof record.kind === 'string' ? record.kind : null;
+    storedOfficialBuild = typeof record.official_build === 'boolean'
+      ? record.official_build
+      : null;
+    const recordPolicy = record.policy !== null && typeof record.policy === 'object'
+      ? record.policy
+      : {};
+    storedPolicyProfile = typeof recordPolicy.profile === 'string'
+      ? recordPolicy.profile
+      : null;
+    storedPolicyRequireElevation = typeof recordPolicy.require_elevation === 'boolean'
+      ? recordPolicy.require_elevation
+      : null;
+    storedPolicyCollectorCount = Array.isArray(recordPolicy.required_collectors)
+      ? recordPolicy.required_collectors.length
+      : null;
     storedScanSeconds = policyServedAt === null
       ? null
       : (Date.now() - policyServedAt) / 1000;
@@ -197,7 +211,11 @@ async function startKit(options = {}) {
         record_visual_hash: storedRecordVisualHash,
         record_bytes: storedRecordBytes,
         rongroi_version: storedRecordVersion,
-        elevated: storedElevated,
+        kind: storedRecordKind,
+        official_build: storedOfficialBuild,
+        policy_profile: storedPolicyProfile,
+        policy_require_elevation: storedPolicyRequireElevation,
+        policy_collector_count: storedPolicyCollectorCount,
         scan_seconds: storedScanSeconds,
       }));
     }
@@ -411,8 +429,20 @@ async function startKit(options = {}) {
     get rongroiVersion() {
       return storedRecordVersion;
     },
-    get elevated() {
-      return storedElevated;
+    get recordKind() {
+      return storedRecordKind;
+    },
+    get officialBuild() {
+      return storedOfficialBuild;
+    },
+    get policyProfile() {
+      return storedPolicyProfile;
+    },
+    get policyRequireElevation() {
+      return storedPolicyRequireElevation;
+    },
+    get policyCollectorCount() {
+      return storedPolicyCollectorCount;
     },
     get scanSeconds() {
       return storedScanSeconds;

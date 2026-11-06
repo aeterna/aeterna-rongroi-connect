@@ -70,7 +70,7 @@ function createSidecarVerifier(options = {}) {
       throw hashError(`cannot read the sidecar hash record ${expected}`, error);
     }
     if (record === null || typeof record !== 'object' || Array.isArray(record)
-        || typeof record.sha256 !== 'string' || record.sha256.length !== 64) {
+        || typeof record.sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(record.sha256)) {
       throw hashError(`the sidecar hash record ${expected} has no sha256`);
     }
 
