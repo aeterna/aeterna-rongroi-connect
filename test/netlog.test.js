@@ -995,30 +995,48 @@ test('a new temp file holding a ticket is found and fails the run', () => {
   }
 });
 
-test('real mode runs posture and Standard without elevation in CI', () => {
-  assert.equal(REAL_RUNS.length, 2);
-  assert.deepEqual(REAL_RUNS.map((run) => run.name), ['posture', 'standard']);
+test('real mode runs posture, elevated Standard and Standard in CI', () => {
+  assert.equal(REAL_RUNS.length, 3);
+  assert.deepEqual(REAL_RUNS.map((run) => run.name), [
+    'posture',
+    'standard-elevated',
+    'standard',
+  ]);
 
-  const [posture, standard] = REAL_RUNS;
+  const [posture, elevated, standard] = REAL_RUNS;
   assert.equal(posture.policy.profile, 'posture');
-  assert.equal(posture.policy.required_collectors.length, 2);
+  assert.deepEqual(posture.policy.required_collectors, ['posture', 'os_image']);
   assert.equal(posture.policy.require_elevation, false);
 
+  assert.equal(elevated.policy.profile, 'standard');
+  assert.deepEqual(elevated.policy.required_collectors, STANDARD_COLLECTORS);
+  assert.equal(elevated.policy.require_elevation, true);
+
   assert.equal(standard.policy.profile, 'standard');
-  assert.equal(standard.policy.required_collectors.length, 20);
   assert.deepEqual(standard.policy.required_collectors, STANDARD_COLLECTORS);
-  // With --elevate on the hosted CI runner, Connect stayed in `scanning`
-  // (elevationPending) for 120 s; cause unknown, lane 3c follow-up + M1 manual PC check.
   assert.equal(standard.policy.require_elevation, false);
+
+  assert.equal(STANDARD_COLLECTORS.length, 20);
 });
 
-test('real mode runs posture and the Standard policy without elevation', () => {
+test('real mode runs posture, elevated Standard and Standard', () => {
   const specs = runSpecs('real', false);
-  assert.deepEqual(specs.map((spec) => spec.name), ['posture', 'standard']);
+  assert.deepEqual(specs.map((spec) => spec.name), [
+    'posture',
+    'standard-elevated',
+    'standard',
+  ]);
+
   assert.equal(specs[0].policy.require_elevation, false);
+  assert.deepEqual(specs[0].policy.required_collectors, ['posture', 'os_image']);
+
   assert.equal(specs[1].policy.profile, 'standard');
-  assert.equal(specs[1].policy.require_elevation, false);
+  assert.equal(specs[1].policy.require_elevation, true);
   assert.deepEqual(specs[1].policy.required_collectors, STANDARD_COLLECTORS);
+
+  assert.equal(specs[2].policy.profile, 'standard');
+  assert.equal(specs[2].policy.require_elevation, false);
+  assert.deepEqual(specs[2].policy.required_collectors, STANDARD_COLLECTORS);
   assert.equal(STANDARD_COLLECTORS.length, 20);
 
   assert.deepEqual(runSpecs('mock', false).map((spec) => spec.name), ['mock']);
