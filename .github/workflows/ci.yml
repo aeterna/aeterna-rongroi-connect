@@ -118,6 +118,12 @@ jobs:
         run: npm run build:test
       - name: Compare the two builds
         run: node scripts/compare-builds.js dist/release dist/test
+      - name: How elevated is the runner
+        # Evidence for the e2e: a non-elevated runner cannot answer a UAC prompt, so the
+        # elevated path is checked on a real PC (lane 3c M1), not here.
+        run: |
+          whoami
+          whoami /groups | Select-String -Pattern "Mandatory Label"
       - name: Run the whole flow and check the netlog
         run: npm run e2e
       - name: The netlog check can fail
