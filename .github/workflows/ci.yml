@@ -91,7 +91,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $lock = Get-Content sidecar.lock.json -Raw | ConvertFrom-Json
-          if ($lock.source -ne "build" -or $lock.repository -ne "aeterna/aeterna-rongroi" -or $lock.commit -notmatch '^[0-9a-f]{40}$') {
+          if ($lock.source -ne "build" -or $lock.repository -ne "aeterna/aeterna-rongroi" -or $lock.commit -cnotmatch '\A[0-9a-f]{40}\z') {
             throw "sidecar.lock.json must pin a 40-hex commit of aeterna/aeterna-rongroi"
           }
           "commit=$($lock.commit)" >> $env:GITHUB_OUTPUT
@@ -106,6 +106,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
+          $head = git rev-parse HEAD
+          if ($head -ne "${{ steps.lock.outputs.commit }}") { throw "checked out $head, not the pinned commit" }
           cargo build --release --locked -p rongroi-scan
           New-Item -ItemType Directory -Force -Path ../vendor | Out-Null
           Copy-Item target/release/rongroi-scan.exe ../vendor/rongroi-scan.exe
