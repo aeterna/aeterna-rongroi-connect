@@ -13,3 +13,4 @@ itself is aeterna-rongroi ADR 0089.
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-connect-client.md) | The Rongroi Connect client: how it is built, hardened and shipped | accepted |
+| [0002](0002-launcher-handoff.md) | Starting Connect from a launcher: the handoff contract (v1) | accepted |
