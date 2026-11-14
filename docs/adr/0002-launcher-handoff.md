@@ -4,7 +4,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 -->
 # ADR 0002 — Starting Connect from a launcher: the handoff contract (v1)
 
-- Status: proposed — owner approved the direction 2026-11-13; becomes accepted when the K4 spike below passes
+- Status: accepted — 2026-11-14, after the named-pipe K4 spike passed (owner approved the direction 2026-11-13 with this condition)
 - Date: 2026-11-13 · Claude Code - Claude Opus 5.5
 - Related: ADR 0001 (sections 2 and 4), the AETERNA Game Launcher (nakara-oss `launcher/`, its ADR 0002)
 
@@ -98,6 +98,28 @@ What was tested: the release folder CI built from `feat/launcher-handoff` at `3f
 - The elevated relaunch is the sidecar's (`--elevate`), not Connect's, so Connect's arguments do not reach it. The CI e2e with its elevated round and the netlog check passed on `8e119a1` (run 43579807676) and `3f501bd` (run 43584325889).
 
 Next: decision 1 moves to the named-pipe fallback above, and this ADR is amended before acceptance. The argument rule stays as tested.
+
+### Result of the named-pipe spike, 2026-11-14 (pik-windows)
+
+What was tested: the release folder CI built from `feat/launcher-handoff` at `969cba4` (run 43588793404), driven by `handoff.exe` from nakara-oss `feat/launcher-pipe`. The driver creates the pipe and checks the client's process id.
+
+- **Pass.** A fresh, valid code arrived intact. Connect stayed open, and the mock Kit received `GET /nakara_rongroi/policy/<ticket>`.
+- Raw bytes served by a test pipe server were each refused with exit 12 in about 2.4 s, and Connect wrote 0 bytes back on the pipe each time:
+  - a damaged code;
+  - CRLF;
+  - a BOM;
+  - 4097 bytes;
+  - an empty line.
+- A pipe held open with nothing written was refused with exit 12 at 7.4 s. That is about 2.4 s of startup plus the 5 s deadline.
+- Each of these arguments exits 12 in 215–850 ms, with no listener on 9222 or 9229 and no netlog file:
+  - a bare `--from-launcher`;
+  - a short pipe name;
+  - another pipe prefix;
+  - `--remote-debugging-port=9222`;
+  - `--inspect=9229`;
+  - `--log-net-log=<path>`;
+  - `extra`.
+- The CI e2e, including its elevated round and the netlog check, passed on `969cba4` (run 43588793404).
 
 ## Consequences
 
