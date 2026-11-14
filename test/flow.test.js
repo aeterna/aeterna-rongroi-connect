@@ -547,8 +547,8 @@ test('declining on consent seals and sends the declined answer without scanning'
     scan: 'declined',
     binding: { ticket: TICKET, nonce: NONCE },
   });
-  assert.equal(h.flow.exitCode(), 0);
-  assert.equal(h.flow.quit(), 0);
+  assert.equal(h.flow.exitCode(), 16);
+  assert.equal(h.flow.quit(), 16);
 });
 
 test('the sidecar decline answer follows the same decline path', async () => {
@@ -563,7 +563,8 @@ test('the sidecar decline answer follows the same decline path', async () => {
     binding: { ticket: TICKET, nonce: NONCE },
   });
   assert.equal(h.uploadCalls.length, 0);
-  assert.equal(h.flow.exitCode(), 0);
+  assert.equal(h.flow.exitCode(), 16);
+  assert.equal(h.flow.quit(), 16);
 });
 
 test('a declined answer the server refuses becomes an upload error with exit code 15', async () => {
@@ -879,7 +880,7 @@ test('quit keeps an exit code an earlier error set, from 12 to 15', async () => 
   assert.equal(policy.flow.quit(), 15);
 });
 
-test('quit returns 0 after a report or a declined answer was accepted', async () => {
+test('quit returns 0 after a report was accepted and 16 after a declined answer', async () => {
   const done = makeHarness();
   await reachHash(done);
   await done.flow.send();
@@ -888,7 +889,8 @@ test('quit returns 0 after a report or a declined answer was accepted', async ()
   const declined = makeHarness();
   await reachConsent(declined);
   await declined.flow.decline();
-  assert.equal(declined.flow.quit(), 0);
+  assert.equal(declined.flow.exitCode(), 16);
+  assert.equal(declined.flow.quit(), 16);
 });
 
 test('wrong-state calls do nothing and return false', async () => {
