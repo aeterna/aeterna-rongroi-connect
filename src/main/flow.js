@@ -7,6 +7,9 @@ const { ConnectError } = require('./net');
 const { KNOWN_COLLECTORS } = require('./collectors');
 
 const MAX_RECORD_BYTES = 2 * 1024 * 1024;
+// ADR 0002 section 4: the server accepting a declined answer is not the same
+// outcome as accepting a report, so the two exit codes differ from v1 on.
+const DECLINED_EXIT_CODE = 16;
 const RETRYABLE_CODES = new Set(['network', 'timeout', 'server_error', 'upload_refused']);
 const POLICY_RETRY_CODES = new Set(['network', 'timeout', 'server_error']);
 const KNOWN_COLLECTOR_IDS = new Set(KNOWN_COLLECTORS);
@@ -543,7 +546,7 @@ function createFlow(options = {}) {
       }
 
       accepted = true;
-      if (!quitRequested) exit = 0;
+      if (!quitRequested) exit = DECLINED_EXIT_CODE;
       publish({ name: 'declined', serverOrigin: parsed.serverOrigin });
       return true;
     } finally {
@@ -584,7 +587,7 @@ function createFlow(options = {}) {
 
     let code;
     if (accepted) {
-      code = 0;
+      code = current.name === 'declined' ? DECLINED_EXIT_CODE : 0;
     } else if (exit !== null && exit !== 0) {
       code = exit;
     } else if (sent === true || current.name === 'uploading') {
@@ -642,3 +645,4 @@ function createFlow(options = {}) {
 module.exports = createFlow;
 module.exports.createFlow = createFlow;
 module.exports.MAX_RECORD_BYTES = MAX_RECORD_BYTES;
+module.exports.DECLINED_EXIT_CODE = DECLINED_EXIT_CODE;
