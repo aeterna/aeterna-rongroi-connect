@@ -142,10 +142,3 @@ jobs:
             e2e-negative-report.json
             e2e-negative-netlog.json
           if-no-files-found: warn
-      - name: Keep the release folder (K4 spike, temporary; revert before merge)
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: k4-release-folder
-          path: dist/release
-          retention-days: 3
-          if-no-files-found: error
