@@ -20,16 +20,30 @@ Nothing in this ADR may let a launcher do what a pasted code could not.
 
 ## Decision
 
-1. **One way in.** Connect accepts exactly one argument, `--from-launcher`. With it, Connect reads one line from stdin:
-   an `rr1.` pairing code, at most 4 KiB, ended by `\n` or EOF within 5 s. Any other argument, including Chromium
-   switches such as `--remote-debugging-port`, `--inspect` or `--user-data-dir`, makes Connect exit **12** before a
-   window opens. Without `--from-launcher` Connect behaves exactly as today (paste field).
-2. **Same checks as a pasted code.** The code from stdin goes through the same validation as the paste field
+1. **One way in** (amended 2026-11-14 after the K4 spike). Connect accepts exactly one argument,
+   `--from-launcher=\\.\pipe\rongroi-launch-<32 lowercase hex>`. With it, Connect connects to that named pipe as a
+   client and reads one line: an `rr1.` pairing code, at most 4 KiB, ended by `\n` or EOF. Connecting and reading
+   together get 5 s. Connect then closes the pipe and writes nothing to it. Exit **12**, before a window opens, on any
+   other argument, a pipe it cannot connect to, a refused line, or the timeout. Other arguments include a bare
+   `--from-launcher`, another pipe name, and Chromium switches such as `--remote-debugging-port`, `--inspect` or
+   `--user-data-dir`. Without an argument Connect behaves exactly as today (paste field). The first version read
+   stdin instead; the packaged build cannot read it (K4 result below).
+2. **Same checks as a pasted code.** The code from the pipe goes through the same validation as the paste field
    (ADR 0001 section 2: origin form, no userinfo or path, punycode, local-address warning, `policy_hash`). A refused
    code exits 12. The consent screen, the destination in large type, the policy and the hash screen are unchanged
    and need the player's own click. The launcher cannot pre-accept anything.
-3. **Why stdin, not argv.** Other programs of the same user can read a process's command line. The code holds the
-   single-use `ticket`; a ticket read from argv could be raced to the Kit first. stdin is visible only to the parent.
+3. **Why a pipe, not argv** (amended 2026-11-14). Other programs of the same user can read a process's command line.
+   The code holds the single-use `ticket`, and a ticket read from argv could be raced to the Kit first. So argv carries
+   only the pipe's name, never the code. The launcher sets up the pipe before it starts Connect:
+   - it creates the pipe with `FILE_FLAG_FIRST_PIPE_INSTANCE`, at most one instance, `PIPE_REJECT_REMOTE_CLIENTS`
+     and a DACL that grants the current user only;
+   - when a client connects, it checks `GetNamedPipeClientProcessId` against the Connect process it started;
+   - on a mismatch it closes the pipe without writing, stops Connect, and reports the attempt;
+   - on a match it writes the code once and closes the pipe.
+
+   Another process of the same user can see the name and connect first. It reads nothing, but the run fails. A
+   process that created the name earlier makes the launcher's create fail, so the launcher never writes to a pipe it
+   does not own.
 4. **Exit codes for the caller.** ADR 0001's table, plus one new code:
 
    | Code | Meaning |
@@ -44,8 +58,8 @@ Nothing in this ADR may let a launcher do what a pasted code could not.
    | 15 | the upload failed or the server refused it |
 
    Scripts that treat 0 as "something was sent" must also accept 16. The mock Kit and the e2e tests change with it.
-5. **Nothing else crosses.** Connect writes nothing to stdout or stderr for the launcher, opens no socket to it and
-   reads no file it names. The launcher learns only the exit code.
+5. **Nothing else crosses.** Connect writes nothing back on the pipe or to stdout or stderr for the launcher, and reads
+   no file it names. (The packaged Electron exe itself prints `\r\n` to stdout; the launcher ignores stdout.) The launcher learns only the exit code.
 6. **The launcher's side** (recorded here so both repos agree): it starts a Connect exe it downloaded from a pinned
    release tag and checked against a signed manifest; it shows the same warning as the paste field ("only paste a code
    you got in this game") next to its own code field; it never retries a code by itself.
