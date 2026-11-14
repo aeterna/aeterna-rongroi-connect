@@ -86,4 +86,12 @@ module.exports = [
       'no-restricted-globals': ['error', ...restrictedGlobals()],
     },
   },
+  {
+    // pipe-code.js connects only to the launcher's local named pipe (ADR 0002); it refuses any other target
+    files: ['src/main/pipe-code.js'],
+    rules: {
+      'no-restricted-syntax': ['error', ...syntaxEntries(ALL_BUT_NET)],
+      'no-restricted-globals': ['error', ...restrictedGlobals()],
+    },
+  },
 ];

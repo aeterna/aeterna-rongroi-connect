@@ -2,29 +2,37 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 'use strict';
 
-// eslint-disable-next-line no-restricted-syntax
 const net = require('node:net');
 const { readCodeFromStream, DEFAULT_TIMEOUT_MS } = require('./stdin-code');
+
+const PIPE_PATH_PATTERN = /^\\\\\.\\pipe\\rongroi-launch-[0-9a-f]{32}$/;
 
 function refusal(reason) {
   return { ok: false, code: null, reason };
 }
 
 function readCodeFromPipe(pipePath, options = {}) {
-  const requested = typeof options.timeoutMs === 'number' && Number.isFinite(options.timeoutMs)
+  const hasInjectedConnect = Boolean(options && typeof options.connect === 'function');
+  if (!hasInjectedConnect) {
+    if (typeof pipePath !== 'string' || !PIPE_PATH_PATTERN.test(pipePath)) {
+      return Promise.resolve(refusal('bad_pipe'));
+    }
+  }
+
+  const requested = typeof options?.timeoutMs === 'number' && Number.isFinite(options.timeoutMs)
     ? options.timeoutMs
     : DEFAULT_TIMEOUT_MS;
   const timeoutMs = requested >= 0 ? requested : DEFAULT_TIMEOUT_MS;
-  const scheduleTimeout = typeof options.setTimeout === 'function'
+  const scheduleTimeout = typeof options?.setTimeout === 'function'
     ? options.setTimeout
     : setTimeout;
-  const cancelTimeout = typeof options.clearTimeout === 'function'
+  const cancelTimeout = typeof options?.clearTimeout === 'function'
     ? options.clearTimeout
     : clearTimeout;
-  const connectFn = typeof options.connect === 'function'
+  const connectFn = hasInjectedConnect
     ? options.connect
-    : (target) => net.connect(target);
-  const now = typeof options.now === 'function'
+    : (target) => net.connect({ path: target });
+  const now = typeof options?.now === 'function'
     ? options.now
     : Date.now;
 
