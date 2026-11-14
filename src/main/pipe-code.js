@@ -31,7 +31,7 @@ function readCodeFromPipe(pipePath, options = {}) {
     : clearTimeout;
   const connectFn = hasInjectedConnect
     ? options.connect
-    : (target) => net.connect({ path: target });
+    : (target) => net.connect({ path: target, readable: true, writable: false });
   const now = typeof options?.now === 'function'
     ? options.now
     : Date.now;

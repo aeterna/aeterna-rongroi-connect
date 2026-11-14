@@ -284,7 +284,6 @@ function bootstrap() {
         submission.catch(() => finish(10));
       }
       if (flow.state().name === 'error') {
-        await submission;
         finish(REFUSED_EXIT_CODE);
         return;
       }

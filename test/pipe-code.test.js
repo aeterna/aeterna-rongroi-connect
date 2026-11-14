@@ -409,7 +409,7 @@ test('without an injected connect, a 31-hex name is refused with bad_pipe and no
   }
 });
 
-test('without an injected connect, a valid pipe connects with net.connect({ path: pipePath })', async () => {
+test('without an injected connect, a valid pipe connects with net.connect({ path: pipePath, readable: true, writable: false })', async () => {
   let capturedOptions = null;
   const originalConnect = net.connect;
   const validPipe = `\\\\.\\pipe\\rongroi-launch-${HEX_32}`;
@@ -426,7 +426,7 @@ test('without an injected connect, a valid pipe connects with net.connect({ path
 
   try {
     const promise = readCodeFromPipe(validPipe, { timeoutMs: 20 });
-    assert.deepEqual(capturedOptions, { path: validPipe });
+    assert.deepEqual(capturedOptions, { path: validPipe, readable: true, writable: false });
     await promise;
   } finally {
     net.connect = originalConnect;
