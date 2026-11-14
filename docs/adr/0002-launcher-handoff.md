@@ -63,6 +63,28 @@ On pik-windows, with the fused, packaged release build (not `npm start`), starte
 name passed as `--from-launcher=\\.\pipe\rongroi-launch-<32 hex>`, created by the launcher with a DACL for the current
 user only, read once, the same way the sidecar pipe works (ADR 0001, `native/pipe`). This ADR is then amended.
 
+### Result, 2026-11-14 (pik-windows, Windows 10.0.26320)
+
+What was tested: the release folder CI built from `feat/launcher-handoff` at `3f501bd` (run 43584325889). The process was started from SSH (session 0) by `handoff.exe` (nakara-oss `launcher-connect`, `std::process::Command` with piped stdin) and by Node `child_process.spawn` writing raw bytes.
+
+- **stdin: fails, so the fallback applies.** A fresh, valid code from the mock Kit was refused with exit 12, and the Kit received no request. Every other input was also refused with exit 12 after about 2.3 s:
+  - a damaged code, CRLF, a BOM, 4097 bytes, or an empty line;
+  - stdin held open with nothing written;
+  - a line written 1 s after start.
+
+  In the open-and-silent case Connect exited at 2.5 s, not at the reader's 5 s timeout. So Connect saw stdin as already ended or failed: the packaged GUI-subsystem Electron exe does not read the inherited pipe. Connect also wrote `\r\n` to stdout in every run. This comes from Electron or Chromium, not from Connect's code.
+- **Arguments: pass.** Each of the following exits 12 in 324–376 ms, with no listener on 9222 or 9229 at any 50 ms poll and no netlog file:
+  - `--remote-debugging-port=9222`, alone and together with `--from-launcher`;
+  - `--inspect=9229`;
+  - `--log-net-log=<path>` (release build);
+  - `extra`.
+
+  `--user-data-dir=<path>` also exits 12, but Chromium creates the (empty) folder before Connect's code runs.
+- With no argument, Connect still opens and stays running (paste field).
+- The elevated relaunch is the sidecar's (`--elevate`), not Connect's, so Connect's arguments do not reach it. The CI e2e with its elevated round and the netlog check passed on `8e119a1` (run 43579807676) and `3f501bd` (run 43584325889).
+
+Next: decision 1 moves to the named-pipe fallback above, and this ADR is amended before acceptance. The argument rule stays as tested.
+
 ## Consequences
 
 - The proof of ADR 0001 section 2 still runs on what ships: the stdin path is in the release build, not in
