@@ -32,7 +32,7 @@ const {
   appArguments,
   interpretLaunchArguments,
 } = require('./launch-args');
-const { readCodeFromStream } = require('./stdin-code');
+const { readCodeFromPipe } = require('./pipe-code');
 
 let userDataDirectory = null;
 let flow = null;
@@ -205,12 +205,12 @@ function bootstrap() {
 
   async function start() {
     // ADR 0002 sections 2 and 3: with --from-launcher the pairing code arrives
-    // on stdin, before any window.  A refusal ends the run with exit 12 and no
-    // window; a code enters the same parseCode path a pasted code takes, and
-    // nothing after it is pre-accepted.
+    // on the launcher's pipe, before any window.  A refusal ends the run with
+    // exit 12 and no window; a code enters the same parseCode path a pasted
+    // code takes, and nothing after it is pre-accepted.
     let handedCode = null;
     if (launchDecision.fromLauncher) {
-      const handoff = await readCodeFromStream(process.stdin);
+      const handoff = await readCodeFromPipe(launchDecision.pipe);
       if (!handoff.ok) {
         finish(REFUSED_EXIT_CODE);
         return;
