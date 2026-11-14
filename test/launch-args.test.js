@@ -87,6 +87,90 @@ test('a refusal names the argument that was not owned by the app', () => {
   );
 });
 
+test('a release build refuses the netlog switch', () => {
+  for (const options of [undefined, {}, { allowNetLog: false }]) {
+    const decision = interpretLaunchArguments(['--log-net-log=/tmp/x.json'], options);
+    assert.equal(decision.ok, false);
+    assert.equal(decision.fromLauncher, false);
+    assert.equal(decision.reason, 'unexpected_argument');
+    assert.equal(decision.argument, '--log-net-log=/tmp/x.json');
+  }
+});
+
+test('the test build accepts one absolute netlog switch alone or with the launcher flag', () => {
+  const expectedPaste = {
+    ok: true,
+    fromLauncher: false,
+    reason: null,
+    argument: null,
+  };
+  const expectedLauncher = {
+    ok: true,
+    fromLauncher: true,
+    reason: null,
+    argument: null,
+  };
+
+  assert.deepEqual(
+    interpretLaunchArguments(['--log-net-log=/tmp/x.json'], { allowNetLog: true }),
+    expectedPaste,
+  );
+  assert.deepEqual(
+    interpretLaunchArguments(
+      ['--log-net-log=/tmp/x.json', '--from-launcher'],
+      { allowNetLog: true },
+    ),
+    expectedLauncher,
+  );
+  assert.deepEqual(
+    interpretLaunchArguments(
+      ['--from-launcher', '--log-net-log=/tmp/x.json'],
+      { allowNetLog: true },
+    ),
+    expectedLauncher,
+  );
+});
+
+test('the test build still refuses a malformed or repeated netlog switch', () => {
+  const refused = [
+    ['--log-net-log'],
+    ['--log-net-log='],
+    ['--log-net-log=x.json'],
+    ['--log-net-log=./x.json'],
+    ['--log-net-log=../x.json'],
+    ['--log-net-log=/tmp/x.json', '--log-net-log=/tmp/y.json'],
+    ['--from-launcher', '--log-net-log=/tmp/x.json', '--log-net-log=/tmp/y.json'],
+    ['--log-net-log=/tmp/x.json', 'extra'],
+    ['--log-net-log=/tmp/x.json', '--inspect'],
+    ['--from-launcher', '--log-net-log=/tmp/x.json', '--from-launcher'],
+  ];
+
+  for (const args of refused) {
+    const decision = interpretLaunchArguments(args, { allowNetLog: true });
+    assert.equal(decision.ok, false, args.join(' '));
+    assert.equal(decision.fromLauncher, false, args.join(' '));
+    assert.equal(decision.reason, 'unexpected_argument', args.join(' '));
+    assert.equal(typeof decision.argument, 'string', args.join(' '));
+  }
+});
+
+test('the test build names the first argument it does not own', () => {
+  assert.equal(
+    interpretLaunchArguments(
+      ['--log-net-log=/tmp/x.json', '--log-net-log=/tmp/y.json'],
+      { allowNetLog: true },
+    ).argument,
+    '--log-net-log=/tmp/y.json',
+  );
+  assert.equal(
+    interpretLaunchArguments(
+      ['--log-net-log=/tmp/x.json', '--inspect'],
+      { allowNetLog: true },
+    ).argument,
+    '--inspect',
+  );
+});
+
 test('the decision refuses input that is not an argument list', () => {
   for (const value of [undefined, null, '--from-launcher', 7, {}]) {
     const decision = interpretLaunchArguments(value);

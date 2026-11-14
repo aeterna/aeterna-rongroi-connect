@@ -158,4 +158,7 @@ module.exports = {
   parseStateTimeoutMs,
   sidecarCommand,
   drive,
+  // CI records the netlog ADR 0001 section 2 relies on.  The release stub
+  // leaves this undefined, so only the test build accepts the switch.
+  allowNetLogArgument: true,
 };

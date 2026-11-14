@@ -95,6 +95,7 @@ process.on('uncaughtException', () => {
 // the whole answer.
 const launchDecision = interpretLaunchArguments(
   appArguments(process.argv, app.isPackaged),
+  { allowNetLog: testHook.allowNetLogArgument === true },
 );
 
 if (launchDecision.ok) {

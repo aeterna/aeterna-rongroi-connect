@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 'use strict';
 
+const path = require('node:path');
+
 // ADR 0002 section 1, the launcher handoff contract v1.  The app's own
 // arguments are either empty (the player started Connect, the paste field is
 // shown) or exactly `--from-launcher` (a launcher hands over one pairing code
@@ -10,8 +12,13 @@
 // `--user-data-dir=x` — is refused: Connect exits 12 at once, before the temp
 // folder or a window exists, because a command line this app does not own is
 // not a command line it may act on.
+//
+// The test build alone may add one `--log-net-log=<absolute path>` so CI can
+// record the netlog ADR 0001 section 2 relies on.  The release test hook does
+// not expose the switch, so a player's build stays strict.
 
 const LAUNCHER_FLAG = '--from-launcher';
+const NET_LOG_PREFIX = '--log-net-log=';
 const REFUSED_EXIT_CODE = 12;
 
 const PASTE = Object.freeze({
@@ -43,12 +50,40 @@ function appArguments(argv, isPackaged) {
   return list.slice(isPackaged === true ? 1 : 2);
 }
 
-function interpretLaunchArguments(args) {
+function isNetLogArgument(value, allowNetLog) {
+  if (allowNetLog !== true) return false;
+  if (typeof value !== 'string' || !value.startsWith(NET_LOG_PREFIX)) return false;
+  const target = value.slice(NET_LOG_PREFIX.length);
+  return target.length > 0 && path.isAbsolute(target);
+}
+
+function interpretLaunchArguments(args, options) {
   if (!Array.isArray(args)) return refusal(args);
   if (args.length === 0) return PASTE;
-  if (args.length === 1 && args[0] === LAUNCHER_FLAG) return LAUNCHER;
-  const offender = args.find((value) => value !== LAUNCHER_FLAG);
-  return refusal(offender === undefined ? args[0] : offender);
+
+  const allowNetLog = Boolean(options) && options.allowNetLog === true;
+  let fromLauncher = false;
+  let netLogSeen = false;
+  let offender = null;
+  let hasOffender = false;
+
+  for (const value of args) {
+    if (value === LAUNCHER_FLAG && !fromLauncher) {
+      fromLauncher = true;
+      continue;
+    }
+    if (!netLogSeen && isNetLogArgument(value, allowNetLog)) {
+      netLogSeen = true;
+      continue;
+    }
+    if (!hasOffender) {
+      offender = value;
+      hasOffender = true;
+    }
+  }
+
+  if (hasOffender) return refusal(offender);
+  return fromLauncher ? LAUNCHER : PASTE;
 }
 
 module.exports = {
