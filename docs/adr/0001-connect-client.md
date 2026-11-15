@@ -335,7 +335,7 @@ Differences from the sections above, each found while building:
 
   The netlog shows this socket at two layers, as a `UDP_SOCKET` source and a `UDP_CLIENT_SOCKET` source. The netlog check accepts them only when the type is UDP, the address and port are exactly that, the source holds only open, connect, local-address and alive events (so no bytes and no send or receive attempt, failed or not), and the log holds Chromium's IPv6 reachability check event. Any other case fails the job.
 
-  **Windows with an IPv6 route: measured 2026-11-15 (M3), 0 packets.** The route was a test route, because no network at hand had real IPv6 (the phone's carrier gave none). Chromium's check only needs `connect()` to succeed, which a route of any kind allows, and the control proves pktmon sees a packet on that path. What this does not cover is a route that reaches the internet. Evidence (pktmon text, e2e report and netlog, the scripts, `SHA256SUMS`): `/Volumes/WD1TB/aeterna-backups/connect-m3-2026-11-15/` on the owner's drive. A packet to that address on any later measurement ends this exception. Whether this test-route measurement is enough for 0.1.0, or a real-route repeat is needed first, is the owner's call.
+  **Windows with an IPv6 route: measured 2026-11-15 (M3), 0 packets.** The route was a test route, because no network at hand had real IPv6 (the phone's carrier gave none). Chromium's check only needs `connect()` to succeed, which a route of any kind allows, and the control proves pktmon sees a packet on that path. What this does not cover is a route that reaches the internet. Evidence (pktmon text, e2e report and netlog, the scripts, `SHA256SUMS`): `/Volumes/WD1TB/aeterna-backups/connect-m3-2026-11-15/` on the owner's drive. A packet to that address on any later measurement ends this exception. The owner accepted this test-route measurement for 0.1.0 (2026-11-15).
 - **Files left in `%TEMP%` after a normal exit (hosted Windows runner, Electron 44.10.2, the mock flow, run 42021779777 on `1991908`).** The delete in `will-quit` does not finish: the folder stays with 20 files, 115,883 bytes. Why is not proven; files Chromium still holds open is the likely cause (section 3). The stale sweep removes the folder on a later run, once its pid is gone and it is more than 10 minutes old, so a player who never runs Connect again keeps it until Windows' own temp cleanup.
 
   | Under the folder | Files | Bytes |
@@ -366,8 +366,7 @@ and from "As built: 2c", each found while building or measuring:
   aeterna-rongroi `3a08e2d`. CI refuses a lock whose commit is not exactly 40 lowercase hex, checks out that commit,
   builds `rongroi-scan` with `--locked`, and `scripts/build.js` copies it next to the asar and writes its SHA-256 into
   `src/sidecar.json`. A missing `vendor/rongroi-scan.exe` fails the build. This build is not an official one
-  (ADR 0007). Section 7's release asset, `SHA256SUMS` and attestation check are not built yet. 0.1.0 needs an
-  aeterna-rongroi release that carries the asset.
+  (ADR 0007). Replaced by the released asset before 0.1.0: see "Section 7 as built" below.
 - **Connect checks the sidecar's SHA-256 before every launch.** This is a time-of-check to time-of-use pair: Connect
   hashes the file and the operating system opens it again when it starts the process, so a process running as the
   player could replace it in between. The pipe check below compares the image path, not its bytes. Both stop a wrong
@@ -403,8 +402,19 @@ and from "As built: 2c", each found while building or measuring:
   place with no prompt. The prompt, Yes and No, was checked by hand on a PC. An elevated run that waited 120 s in
   `scanning` during wave 2 did not happen again once each run's policy reached the mock Kit (two traced runs, debug PR #5).
   Its cause is not proven.
-- **Still open before 0.1.0:** the owner's call on whether the M3 test-route measurement is enough (above); quitting during an elevated scan, which only unit tests cover because a scan ends
-  too fast to quit by hand; the release asset, `SHA256SUMS` and attestation of section 7. The real-sidecar runs found
+- **Section 7 as built (K5, 2026-11-15).** `sidecar.lock.json` now pins the aeterna-rongroi 0.15.0 asset
+  `rongroi-scan-0.15.0-windows-x64.exe` (tag `v2026.11.13-0.15.0`, commit `d8d17f0`) with its SHA-256. The composite
+  action `.github/actions/fetch-sidecar` downloads it and refuses it unless it matches the lock, the release's
+  `SHA256SUMS` line and aeterna-rongroi's attestation for that tag and commit; `ci.yml` and `release.yml` both use it, so
+  CI tests the sidecar that ships. `build.js` refuses a vendor sidecar whose hash differs from a release lock.
+  `release.yml` on a `v<version>` tag (the tag must equal `package.json`) builds both folders, compares them, runs the
+  release smoke, lays out the folder with `scripts/package.js`, zips it, checks every entry sits under the one top
+  folder, writes `SHA256SUMS`, attests the zip and opens a draft pre-release. On a pull request that touches packaging
+  it stops after the zip. Differences from section 7: Electron's own `LICENSE` (MIT) ships as `LICENSE.electron.txt`
+  so `LICENSE` can be this repository's GPL text, and the zip is named `rongroi-connect-<version>-windows-x64.zip`.
+  The attestation step needs a public repository, so the first tag waits for the repository to go public (K7).
+- **Still open before 0.1.0:** quitting during an elevated scan, which only unit tests cover because a scan ends
+  too fast to quit by hand; the first tagged release run (it needs the public repository). The real-sidecar runs found
   none of the run's ticket, nonce or Kit key in the files left in `%TEMP%` (run 42307666982); the 2c limits of that
   search still apply.
 

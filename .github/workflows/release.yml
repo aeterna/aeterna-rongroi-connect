@@ -1,0 +1,180 @@
+# SPDX-FileCopyrightText: 2026 aeterna-rongroi contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+# ADR 0001 section 7: builds the release zip on a GitHub-hosted runner, writes SHA256SUMS, attests the zip and
+# opens a draft release for a v<version> tag. On a pull request that touches packaging it builds the zip and
+# stops before attesting or publishing (attestations need the repository to be public; the first is 0.1.0).
+#   gh attestation verify <zip> --repo aeterna/aeterna-rongroi-connect --signer-workflow aeterna/aeterna-rongroi-connect/.github/workflows/release.yml
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/actions/**
+      - scripts/build.js
+      - scripts/package.js
+      - sidecar.lock.json
+      - package.json
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build zip (windows)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sidecar: ${{ steps.version.outputs.sidecar }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # the tag check below needs origin/main
+          persist-credentials: false
+      - name: Read the version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($version -cnotmatch '\A[0-9]+\.[0-9]+\.[0-9]+\z') { throw "package.json version '$version' is not x.y.z" }
+          if ($env:REF_TYPE -ceq "tag") {
+            if ($env:REF_NAME -cne "v$version") { throw "tag $env:REF_NAME does not name package.json version $version" }
+            # A release is cut from main only: the tagged commit must already be on main.
+            git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+            if ($LASTEXITCODE -ne 0) { throw "tag $env:REF_NAME points at $env:GITHUB_SHA, which is not on main" }
+          }
+          $sidecar = (Get-Content sidecar.lock.json -Raw | ConvertFrom-Json).version
+          if ($sidecar -cnotmatch '\A[0-9]+\.[0-9]+\.[0-9]+\z') { throw "sidecar.lock.json version '$sidecar' is not x.y.z" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "sidecar=$sidecar" >> $env:GITHUB_OUTPUT
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false   # a release build never restores a cache another run wrote
+      - name: Rust toolchain
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+      - name: Install without running package scripts
+        run: npm ci --ignore-scripts
+      - name: Build the pipe module
+        run: npm run build:native
+      - uses: ./.github/actions/fetch-sidecar
+        with:
+          token: ${{ github.token }}
+      - name: Build the release folder
+        run: npm run build
+      - name: Build the test folder
+        run: npm run build:test
+      - name: Compare the two builds
+        run: node scripts/compare-builds.js dist/release dist/test
+      - name: The release folder stays running for 8 seconds
+        run: node scripts/run-e2e.js --release-smoke dist/release
+      - name: Lay out and zip
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $release = @(Get-ChildItem dist/release -Directory)
+          if ($release.Count -ne 1) { throw "expected one folder in dist/release, found $($release.Count)" }
+          node scripts/package.js $release[0].FullName out
+          $top = "rongroi-connect-$env:VERSION"
+          $zip = "out/$top-windows-x64.zip"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path "out/$top").Path, (Join-Path (Get-Location) $zip), [IO.Compression.CompressionLevel]::Optimal, $true)
+          # One top folder, so Extract All does not scatter the runtime files (ADR 0001 section 7). Names are read
+          # raw: an entry with a backslash would not be a folder path in every extractor.
+          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip))
+          try {
+            $names = @($archive.Entries | ForEach-Object { $_.FullName })
+          } finally { $archive.Dispose() }
+          $backslash = @($names | Where-Object { $_.Contains('\') })
+          if ($backslash.Count -ne 0) { throw "zip entries with a backslash: $($backslash -join ', ')" }
+          $outside = @($names | Where-Object { -not $_.StartsWith("$top/") })
+          if ($outside.Count -ne 0) { throw "zip entries outside ${top}/: $($outside -join ', ')" }
+          foreach ($need in "rongroi-connect.exe", "resources/app.asar", "resources/rongroi-scan.exe", "LICENSE", "LICENSE.electron.txt", "LICENSES.chromium.html", "README.txt") {
+            if ($names -cnotcontains "$top/$need") { throw "zip has no $top/$need" }
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          [IO.File]::WriteAllText((Join-Path (Get-Location) 'out/SHA256SUMS'), "$hash  $top-windows-x64.zip`n")
+          Get-Content out/SHA256SUMS
+          "$($names.Count) entries, $([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: |
+            out/*.zip
+            out/SHA256SUMS
+          if-no-files-found: error
+
+  attest:
+    name: attest
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+          path: out
+      - name: Check the hashes before signing
+        working-directory: out
+        run: sha256sum -c --strict SHA256SUMS
+      - name: Attest build provenance of the zip
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: out/SHA256SUMS
+
+  publish:
+    name: draft release
+    if: github.ref_type == 'tag'
+    needs: [build, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+          path: out
+      - name: Check the hashes again
+        working-directory: out
+        run: sha256sum -c --strict SHA256SUMS
+      - name: Create the draft release
+        working-directory: out
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          SIDECAR: ${{ needs.build.outputs.sidecar }}
+        run: |
+          set -euo pipefail
+          printf 'Rongroi Connect %s (pre-alpha)\n\nBundles rongroi-scan %s from aeterna-rongroi.\nCheck the zip against SHA256SUMS (certutil -hashfile <zip> SHA256), or with gh attestation verify.\nSource: https://github.com/%s/tree/%s\n' \
+            "$VERSION" "$SIDECAR" "$GH_REPO" "$TAG" > ../notes.md
+          gh release create "$TAG" --draft --verify-tag --prerelease --title "Rongroi Connect $VERSION" \
+            --notes-file ../notes.md ./*.zip SHA256SUMS

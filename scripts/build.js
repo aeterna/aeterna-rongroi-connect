@@ -35,16 +35,40 @@ function sha256Hex(file) {
 
 // sidecar.lock.json pins which sidecar the build must carry.  Every failure
 // here is one line that names the lock file, per C4.
-function readSidecarLock(lockFile) {
+function readSidecarLock(lockFile = LOCK_FILE) {
   let lock;
   try {
     lock = readJson(lockFile);
   } catch (error) {
-    throw new Error(`cannot read sidecar.lock.json at ${lockFile}: ${error.message}`);
+    const reason = String(error && error.message ? error.message : error).replace(/\r?\n/g, ' ');
+    throw new Error(`cannot read sidecar.lock.json at ${lockFile}: ${reason}`);
   }
-  if (lock === null || typeof lock !== 'object' || Array.isArray(lock)
-      || typeof lock.commit !== 'string' || lock.commit.length === 0) {
-    throw new Error(`sidecar.lock.json (${lockFile}) must record the pinned sidecar commit`);
+  if (lock === null || typeof lock !== 'object' || Array.isArray(lock)) {
+    throw new Error(`sidecar.lock.json (${lockFile}) must be a JSON object`);
+  }
+  if (lock.source !== 'build' && lock.source !== 'release') {
+    throw new Error(`sidecar.lock.json (${lockFile}) source must be "build" or "release"`);
+  }
+  if (lock.repository !== 'aeterna/aeterna-rongroi') {
+    throw new Error(`sidecar.lock.json (${lockFile}) repository must be aeterna/aeterna-rongroi`);
+  }
+  if (typeof lock.commit !== 'string' || !/^[0-9a-f]{40}$/.test(lock.commit)) {
+    throw new Error(`sidecar.lock.json (${lockFile}) must record a 40 lowercase hex commit`);
+  }
+  if (lock.source === 'release') {
+    if (typeof lock.tag !== 'string' || !/^v[0-9A-Za-z.-]{1,64}$/.test(lock.tag)) {
+      throw new Error(`sidecar.lock.json (${lockFile}) tag must match ^v[0-9A-Za-z.-]{1,64}$`);
+    }
+    if (typeof lock.version !== 'string' || lock.version.length === 0) {
+      throw new Error(`sidecar.lock.json (${lockFile}) must record a non-empty version`);
+    }
+    const expectedAsset = `rongroi-scan-${lock.version}-windows-x64.exe`;
+    if (lock.asset !== expectedAsset) {
+      throw new Error(`sidecar.lock.json (${lockFile}) asset must be ${expectedAsset}`);
+    }
+    if (typeof lock.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(lock.sha256)) {
+      throw new Error(`sidecar.lock.json (${lockFile}) sha256 must be 64 lowercase hex`);
+    }
   }
   return lock;
 }
@@ -87,6 +111,12 @@ function stage({
   try {
     const sidecar = readSidecarLock(lockFile);
     requireVendorSidecar(vendorExe, lockFile);
+    const vendorSha256 = sha256Hex(vendorExe);
+    if (sidecar.source === 'release' && vendorSha256 !== sidecar.sha256) {
+      throw new Error(
+        `vendor sidecar ${vendorExe} sha256 ${vendorSha256} does not match sidecar.lock.json (${lockFile}) expected ${sidecar.sha256}`,
+      );
+    }
 
     fs.writeFileSync(
       path.join(stageDir, 'package.json'),
@@ -96,13 +126,13 @@ function stage({
 
     fs.cpSync(path.join(ROOT, 'src'), path.join(stageDir, 'src'), { recursive: true });
 
+    const sidecarRecord = { sha256: vendorSha256, commit: sidecar.commit };
+    if (sidecar.source === 'release') {
+      sidecarRecord.version = sidecar.version;
+    }
     fs.writeFileSync(
       path.join(stageDir, SIDECAR_RECORD),
-      `${JSON.stringify(
-        { sha256: sha256Hex(vendorExe), commit: sidecar.commit },
-        null,
-        2,
-      )}\n`,
+      `${JSON.stringify(sidecarRecord, null, 2)}\n`,
       'utf8',
     );
 
@@ -234,6 +264,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  readSidecarLock,
   stagedPackageJson,
   stage,
   main,
