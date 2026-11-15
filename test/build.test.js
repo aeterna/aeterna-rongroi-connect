@@ -24,7 +24,7 @@ const {
   SIDECAR_EXE_PATH,
   SIDECAR_RECORD_PATH,
 } = require('../scripts/compare-builds');
-const { stagedPackageJson, stage } = require('../scripts/build');
+const { readSidecarLock, stagedPackageJson, stage } = require('../scripts/build');
 
 const HOOKS = repositoryHookCopies();
 const RELEASE_HOOK = HOOKS.release;
@@ -601,14 +601,18 @@ test('the staged package.json drops devDependencies without changing the input',
   assert.equal(pkg.devDependencies.electron, '44.7.1');
 });
 
-test('sidecar.lock.json pins the source build of rongroi-scan', () => {
+test('sidecar.lock.json pins the released rongroi-scan asset', () => {
   const lockFile = path.join(__dirname, '..', 'sidecar.lock.json');
-  const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+  const lock = readSidecarLock(lockFile);
 
   assert.deepEqual(lock, {
-    source: 'build',
+    source: 'release',
     repository: 'aeterna/aeterna-rongroi',
-    commit: '3a08e2dcabd940780dd314579f6345306eae7143',
+    tag: 'v2026.11.13-0.15.0',
+    version: '0.15.0',
+    asset: 'rongroi-scan-0.15.0-windows-x64.exe',
+    sha256: '8a268639527fafd530166ce3c592526ef256ecd362c3a3e7ecb40896427b6d93',
+    commit: 'd8d17f0c3322e35e4d94dc9cc797f8b423f1669d',
     package: 'rongroi-scan',
   });
   assert.equal(fs.existsSync(`${lockFile}.license`), true);
@@ -831,6 +835,138 @@ test('stage() writes src/sidecar.json with the vendor SHA-256 and the lock commi
         .update(fs.readFileSync(vendorExe))
         .digest('hex');
       assert.deepEqual(record, { sha256: digest, commit: '0'.repeat(40) });
+    } finally {
+      fs.rmSync(stageDir, { recursive: true, force: true });
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function releaseLockFixture(overrides = {}) {
+  return {
+    source: 'release',
+    repository: 'aeterna/aeterna-rongroi',
+    tag: 'v2026.11.13-0.15.0',
+    version: '0.15.0',
+    asset: 'rongroi-scan-0.15.0-windows-x64.exe',
+    sha256: '8a268639527fafd530166ce3c592526ef256ecd362c3a3e7ecb40896427b6d93',
+    commit: 'd8d17f0c3322e35e4d94dc9cc797f8b423f1669d',
+    package: 'rongroi-scan',
+    ...overrides,
+  };
+}
+
+test('readSidecarLock refuses invalid release locks and unknown sources on one line', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sidecar-lock-invalid-'));
+
+  try {
+    const cases = [
+      ['wrong asset name', releaseLockFixture({ asset: 'rongroi-scan-0.14.0-windows-x64.exe' })],
+      ['uppercase sha256', releaseLockFixture({ sha256: 'A'.repeat(64) })],
+      ['39-char commit', releaseLockFixture({ commit: 'a'.repeat(39) })],
+      ['unknown source', releaseLockFixture({ source: 'tarball' })],
+      ['wrong repository', releaseLockFixture({ repository: 'other/repo' })],
+      ['invalid tag', releaseLockFixture({ tag: '2026.11.13-0.15.0' })],
+      ['empty version', releaseLockFixture({ version: '' })],
+    ];
+
+    for (const [label, payload] of cases) {
+      const lockFile = path.join(root, label.replace(/\s+/g, '-'), 'sidecar.lock.json');
+      fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+      fs.writeFileSync(lockFile, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+
+      assert.throws(
+        () => readSidecarLock(lockFile),
+        (error) => {
+          assert.equal(
+            error.message.includes('sidecar.lock.json'),
+            true,
+            `${label}: error should name sidecar.lock.json: ${error.message}`,
+          );
+          assert.equal(
+            error.message.includes('\n'),
+            false,
+            `${label}: error should be one line: ${error.message}`,
+          );
+          return true;
+        },
+        label,
+      );
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('stage() with a release lock verifies the vendor SHA-256 and writes version to src/sidecar.json', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sidecar-stage-release-'));
+
+  try {
+    const vendorExe = path.join(root, 'rongroi-scan.exe');
+    const vendorBytes = Buffer.from('released rongroi-scan binary bytes', 'utf8');
+    fs.writeFileSync(vendorExe, vendorBytes);
+    const actualSha256 = crypto.createHash('sha256').update(vendorBytes).digest('hex');
+    const wrongSha256 = '0'.repeat(64);
+
+    const nativeModule = path.join(root, 'rongroi_connect_pipe.node');
+    fs.writeFileSync(nativeModule, Buffer.alloc(16, 0x01));
+
+    const badLockFile = path.join(root, 'bad', 'sidecar.lock.json');
+    fs.mkdirSync(path.dirname(badLockFile), { recursive: true });
+    fs.writeFileSync(
+      badLockFile,
+      `${JSON.stringify(releaseLockFixture({ sha256: wrongSha256 }), null, 2)}\n`,
+      'utf8',
+    );
+
+    assert.throws(
+      () => stage({ vendorExe, lockFile: badLockFile, nativeModule }),
+      (error) => {
+        assert.equal(
+          error.message.includes('sidecar.lock.json'),
+          true,
+          `error should name sidecar.lock.json: ${error.message}`,
+        );
+        assert.equal(
+          error.message.includes(wrongSha256),
+          true,
+          `error should name expected sha256: ${error.message}`,
+        );
+        assert.equal(
+          error.message.includes(actualSha256),
+          true,
+          `error should name actual sha256: ${error.message}`,
+        );
+        assert.equal(
+          error.message.includes('\n'),
+          false,
+          `error should be one line: ${error.message}`,
+        );
+        return true;
+      },
+    );
+
+    const goodLockFile = path.join(root, 'good', 'sidecar.lock.json');
+    fs.mkdirSync(path.dirname(goodLockFile), { recursive: true });
+    const commit = 'd8d17f0c3322e35e4d94dc9cc797f8b423f1669d';
+    fs.writeFileSync(
+      goodLockFile,
+      `${JSON.stringify(releaseLockFixture({ sha256: actualSha256, commit }), null, 2)}\n`,
+      'utf8',
+    );
+
+    const { stageDir, sidecarExe } = stage({ vendorExe, lockFile: goodLockFile, nativeModule });
+    try {
+      assert.equal(sidecarExe, vendorExe);
+      const record = JSON.parse(
+        fs.readFileSync(path.join(stageDir, 'src', 'sidecar.json'), 'utf8'),
+      );
+      assert.deepEqual(record, {
+        sha256: actualSha256,
+        commit,
+        version: '0.15.0',
+      });
     } finally {
       fs.rmSync(stageDir, { recursive: true, force: true });
     }
