@@ -335,7 +335,7 @@ Differences from the sections above, each found while building:
 
   The netlog shows this socket at two layers, as a `UDP_SOCKET` source and a `UDP_CLIENT_SOCKET` source. The netlog check accepts them only when the type is UDP, the address and port are exactly that, the source holds only open, connect, local-address and alive events (so no bytes and no send or receive attempt, failed or not), and the log holds Chromium's IPv6 reachability check event. Any other case fails the job.
 
-  **Windows with an IPv6 route: measured 2026-11-15 (M3), 0 packets.** The route was a test route, because no network at hand had real IPv6 (the phone's carrier gave none). Chromium's check only needs `connect()` to succeed, which a route of any kind allows, and the control proves pktmon sees a packet on that path. What this does not cover is a route that reaches the internet. Evidence (pktmon text, e2e report and netlog, the scripts, `SHA256SUMS`): `/Volumes/WD1TB/aeterna-backups/connect-m3-2026-11-15/` on the owner's drive. A packet to that address on any later measurement ends this exception. A real-route repeat is welcome when one exists; it does not block 0.1.0.
+  **Windows with an IPv6 route: measured 2026-11-15 (M3), 0 packets.** The route was a test route, because no network at hand had real IPv6 (the phone's carrier gave none). Chromium's check only needs `connect()` to succeed, which a route of any kind allows, and the control proves pktmon sees a packet on that path. What this does not cover is a route that reaches the internet. Evidence (pktmon text, e2e report and netlog, the scripts, `SHA256SUMS`): `/Volumes/WD1TB/aeterna-backups/connect-m3-2026-11-15/` on the owner's drive. A packet to that address on any later measurement ends this exception. Whether this test-route measurement is enough for 0.1.0, or a real-route repeat is needed first, is the owner's call.
 - **Files left in `%TEMP%` after a normal exit (hosted Windows runner, Electron 44.10.2, the mock flow, run 42021779777 on `1991908`).** The delete in `will-quit` does not finish: the folder stays with 20 files, 115,883 bytes. Why is not proven; files Chromium still holds open is the likely cause (section 3). The stale sweep removes the folder on a later run, once its pid is gone and it is more than 10 minutes old, so a player who never runs Connect again keeps it until Windows' own temp cleanup.
 
   | Under the folder | Files | Bytes |
@@ -403,7 +403,7 @@ and from "As built: 2c", each found while building or measuring:
   place with no prompt. The prompt, Yes and No, was checked by hand on a PC. An elevated run that waited 120 s in
   `scanning` during wave 2 did not happen again once each run's policy reached the mock Kit (two traced runs, debug PR #5).
   Its cause is not proven.
-- **Still open before 0.1.0:** quitting during an elevated scan, which only unit tests cover because a scan ends
+- **Still open before 0.1.0:** the owner's call on whether the M3 test-route measurement is enough (above); quitting during an elevated scan, which only unit tests cover because a scan ends
   too fast to quit by hand; the release asset, `SHA256SUMS` and attestation of section 7. The real-sidecar runs found
   none of the run's ticket, nonce or Kit key in the files left in `%TEMP%` (run 42307666982); the 2c limits of that
   search still apply.
