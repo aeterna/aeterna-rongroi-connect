@@ -37,6 +37,6 @@ runs:
         if ($got -cne $lock.sha256) { throw "downloaded sidecar SHA-256 $got does not match sidecar.lock.json" }
         gh attestation verify $file --repo aeterna/aeterna-rongroi `
           --signer-workflow aeterna/aeterna-rongroi/.github/workflows/release.yml `
-          --source-ref "refs/tags/$($lock.tag)" --source-digest $lock.commit
+          --source-ref "refs/tags/$($lock.tag)" --source-digest $lock.commit --deny-self-hosted-runners
         Copy-Item $file vendor/rongroi-scan.exe
         "rongroi-scan $($lock.version) ($($lock.tag)) sha256 $got"
