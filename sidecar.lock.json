@@ -1,6 +1,10 @@
 {
-  "source": "build",
+  "source": "release",
   "repository": "aeterna/aeterna-rongroi",
-  "commit": "3a08e2dcabd940780dd314579f6345306eae7143",
+  "tag": "v2026.11.13-0.15.0",
+  "version": "0.15.0",
+  "asset": "rongroi-scan-0.15.0-windows-x64.exe",
+  "sha256": "8a268639527fafd530166ce3c592526ef256ecd362c3a3e7ecb40896427b6d93",
+  "commit": "d8d17f0c3322e35e4d94dc9cc797f8b423f1669d",
   "package": "rongroi-scan"
 }
