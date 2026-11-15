@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: 2026 aeterna-rongroi contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: fetch the pinned sidecar
+description: >-
+  ADR 0001 section 7. Downloads the rongroi-scan release asset that sidecar.lock.json pins, checks it against
+  the lock, against that release's SHA256SUMS and against aeterna-rongroi's build-provenance attestation for
+  the tag, and only then copies it to vendor/rongroi-scan.exe. The SHA256SUMS line comes from the same
+  release, so it only catches corruption; the lock and the attestation are the real checks.
+inputs:
+  token:
+    description: token for gh (read access to public releases and attestations)
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Download and check rongroi-scan
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        $PSNativeCommandUseErrorActionPreference = $true
+        $lock = Get-Content sidecar.lock.json -Raw | ConvertFrom-Json
+        if ($lock.source -cne "release" -or $lock.repository -cne "aeterna/aeterna-rongroi" `
+            -or $lock.tag -cnotmatch '\Av[0-9A-Za-z.-]{1,64}\z' `
+            -or $lock.asset -cne "rongroi-scan-$($lock.version)-windows-x64.exe" `
+            -or $lock.sha256 -cnotmatch '\A[0-9a-f]{64}\z' -or $lock.commit -cnotmatch '\A[0-9a-f]{40}\z') {
+          throw "sidecar.lock.json must pin a rongroi-scan release asset of aeterna/aeterna-rongroi"
+        }
+        New-Item -ItemType Directory -Force -Path _sidecar, vendor | Out-Null
+        gh release download -R aeterna/aeterna-rongroi -D _sidecar -p $lock.asset -p SHA256SUMS -- $lock.tag
+        $file = Join-Path _sidecar $lock.asset
+        $want = @(Get-Content _sidecar/SHA256SUMS | Where-Object { $_ -cmatch ('\A[0-9a-f]{64}  ' + [regex]::Escape($lock.asset) + '\z') })
+        if ($want.Count -ne 1) { throw "the release's SHA256SUMS has $($want.Count) lines for $($lock.asset), not 1" }
+        if (($want[0] -replace '\s.*$', '') -cne $lock.sha256) { throw "the release's SHA256SUMS does not match sidecar.lock.json" }
+        $got = (Get-FileHash -Algorithm SHA256 $file).Hash.ToLower()
+        if ($got -cne $lock.sha256) { throw "downloaded sidecar SHA-256 $got does not match sidecar.lock.json" }
+        gh attestation verify $file --repo aeterna/aeterna-rongroi `
+          --signer-workflow aeterna/aeterna-rongroi/.github/workflows/release.yml `
+          --source-ref "refs/tags/$($lock.tag)" --source-digest $lock.commit
+        Copy-Item $file vendor/rongroi-scan.exe
+        "rongroi-scan $($lock.version) ($($lock.tag)) sha256 $got"
