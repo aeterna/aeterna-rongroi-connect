@@ -329,12 +329,13 @@ Differences from the sections above, each found while building:
   | This repo's hosted Windows runner | none | `net_error -109` | netlog: no byte events. Not captured by the OS |
   | Development PC, Windows, `pktmon` | none (Teredo and Tailscale only) | `net_error -109` | none seen, but the control could not send either, so this shows nothing beyond "no route, nothing leaves" |
   | MacBook, macOS, `tcpdump` | yes | connected, `ipv6_available: true` | **0**, with a control that sent 1 byte and captured 1 packet |
+  | pik-windows, Windows build 26320, `pktmon` (2026-11-15, CI run 43683279014 test folder, whole e2e: 3 runs) | yes, a **test route**: `::/0` via a fixed neighbor on the WSL virtual adapter, source `2001:db8:3c::2` (documentation prefix; traffic stays inside the machine, nothing reaches the internet) | connected in all 3 runs (`acceptedIpv6Check` `{"connected":true}`, sources 2, 4, 4); netlog check passed | **0** packet records over the whole run, with the same pktmon filter on the same address catching a control that sent 1 UDP byte to `[2001:4860:4860::8888]:443` (11 records: one packet seen at 11 stack components) |
 
   `--enable-features` with `EnableIPv6ReachabilityOverride` or `kEnableIPv6ReachabilityOverride` did not stop the check on the Mac. No `disable-ipv6` switch string was found in the binary. Whether another way exists is unknown.
 
   The netlog shows this socket at two layers, as a `UDP_SOCKET` source and a `UDP_CLIENT_SOCKET` source. The netlog check accepts them only when the type is UDP, the address and port are exactly that, the source holds only open, connect, local-address and alive events (so no bytes and no send or receive attempt, failed or not), and the log holds Chromium's IPv6 reachability check event. Any other case fails the job.
 
-  **Windows with a working IPv6 route is unmeasured.** Before 0.1.0, lane 3c measures it with `pktmon` and a control that sends. A packet to that address ends this exception, and 0.1.0 does not ship until that is resolved. Until then nothing public says Connect contacts nobody else.
+  **Windows with an IPv6 route: measured 2026-11-15 (M3), 0 packets.** The route was a test route, because no network at hand had real IPv6 (the phone's carrier gave none). Chromium's check only needs `connect()` to succeed, which a route of any kind allows, and the control proves pktmon sees a packet on that path. What this does not cover is a route that reaches the internet. Evidence (pktmon text, e2e report and netlog, the scripts, `SHA256SUMS`): `/Volumes/WD1TB/aeterna-backups/connect-m3-2026-11-15/` on the owner's drive. A packet to that address on any later measurement ends this exception. Whether this test-route measurement is enough for 0.1.0, or a real-route repeat is needed first, is the owner's call.
 - **Files left in `%TEMP%` after a normal exit (hosted Windows runner, Electron 44.10.2, the mock flow, run 42021779777 on `1991908`).** The delete in `will-quit` does not finish: the folder stays with 20 files, 115,883 bytes. Why is not proven; files Chromium still holds open is the likely cause (section 3). The stale sweep removes the folder on a later run, once its pid is gone and it is more than 10 minutes old, so a player who never runs Connect again keeps it until Windows' own temp cleanup.
 
   | Under the folder | Files | Bytes |
@@ -402,8 +403,7 @@ and from "As built: 2c", each found while building or measuring:
   place with no prompt. The prompt, Yes and No, was checked by hand on a PC. An elevated run that waited 120 s in
   `scanning` during wave 2 did not happen again once each run's policy reached the mock Kit (two traced runs, debug PR #5).
   Its cause is not proven.
-- **Still open before 0.1.0:** Windows with a working IPv6 route (the 2c socket exception above, measured with
-  `pktmon` and a control that sends); quitting during an elevated scan, which only unit tests cover because a scan ends
+- **Still open before 0.1.0:** the owner's call on whether the M3 test-route measurement is enough (above); quitting during an elevated scan, which only unit tests cover because a scan ends
   too fast to quit by hand; the release asset, `SHA256SUMS` and attestation of section 7. The real-sidecar runs found
   none of the run's ticket, nonce or Kit key in the files left in `%TEMP%` (run 42307666982); the 2c limits of that
   search still apply.
