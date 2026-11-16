@@ -1,0 +1,9 @@
+diff --git a/src/core/pairing.js b/src/core/pairing.js
+--- a/src/core/pairing.js
++++ b/src/core/pairing.js
+@@ -194,4 +194,4 @@ function parsePairingCode(code) {
+   return {
+-    version: 1,
++    version: 2,
+     serverOrigin: origin.serverOrigin,
+     host: origin.host,

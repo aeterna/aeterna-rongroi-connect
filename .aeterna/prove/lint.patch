@@ -1,0 +1,9 @@
+diff --git a/src/core/canonical.js b/src/core/canonical.js
+--- a/src/core/canonical.js
++++ b/src/core/canonical.js
+@@ -5,4 +5,5 @@
+ const { createHash } = require('node:crypto');
++require('node:https');
+ 
+ function compareUtf16(a, b) {
+   // ECMAScript string comparison is lexicographic over UTF-16 code units,
