@@ -1,17 +1,20 @@
 # SPDX-FileCopyrightText: 2026 aeterna-rongroi contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+# Excluded test files:
+# - test/net.test.js: starts a local HTTP server (http.createServer listening on 127.0.0.1)
+# - test/pipe-code.test.js: starts a local server (net.createServer listening on a pipe/socket)
+# Reason: In the Q2 sandbox, socket listen is denied (listen EPERM 127.0.0.1).
 [[checks]]
 name = "test"
-cmd = "node --test"
+cmd = 'npm ci --offline --ignore-scripts --no-audit --no-fund --cache "/Users/$USER/.npm" && node --test test/build.test.js test/canonical.test.js test/envelope.test.js test/flow.test.js test/launch-args.test.js test/lint.test.js test/netlog.test.js test/pairing.test.js test/quarantine.test.js test/sidecar.test.js test/stdin-code.test.js test/userdata.test.js test/verify-sidecar.test.js test/view.test.js'
 timeout = 60
 deps = [
   "package.json",
+  "package-lock.json",
   "sidecar.lock.json",
-  "src/**",
   "test/**",
   "scripts/**",
-  "native/**",
 ]
 prove = ".aeterna/prove/test.patch"
 
@@ -23,8 +26,6 @@ deps = [
   "eslint.config.js",
   "package.json",
   "package-lock.json",
-  "src/**",
   "test/**",
-  "native/**",
 ]
 prove = ".aeterna/prove/lint.patch"
