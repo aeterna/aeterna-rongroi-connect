@@ -270,7 +270,7 @@ check, because Chromium may add a background fetch the switches do not cover.
 
 ### 7. Build, provenance and the zip
 
-- The release workflow runs on a GitHub-hosted Windows runner (not the shared `wsl-pik-*` runners) on a
+- The release workflow runs on a GitHub-hosted Windows runner (not a shared self-hosted runner) on a
   `v*` tag: `npm ci` from the lockfile, Electron from `@electron/get` with its checksum check, the N-API module
   built with `cargo build --locked`, fuses flipped, asar packed with the sidecar's SHA-256 embedded, the test
   build and the comparison of section 2.
