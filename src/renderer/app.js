@@ -212,6 +212,8 @@
     }
   }
 
+  var lastName;
+
   function draw(state) {
     var app = document.getElementById('app');
     if (!app || !window.RongroiView || typeof window.RongroiView.render !== 'function') {
@@ -219,8 +221,12 @@
     }
 
     var tree = window.RongroiView.render(state, t);
+    var name = state && state.name;
+    var snap = window.RongroiKeep ? window.RongroiKeep.capture(document, lastName) : null;
     app.textContent = '';
     app.appendChild(build(tree));
+    if (snap) window.RongroiKeep.restore(document, snap, name);
+    lastName = name;
 
     if (state && state.name === 'paste') {
       var input = document.getElementById('pairing-code');
