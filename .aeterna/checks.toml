@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2026 aeterna-rongroi contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# excluded test/net.test.js and test/pipe-code.test.js (they listen on a socket),
+# and test/mock/kit.test.js is not run because test/mock/kit.js calls server.listen.
+[[checks]]
+name = "test"
+cmd = '''npm ci --offline --ignore-scripts --no-audit --no-fund --cache "/Users/$USER/.npm" && node --test $(ls test/*.test.js | grep -vE 'test/(net|pipe-code)\.test\.js')'''
+timeout = 90
+deps = [
+  "package.json",
+  "package-lock.json",
+  "sidecar.lock.json",
+  "test/**",
+  "scripts/**",
+]
+prove = ".aeterna/prove/test.patch"
+
+[[checks]]
+name = "lint"
+cmd = 'npm ci --offline --ignore-scripts --no-audit --no-fund --cache "/Users/$USER/.npm" && npm run lint'
+timeout = 120
+deps = [
+  "eslint.config.js",
+  "package.json",
+  "package-lock.json",
+  "test/**",
+]
+prove = ".aeterna/prove/lint.patch"
