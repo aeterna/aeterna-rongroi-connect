@@ -5,6 +5,8 @@
 const crypto = require('node:crypto');
 
 const INFO_PREFIX = 'rongroi-connect report v1';
+const INFO_PREFIX_V2 = 'rongroi-connect report v2';
+const BINDING_KEYS = ['base_path', 'policy_hash', 'server_origin', 'ticket', 'transport'];
 const SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex');
 const PKCS8_PREFIX = Buffer.from('302e020100300506032b656e04220420', 'hex');
 
@@ -50,8 +52,9 @@ function deriveSharedSecret(privateKey, peerRaw) {
   });
 }
 
-function deriveKey(shared, kitRaw, epkRaw, ticket) {
-  const info = Buffer.concat([Buffer.from(INFO_PREFIX, 'utf8'), kitRaw, epkRaw]);
+function deriveKey(shared, kitRaw, epkRaw, ticket, version = 1) {
+  const label = version === 2 ? INFO_PREFIX_V2 : INFO_PREFIX;
+  const info = Buffer.concat([Buffer.from(label, 'utf8'), kitRaw, epkRaw]);
   const key = crypto.hkdfSync('sha256', shared, Buffer.from(ticket, 'ascii'), info, 32);
   return Buffer.from(key);
 }
@@ -104,6 +107,56 @@ function sealEnvelope(plaintextUtf8, kitPublicB64u, ticket, fixed) {
   };
 }
 
+/**
+ * Envelope v2 additional data (ADR 0003, aeterna-rongroi ADR 0097 section 4): the JCS form of the five binding
+ * members, each a string, keys in code-point order. For flat string members JCS equals JSON.stringify of the
+ * sorted object.
+ */
+function bindingAad(binding) {
+  if (binding === null || typeof binding !== 'object' || Array.isArray(binding)) {
+    throw new TypeError('binding must be an object');
+  }
+  const keys = Object.keys(binding).sort();
+  if (keys.length !== BINDING_KEYS.length || keys.some((key, i) => key !== BINDING_KEYS[i])) {
+    throw new TypeError('binding must have exactly base_path, policy_hash, server_origin, ticket, transport');
+  }
+  const ordered = {};
+  for (const key of BINDING_KEYS) {
+    if (typeof binding[key] !== 'string' || binding[key].length === 0) {
+      throw new TypeError(`binding.${key} must be a non-empty string`);
+    }
+    ordered[key] = binding[key];
+  }
+  ticketBytes(binding.ticket);
+  return Buffer.from(JSON.stringify(ordered), 'utf8');
+}
+
+/** Seal a report into an envelope v2, bound to an rr2 code. `fixed` is the same test seam as v1. */
+function sealEnvelopeV2(plaintextUtf8, kitPublicB64u, binding, fixed) {
+  const kitRaw = base64urlBytes(kitPublicB64u, 32, 'kit public key');
+  const aad = bindingAad(binding);
+  if (typeof plaintextUtf8 !== 'string' && !Buffer.isBuffer(plaintextUtf8)) {
+    throw new TypeError('plaintext must be a UTF-8 string or a Buffer');
+  }
+  const plaintext = Buffer.isBuffer(plaintextUtf8) ? plaintextUtf8 : Buffer.from(plaintextUtf8, 'utf8');
+  const ephemeralPrivate = fixed && fixed.ephemeralPrivate !== undefined
+    ? importPrivateKey(fixed.ephemeralPrivate)
+    : crypto.generateKeyPairSync('x25519').privateKey;
+  const epkRaw = rawPublicKey(crypto.createPublicKey(ephemeralPrivate));
+  const shared = deriveSharedSecret(ephemeralPrivate, kitRaw);
+  const key = deriveKey(shared, kitRaw, epkRaw, binding.ticket, 2);
+  const iv = fixed && fixed.iv !== undefined ? fixedIv(fixed.iv) : crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  cipher.setAAD(aad);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
+  return {
+    v: 2,
+    epk: epkRaw.toString('base64url'),
+    iv: iv.toString('base64url'),
+    ct: ciphertext.toString('base64url'),
+  };
+}
+
 function openEnvelope(envelope, kitPrivateKey, ticket) {
   if (envelope === null || typeof envelope !== 'object' || envelope.v !== 1) {
     throw new TypeError('envelope must be version 1');
@@ -129,4 +182,4 @@ function openEnvelope(envelope, kitPrivateKey, ticket) {
   ]).toString('utf8');
 }
 
-module.exports = { sealEnvelope, openEnvelope, deriveKey, deriveSharedSecret };
+module.exports = { sealEnvelope, sealEnvelopeV2, bindingAad, openEnvelope, deriveKey, deriveSharedSecret };

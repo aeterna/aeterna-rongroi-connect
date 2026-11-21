@@ -157,7 +157,9 @@ const CODE_NOISE = /[\s\u180E\u200B\u200C\u200D\u2060]/g;
 function parsePairingCode(code) {
   if (typeof code !== 'string') fail('BAD_PREFIX', 'pairing code must be a string');
   const text = code.replace(CODE_NOISE, '');
-  if (!text.startsWith('rr1.')) fail('BAD_PREFIX', 'pairing code must start with rr1.');
+  // rr1 (ADR 0001) and rr2 (ADR 0003, aeterna-rongroi ADR 0097 section 2) are both accepted throughout 0.x.
+  const version = text.startsWith('rr2.') ? 2 : 1;
+  if (version === 1 && !text.startsWith('rr1.')) fail('BAD_PREFIX', 'pairing code must start with rr1. or rr2.');
   const body = text.slice(4);
   if (body.length > 8192) fail('BAD_BASE64', 'pairing payload is too large');
   const raw = base64urlBytes(body, 'BAD_BASE64', 'pairing payload');
@@ -171,13 +173,33 @@ function parsePairingCode(code) {
   if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
     fail('BAD_SHAPE', 'pairing payload must be a JSON object');
   }
-  const expectedMembers = ['expires_at', 'kit_public_key', 'nonce', 'policy_hash', 'server_origin', 'ticket'];
+  const expectedMembers = version === 2
+    ? ['base_path', 'expires_at', 'kit_public_key', 'nonce', 'policy_hash', 'server_origin', 'ticket', 'transport']
+    : ['expires_at', 'kit_public_key', 'nonce', 'policy_hash', 'server_origin', 'ticket'];
   const members = Object.keys(payload).sort();
   if (members.length !== expectedMembers.length || members.some((key, index) => key !== expectedMembers[index])) {
     fail('BAD_SHAPE', 'pairing payload has missing or unexpected members');
   }
 
   const origin = parseOrigin(payload.server_origin);
+  let basePath = 'nakara_rongroi';
+  let transport = 'direct';
+  if (version === 2) {
+    // Envelope v2 binds the exact strings of the code, so the origin must already be in its normal form.
+    if (payload.server_origin !== origin.serverOrigin) fail('BAD_ORIGIN', 'server_origin must be in normal form');
+    if (typeof payload.base_path !== 'string' || !/^[a-z0-9_-]{1,64}$/.test(payload.base_path)
+        || payload.base_path === 'v1') {
+      fail('BAD_BASE_PATH', 'base_path must be one segment of a-z 0-9 _ - and not v1');
+    }
+    if (payload.transport !== 'direct' && payload.transport !== 'relay') {
+      fail('BAD_TRANSPORT', 'transport must be direct or relay');
+    }
+    if (payload.transport === 'relay' && !payload.server_origin.startsWith('https://')) {
+      fail('BAD_ORIGIN', 'a relay code needs an https origin');
+    }
+    basePath = payload.base_path;
+    transport = payload.transport;
+  }
   const { ticket } = payload;
   if (typeof ticket !== 'string' || !/^[0-9a-f]{32}$/.test(ticket)) {
     fail('BAD_TICKET', 'ticket must be 32 lowercase hex characters');
@@ -192,7 +214,9 @@ function parsePairingCode(code) {
   const kitPublicKey = base64urlBytes(payload.kit_public_key, 'BAD_KIT_KEY', 'kit_public_key', 32);
 
   return {
-    version: 1,
+    version,
+    basePath,
+    transport,
     serverOrigin: origin.serverOrigin,
     host: origin.host,
     hostAscii: origin.hostAscii,
@@ -202,6 +226,14 @@ function parsePairingCode(code) {
     expiresAt,
     policyHash: payload.policy_hash,
     kitPublicKey: kitPublicKey.toString('base64url'),
+    // Envelope v2's additional data (version 2 only).
+    binding: version === 2 ? {
+      base_path: basePath,
+      policy_hash: payload.policy_hash,
+      server_origin: payload.server_origin,
+      ticket,
+      transport,
+    } : null,
   };
 }
 

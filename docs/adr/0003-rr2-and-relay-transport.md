@@ -40,6 +40,11 @@ changes in Connect. The protocol itself is owned by ADR 0097.
    - no result yet → "Delivered to the relay, waiting for the server";
    - no result by `expires_at` + 10 minutes → "The relay has the report but the server has not confirmed it". This
      screen never says "Sent".
+   As soon as the relay answers `202`, the screen changes to "Delivered to the relay at <origin>. Waiting for the game
+   server to collect it." (amended 2026-11-22 after Q3), and quitting from then on exits 17, not 15.
+   Trust: through a relay, "Sent" means the relay reported the server's `accepted`. The player chose that relay's
+   origin on the consent screen; a relay that lies can make Connect say "Sent" for a report the server never saw, the
+   same way a server can lie about its own `200` today.
    Exit codes for a launcher (ADR 0002): 0 (or 16 for a declined answer) only after `accepted`. The two waiting cases
    exit **17**, a new code added to ADR 0002's table, because 15 already means the upload failed or was refused.
 6. **Consent screen.** The large-type origin stays the destination. For `relay` one line is added: "Through a relay the

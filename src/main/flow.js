@@ -10,6 +10,8 @@ const MAX_RECORD_BYTES = 2 * 1024 * 1024;
 // ADR 0002 section 4: the server accepting a declined answer is not the same
 // outcome as accepting a report, so the two exit codes differ from v1 on.
 const DECLINED_EXIT_CODE = 16;
+// Relay transport only (ADR 0003 section 5): the relay holds the report, the server has not confirmed it yet.
+const RELAY_WAITING_EXIT_CODE = 17;
 const RETRYABLE_CODES = new Set(['network', 'timeout', 'server_error', 'upload_refused']);
 const POLICY_RETRY_CODES = new Set(['network', 'timeout', 'server_error']);
 const KNOWN_COLLECTOR_IDS = new Set(KNOWN_COLLECTORS);
@@ -95,6 +97,7 @@ function createFlow(options = {}) {
   const parseCode = options.parseCode;
   const makeClient = options.makeClient;
   const sealEnvelope = options.sealEnvelope;
+  const sealEnvelopeV2 = options.sealEnvelopeV2;
   const runSidecar = options.runSidecar;
   const now = typeof options.now === 'function' ? options.now : Date.now;
   const emit = typeof options.emit === 'function' ? options.emit : noop;
@@ -112,6 +115,7 @@ function createFlow(options = {}) {
   let busy = false;
   let expected = null;
   let sent = false;
+  let stored = false; // relay transport: the relay holds the envelope, the server has not answered yet
   let quitRequested = false;
   let scanInFlight = false;
   let scanCanceled = false;
@@ -169,7 +173,7 @@ function createFlow(options = {}) {
 
   function failConnect(error, exitCode) {
     const key = errorKey(error);
-    const retry = RETRYABLE_CODES.has(key) && hasTime();
+    const retry = !(error && error.final === true) && RETRYABLE_CODES.has(key) && hasTime();
     fail(key, exitCode, retry);
   }
 
@@ -199,10 +203,20 @@ function createFlow(options = {}) {
     }
   }
 
+  // An rr2 code is sealed as envelope v2, bound to the code's five members; rr1 keeps v1 (ADR 0003 section 4).
+  function seal(plain) {
+    if (parsed.version === 2) {
+      if (typeof sealEnvelopeV2 !== 'function') throw new TypeError('envelope v2 is not available');
+      return sealEnvelopeV2(plain, parsed.kitPublicKey, parsed.binding);
+    }
+    return sealEnvelope(plain, parsed.kitPublicKey, parsed.ticket);
+  }
+
   function consentState() {
     return withCountdown({
       name: 'consent',
       serverOrigin: parsed.serverOrigin,
+      viaRelay: parsed.transport === 'relay',
       serverName: policy.server_name,
       collectors: [...policy.required_collectors],
       elevation: policy.require_elevation === true,
@@ -290,7 +304,7 @@ function createFlow(options = {}) {
 
     let envelope;
     try {
-      envelope = sealEnvelope(text, parsed.kitPublicKey, parsed.ticket);
+      envelope = seal(text);
     } catch {
       return { ok: false, key: 'record_refused' };
     }
@@ -320,6 +334,11 @@ function createFlow(options = {}) {
           ticket: parsed.ticket,
           expiresAt: parsed.expiresAt,
         };
+        // rr2 codes name the path and the transport (ADR 0003); rr1 keeps the client's defaults.
+        if (parsed.version === 2) {
+          pairing.basePath = parsed.basePath;
+          pairing.transport = parsed.transport;
+        }
         client = await makeClient(pairing);
       }
       const received = await client.getPolicy(parsed.policyHash);
@@ -468,7 +487,7 @@ function createFlow(options = {}) {
 
       let envelope;
       try {
-        envelope = sealEnvelope(recordText, parsed.kitPublicKey, parsed.ticket);
+        envelope = seal(recordText);
       } catch {
         fail('internal', 10, false);
         return true;
@@ -481,8 +500,15 @@ function createFlow(options = {}) {
         return true;
       }
 
+      stored = false;
+      const onStored = () => {
+        stored = true;
+        sent = true;
+        publish({ name: 'waiting', pending: true, serverOrigin: parsed.serverOrigin, visualHash });
+      };
+      let result;
       try {
-        await client.upload(bytes);
+        result = await client.upload(bytes, { onStored });
       } catch (error) {
         if (isConnectError(error)) {
           sent = errorMayHaveSent(error);
@@ -494,6 +520,11 @@ function createFlow(options = {}) {
         return true;
       }
 
+      if (result && result.status === 'waiting') {
+        if (!quitRequested) exit = RELAY_WAITING_EXIT_CODE;
+        publish({ name: 'waiting', serverOrigin: parsed.serverOrigin, visualHash });
+        return true;
+      }
       accepted = true;
       if (!quitRequested) exit = 0;
       publish({ name: 'done', serverOrigin: parsed.serverOrigin, visualHash });
@@ -519,7 +550,7 @@ function createFlow(options = {}) {
 
       let envelope;
       try {
-        envelope = sealEnvelope(plaintext, parsed.kitPublicKey, parsed.ticket);
+        envelope = seal(plaintext);
       } catch {
         fail('internal', 10, false);
         return true;
@@ -532,8 +563,15 @@ function createFlow(options = {}) {
         return true;
       }
 
+      stored = false;
+      const onStored = () => {
+        stored = true;
+        sent = true;
+        publish({ name: 'waiting', pending: true, serverOrigin: parsed.serverOrigin, declined: true });
+      };
+      let result;
       try {
-        await client.decline(bytes);
+        result = await client.decline(bytes, { onStored });
       } catch (error) {
         if (isConnectError(error)) {
           sent = errorMayHaveSent(error);
@@ -545,6 +583,11 @@ function createFlow(options = {}) {
         return true;
       }
 
+      if (result && result.status === 'waiting') {
+        if (!quitRequested) exit = RELAY_WAITING_EXIT_CODE;
+        publish({ name: 'waiting', serverOrigin: parsed.serverOrigin, declined: true });
+        return true;
+      }
       accepted = true;
       if (!quitRequested) exit = DECLINED_EXIT_CODE;
       publish({ name: 'declined', serverOrigin: parsed.serverOrigin });
@@ -590,6 +633,8 @@ function createFlow(options = {}) {
       code = current.name === 'declined' ? DECLINED_EXIT_CODE : 0;
     } else if (exit !== null && exit !== 0) {
       code = exit;
+    } else if (stored === true) {
+      code = RELAY_WAITING_EXIT_CODE;
     } else if (sent === true || current.name === 'uploading') {
       code = 15;
     } else {
@@ -646,3 +691,4 @@ module.exports = createFlow;
 module.exports.createFlow = createFlow;
 module.exports.MAX_RECORD_BYTES = MAX_RECORD_BYTES;
 module.exports.DECLINED_EXIT_CODE = DECLINED_EXIT_CODE;
+module.exports.RELAY_WAITING_EXIT_CODE = RELAY_WAITING_EXIT_CODE;

@@ -21,7 +21,7 @@ const {
   sweepStale,
 } = require('./userdata');
 const { parsePairingCode } = require('../core/pairing');
-const { sealEnvelope } = require('../core/envelope');
+const { sealEnvelope, sealEnvelopeV2 } = require('../core/envelope');
 const PairedClient = require('./net');
 const testHook = require('../test-hook');
 const { createFlow } = require('./flow');
@@ -250,6 +250,8 @@ function bootstrap() {
           ? expiresAt
           : parsed.expiresAt ?? parsed.expires_at,
         fetchImpl: (...a) => ses.fetch(...a),
+        basePath: typeof parsed.basePath === 'string' ? parsed.basePath : undefined,
+        transport: typeof parsed.transport === 'string' ? parsed.transport : undefined,
       });
     };
 
@@ -269,6 +271,7 @@ function bootstrap() {
       parseCode: parsePairingCode,
       makeClient,
       sealEnvelope,
+      sealEnvelopeV2,
       runSidecar,
       now: () => Date.now(),
       emit,
