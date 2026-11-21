@@ -123,6 +123,18 @@ const STATES = {
       localAddress: true,
     };
   },
+  consentRelay() {
+    return {
+      name: 'consent',
+      serverOrigin: 'https://relay.example.org',
+      viaRelay: true,
+      serverName: 'Example City',
+      collectors: ['posture'],
+      elevation: false,
+      secondsLeft: 125,
+      localAddress: false,
+    };
+  },
   scanning() {
     return { name: 'scanning', elevationPending: false, secondsLeft: 74 };
   },
@@ -148,6 +160,12 @@ const STATES = {
   },
   declined() {
     return { name: 'declined', serverOrigin: ORIGIN };
+  },
+  waiting() {
+    return { name: 'waiting', serverOrigin: 'https://relay.example.org', visualHash: HASH };
+  },
+  waitingDeclined() {
+    return { name: 'waiting', serverOrigin: 'https://relay.example.org', declined: true };
   },
   error() {
     return {
@@ -657,4 +675,14 @@ test('the stylesheet keeps the product tokens, the Thai font stack and no motion
   assert.equal(/linear-gradient|radial-gradient/i.test(css), false);
   assert.equal(/@keyframes/i.test(css), false);
   assert.match(css, /prefers-reduced-motion: reduce/);
+});
+
+test('a relay consent shows the relay line; waiting never says sent', function () {
+  for (const [name, table] of Object.entries(LOCALES)) {
+    const t = makeT(table);
+    assert.match(t('consent.viaRelay'), /relay/, name);
+    const text = t('waiting.message', { origin: 'https://relay.example.org' });
+    assert.ok(text.includes('https://relay.example.org'), name);
+    assert.ok(!/\bsent\b|ส่งแล้ว/i.test(text), name);
+  }
 });

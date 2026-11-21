@@ -173,6 +173,11 @@
     var children = [
       element('p', { class: 'eyebrow' }, [textNode(t('consent.origin'))]),
       element('p', { class: 'origin' }, [textNode(state.serverOrigin)]),
+    ];
+    if (state.viaRelay === true) {
+      children.push(element('p', { class: 'lede' }, [textNode(t('consent.viaRelay'))]));
+    }
+    children.push(
       element('p', { class: 'lede' }, [
         textNode(t('consent.serverCallsItself', { name: state.serverName })),
       ]),
@@ -184,7 +189,7 @@
         textNode(state.elevation ? t('consent.elevationYes') : t('consent.elevationNo')),
       ]),
       countdown(t, state),
-    ];
+    );
 
     if (state.localAddress) {
       children.push(element('p', { class: 'warning' }, [
@@ -248,6 +253,18 @@
     ]);
   }
 
+  // Relay transport: the relay holds the report and the server has not confirmed it. Never says "sent".
+  function renderWaiting(state, t) {
+    return screen(state, [
+      element('p', { class: 'lede' }, [
+        textNode(t(state.declined === true ? 'waiting.declined' : 'waiting.message', { origin: state.serverOrigin })),
+      ]),
+      actions([
+        button(t, 'quit', t('common.quit'), 'quiet'),
+      ]),
+    ]);
+  }
+
   function renderDeclined(state, t) {
     return screen(state, [
       element('p', { class: 'lede' }, [
@@ -298,6 +315,8 @@
         return renderDone(safeState, t);
       case 'declined':
         return renderDeclined(safeState, t);
+      case 'waiting':
+        return renderWaiting(safeState, t);
       case 'error':
       default:
         return renderError(safeState, t);
