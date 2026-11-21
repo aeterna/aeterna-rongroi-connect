@@ -82,3 +82,35 @@ test('an envelope over 2 MiB is refused locally', async () => {
   await assert.rejects(c.upload(Buffer.alloc(2 * 1024 * 1024 + 1)), (e) => e.code === 'bad_envelope');
   assert.equal(calls.length, 0);
 });
+
+test('onStored is called once after the 202; any failed poll keeps polling; the GET count is bounded', async () => {
+  const responses = [{ status: 202 }, { status: 302, headers: { location: 'https://x.example' } }, { status: 200, body: 'not json' },
+    { status: 200, body: { result: 'pending' } }, { status: 200, body: { result: 'accepted' } }];
+  const { c, calls } = client(responses);
+  let stored = 0;
+  assert.deepEqual(await c.upload(Buffer.from('envelope'), { onStored: () => { stored += 1; } }), { status: 'accepted' });
+  assert.equal(stored, 1);
+  assert.equal(calls.length, 5);
+});
+
+test('a relay result is marked final', async () => {
+  for (const result of [422, 500, 409]) {
+    const { c } = client([{ status: 202 }, { status: 200, body: { result } }]);
+    await assert.rejects(c.upload(Buffer.from('e')), (e) => e.final === true && e.sent === true, String(result));
+  }
+});
+
+test('an expired ticket sends nothing to the relay', async () => {
+  const { c, calls, advance } = client([]);
+  advance(400000);
+  await assert.rejects(c.upload(Buffer.from('e')), (e) => e.code === 'expired' && e.sent === false);
+  assert.equal(calls.length, 0);
+});
+
+test('waiting is reached after at most 2 s, 4 s, 8 s, then 15 s steps until expiry + 10 min', async () => {
+  const pending = Array.from({ length: 200 }, () => ({ status: 200, body: { result: 'pending' } }));
+  const { c, calls } = client([{ status: 202 }, ...pending]);
+  assert.deepEqual(await c.upload(Buffer.from('envelope')), { status: 'waiting' });
+  // 300 s ticket + 600 s grace = 900 s: 2+4+8 then 15 s steps ⇒ about 60 polls, never hundreds.
+  assert.ok(calls.length > 50 && calls.length < 70, String(calls.length));
+});

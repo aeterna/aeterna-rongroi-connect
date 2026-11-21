@@ -38,6 +38,8 @@ class ConnectError extends Error {
     if (options !== null && typeof options === 'object' && typeof options.sent === 'boolean') {
       this.sent = options.sent;
     }
+    // A server result relayed by a Rongroi Relay is final: the flow offers no retry (ADR 0003 section 5).
+    if (options !== null && typeof options === 'object' && options.final === true) this.final = true;
   }
 }
 
@@ -332,8 +334,9 @@ class PairedClient {
     return policy;
   }
 
-  async upload(envelopeBytes) {
-    if (this.transport === 'relay') return this.uploadToRelay(envelopeBytes);
+  // `onStored` (relay transport only) is called once the relay has stored the envelope (202).
+  async upload(envelopeBytes, { onStored } = {}) {
+    if (this.transport === 'relay') return this.uploadToRelay(envelopeBytes, { onStored });
     let plan;
     try {
       plan = planUpload(envelopeBytes, this.ticket);
@@ -362,8 +365,8 @@ class PairedClient {
     }
   }
 
-  async decline(sealedBytes) {
-    const result = await this.upload(sealedBytes);
+  async decline(sealedBytes, options = {}) {
+    const result = await this.upload(sealedBytes, options);
     if (result.status === 'waiting') return result;
     return { status: 'declined' };
   }
@@ -371,7 +374,8 @@ class PairedClient {
   // Relay transport (ADR 0003 section 5): a 202 means the Relay stored the envelope, not that the server accepted
   // it. Poll the status until the server's result: 'accepted' resolves; a listed code fails like the direct path
   // but is final (no restart, no retry); no result by expires_at + 10 minutes resolves { status: 'waiting' }.
-  async uploadToRelay(envelopeBytes) {
+  async uploadToRelay(envelopeBytes, { onStored } = {}) {
+    if (!this.hasTime()) fail('expired', 'the ticket expired before the upload', { sent: false });
     const body = Buffer.isBuffer(envelopeBytes) ? envelopeBytes : Buffer.from(envelopeBytes);
     if (body.length === 0 || body.length > MAX_RELAY_BYTES) {
       fail('bad_envelope', 'a relay envelope must be 1 byte to 2 MiB', { sent: false });
@@ -400,6 +404,13 @@ class PairedClient {
     if (response.status !== 202) {
       fail(statusCode(response.status), `relay refused the upload with status ${response.status}`, { sent: false });
     }
+    if (typeof onStored === 'function') {
+      try {
+        onStored();
+      } catch {
+        // The flow's callback must not stop the poll.
+      }
+    }
     const deadline = (Number.isFinite(this.expiresAtMs) ? this.expiresAtMs : this.now()) + RELAY_WAIT_PAST_EXPIRY_MS;
     let delay = RELAY_POLL_FIRST_MS;
     for (;;) {
@@ -408,7 +419,9 @@ class PairedClient {
       try {
         poll = await this.request(`status/${this.ticket}/${sha}`, { method: 'GET' }, this.policyTimeoutMs);
       } catch (error) {
-        if (!(error instanceof ConnectError) || (error.code !== 'network' && error.code !== 'timeout')) throw error;
+        // The report is already at the relay: any failed poll (network, timeout, redirect, a bad body) only means
+        // "no answer yet", so keep polling until the deadline.
+        if (!(error instanceof ConnectError)) throw error;
         poll = null;
       }
       if (poll && poll.status === 200) {
@@ -416,7 +429,8 @@ class PairedClient {
         try { result = JSON.parse(poll.bytes.toString('utf8')).result; } catch { result = undefined; }
         if (result === 'accepted') return { status: 'accepted' };
         if (RELAY_RESULT_CODES.includes(result)) {
-          fail(result === 500 ? 'server_error' : statusCode(result), `the server answered ${result} through the relay`, { sent: true });
+          fail(result === 500 ? 'server_error' : statusCode(result), `the server answered ${result} through the relay`,
+            { sent: true, final: true });
         }
       }
       if (this.now() >= deadline) return { status: 'waiting' };

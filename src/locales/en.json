@@ -50,6 +50,7 @@
   "declined.message": "You declined. {origin} was told.",
   "waiting.message": "The relay at {origin} has your report, but the game server has not confirmed it yet. You can close this window; ask staff if they did not get it.",
   "waiting.declined": "The relay at {origin} has your answer, but the game server has not confirmed it yet. You can close this window.",
+  "waiting.pending": "Delivered to the relay at {origin}. Waiting for the game server to collect it.",
   "error.title": "Something went wrong",
   "error.bad_code": "The code is not one this app can read.",
   "error.bad_origin": "The code points at an address this app cannot use.",

@@ -115,6 +115,7 @@ function createFlow(options = {}) {
   let busy = false;
   let expected = null;
   let sent = false;
+  let stored = false; // relay transport: the relay holds the envelope, the server has not answered yet
   let quitRequested = false;
   let scanInFlight = false;
   let scanCanceled = false;
@@ -172,7 +173,7 @@ function createFlow(options = {}) {
 
   function failConnect(error, exitCode) {
     const key = errorKey(error);
-    const retry = RETRYABLE_CODES.has(key) && hasTime();
+    const retry = !(error && error.final === true) && RETRYABLE_CODES.has(key) && hasTime();
     fail(key, exitCode, retry);
   }
 
@@ -499,9 +500,15 @@ function createFlow(options = {}) {
         return true;
       }
 
+      stored = false;
+      const onStored = () => {
+        stored = true;
+        sent = true;
+        publish({ name: 'waiting', pending: true, serverOrigin: parsed.serverOrigin, visualHash });
+      };
       let result;
       try {
-        result = await client.upload(bytes);
+        result = await client.upload(bytes, { onStored });
       } catch (error) {
         if (isConnectError(error)) {
           sent = errorMayHaveSent(error);
@@ -556,9 +563,15 @@ function createFlow(options = {}) {
         return true;
       }
 
+      stored = false;
+      const onStored = () => {
+        stored = true;
+        sent = true;
+        publish({ name: 'waiting', pending: true, serverOrigin: parsed.serverOrigin, declined: true });
+      };
       let result;
       try {
-        result = await client.decline(bytes);
+        result = await client.decline(bytes, { onStored });
       } catch (error) {
         if (isConnectError(error)) {
           sent = errorMayHaveSent(error);
@@ -620,6 +633,8 @@ function createFlow(options = {}) {
       code = current.name === 'declined' ? DECLINED_EXIT_CODE : 0;
     } else if (exit !== null && exit !== 0) {
       code = exit;
+    } else if (stored === true) {
+      code = RELAY_WAITING_EXIT_CODE;
     } else if (sent === true || current.name === 'uploading') {
       code = 15;
     } else {

@@ -164,6 +164,9 @@ const STATES = {
   waiting() {
     return { name: 'waiting', serverOrigin: 'https://relay.example.org', visualHash: HASH };
   },
+  waitingPending() {
+    return { name: 'waiting', pending: true, serverOrigin: 'https://relay.example.org' };
+  },
   waitingDeclined() {
     return { name: 'waiting', serverOrigin: 'https://relay.example.org', declined: true };
   },

@@ -79,3 +79,54 @@ test('a declined answer through a relay that is not confirmed is also waiting wi
   assert.equal(h.emitted.at(-1).declined, true);
   assert.equal(h.flow.exitCode(), 17);
 });
+
+function harnessWith(uploadImpl) {
+  const emitted = [];
+  const flow = createFlow({
+    parseCode: () => CODE,
+    makeClient: () => ({ expiresAtMs: Date.now() + 300000, getPolicy: async () => POLICY, upload: uploadImpl, decline: uploadImpl }),
+    sealEnvelope: () => ({ v: 1 }),
+    sealEnvelopeV2: () => ({ v: 2, epk: 'e', iv: 'i', ct: 'c' }),
+    runSidecar: async (input) => ({ recordText: JSON.stringify({ schema: 2, binding: input.binding, policy: input.policy,
+      producer: input.producer, visual_hash: '0123456789abcdef', facts: [] }) }),
+    emit: (s) => emitted.push(s),
+    version: '0.1.0',
+  });
+  return { flow, emitted };
+}
+
+test('after the relay stores the report the screen says so, and quitting then exits 17', async () => {
+  let release;
+  const h = harnessWith((bytes, { onStored }) => { onStored(); return new Promise((r) => { release = r; }); });
+  await h.flow.submitCode('rr2.x');
+  await h.flow.consent();
+  const sending = h.flow.send();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.emitted.at(-1).name, 'waiting');
+  assert.equal(h.emitted.at(-1).pending, true);
+  assert.equal(h.flow.quit(), 17);
+  release({ status: 'accepted' });
+  await sending;
+});
+
+test('a final relay result offers no retry', async () => {
+  const { ConnectError } = require('../src/main/net');
+  const h = harnessWith(async (bytes, { onStored }) => {
+    onStored();
+    throw new ConnectError('upload_refused', 'the server answered 422 through the relay', { sent: true, final: true });
+  });
+  await h.flow.submitCode('rr2.x');
+  await h.flow.consent();
+  await h.flow.send();
+  const last = h.emitted.at(-1);
+  assert.equal(last.name, 'error');
+  assert.equal(last.canRetry, false);
+  assert.equal(h.flow.exitCode(), 15);
+});
+
+test('a declined answer accepted through the relay exits 16', async () => {
+  const h = harnessWith(async () => ({ status: 'declined' }));
+  await h.flow.submitCode('rr2.x');
+  await h.flow.decline();
+  assert.equal(h.flow.exitCode(), 16);
+});

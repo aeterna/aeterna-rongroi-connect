@@ -257,7 +257,8 @@
   function renderWaiting(state, t) {
     return screen(state, [
       element('p', { class: 'lede' }, [
-        textNode(t(state.declined === true ? 'waiting.declined' : 'waiting.message', { origin: state.serverOrigin })),
+        textNode(t(state.pending === true ? 'waiting.pending'
+          : (state.declined === true ? 'waiting.declined' : 'waiting.message'), { origin: state.serverOrigin })),
       ]),
       actions([
         button(t, 'quit', t('common.quit'), 'quiet'),
