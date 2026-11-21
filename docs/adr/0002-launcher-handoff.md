@@ -56,6 +56,7 @@ Nothing in this ADR may let a launcher do what a pasted code could not.
    | 13 | the sidecar failed, its hash did not match, or it timed out |
    | 14 | the record was refused before upload |
    | 15 | the upload failed or the server refused it |
+   | **17** | **relay transport only: the relay holds the report, the server has not confirmed it** (ADR 0003, amended 2026-11-21) |
 
    Scripts that treat 0 as "something was sent" must also accept 16. The mock Kit and the e2e tests change with it.
 5. **Nothing else crosses.** Connect writes nothing back on the pipe or to stdout or stderr for the launcher, and reads
