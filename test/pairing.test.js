@@ -94,7 +94,7 @@ test('refuses hostile or non-canonical origins', () => {
 });
 
 test('refuses malformed codes and members', () => {
-  assert.throws(() => parsePairingCode('rr2.abc'), isPairingError('BAD_PREFIX'));
+  assert.throws(() => parsePairingCode('rr3.abc'), isPairingError('BAD_PREFIX'));
   assert.throws(() => parsePairingCode('rr1.!!!!'), isPairingError('BAD_BASE64'));
   assert.throws(() => parsePairingCode(`${encode(BASE)}=`), isPairingError('BAD_BASE64'));
   assert.throws(() => parsePairingCode('rr1.' + Buffer.from([0xff]).toString('base64url')), isPairingError('BAD_JSON'));
@@ -140,4 +140,46 @@ test('refuses a pairing code that is only whitespace', () => {
     () => parsePairingCode(' \t\r\n\u00A0\u2009\u200B\uFEFF'),
     isPairingError('BAD_PREFIX'),
   );
+});
+
+// rr2 codes (ADR 0003, aeterna-rongroi ADR 0097 section 2).
+function rr2(changes = {}) {
+  const payload = {
+    server_origin: 'https://relay.example.org', base_path: 'srv1', transport: 'relay',
+    ticket: '7a1c9e3f5b2d8a4c6e0f1b3d5a7c9e2f', nonce: 'n-01', expires_at: '2026-11-21T12:00:00Z',
+    policy_hash: '0123456789abcdef', kit_public_key: 'ovol0Vile5zOPb8MVWv4hi3YXxnWwdhDWs2VxaLj5yA', ...changes,
+  };
+  for (const key of Object.keys(payload)) if (payload[key] === undefined) delete payload[key];
+  return `rr2.${Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')}`;
+}
+
+test('rr2: parses base_path and transport and returns the v2 binding', () => {
+  const parsed = parsePairingCode(rr2());
+  assert.equal(parsed.version, 2);
+  assert.equal(parsed.basePath, 'srv1');
+  assert.equal(parsed.transport, 'relay');
+  assert.deepEqual(parsed.binding, { base_path: 'srv1', policy_hash: '0123456789abcdef',
+    server_origin: 'https://relay.example.org', ticket: '7a1c9e3f5b2d8a4c6e0f1b3d5a7c9e2f', transport: 'relay' });
+});
+
+test('rr1 keeps base_path nakara_rongroi, transport direct and no binding', () => {
+  const p = { server_origin: 'http://203.0.113.10:30120', ticket: '7a1c9e3f5b2d8a4c6e0f1b3d5a7c9e2f', nonce: 'n',
+    expires_at: '2026-11-21T12:00:00Z', policy_hash: '0123456789abcdef', kit_public_key: 'ovol0Vile5zOPb8MVWv4hi3YXxnWwdhDWs2VxaLj5yA' };
+  const parsed = parsePairingCode(`rr1.${Buffer.from(JSON.stringify(p)).toString('base64url')}`);
+  assert.equal(parsed.version, 1);
+  assert.equal(parsed.basePath, 'nakara_rongroi');
+  assert.equal(parsed.transport, 'direct');
+  assert.equal(parsed.binding, null);
+});
+
+test('rr2: refuses unknown or missing members, bad base_path, bad transport, http relay, unnormalised origin', () => {
+  assert.throws(() => parsePairingCode(rr2({ extra: 'x' })), isPairingError('BAD_SHAPE'));
+  assert.throws(() => parsePairingCode(rr2({ base_path: undefined })), isPairingError('BAD_SHAPE'));
+  for (const base_path of ['v1', 'Srv', '', 'a/b', 'x'.repeat(65)]) {
+    assert.throws(() => parsePairingCode(rr2({ base_path })), isPairingError('BAD_BASE_PATH'), base_path);
+  }
+  assert.throws(() => parsePairingCode(rr2({ transport: 'smoke' })), isPairingError('BAD_TRANSPORT'));
+  assert.throws(() => parsePairingCode(rr2({ server_origin: 'http://relay.example.org' })), isPairingError('BAD_ORIGIN'));
+  assert.throws(() => parsePairingCode(rr2({ server_origin: 'https://Relay.example.org' })), isPairingError('BAD_ORIGIN'));
+  assert.equal(parsePairingCode(rr2({ server_origin: 'http://203.0.113.10:30120', transport: 'direct' })).transport, 'direct');
 });

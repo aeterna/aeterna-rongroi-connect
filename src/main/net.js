@@ -5,7 +5,17 @@
 const { policyHash } = require('../core/canonical');
 const { actionForStatus, planUpload } = require('../core/upload-plan');
 
+const crypto = require('node:crypto');
+
+// rr1 codes always use the Kit's fixed path; rr2 codes name it in base_path (ADR 0003).
 const PATH_PREFIX = '/nakara_rongroi/';
+const BASE_PATH_RE = /^[a-z0-9_-]{1,64}$/;
+// Relay transport (ADR 0003 section 5): one POST of at most 2 MiB, then poll the result.
+const MAX_RELAY_BYTES = 2 * 1024 * 1024;
+const RELAY_POLL_FIRST_MS = 2000;
+const RELAY_POLL_MAX_MS = 15000;
+const RELAY_WAIT_PAST_EXPIRY_MS = 10 * 60 * 1000;
+const RELAY_RESULT_CODES = [404, 409, 410, 422, 500];
 const MAX_RATE_LIMIT_WAITS = 4;
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const POLICY_TIMEOUT_MS = 10_000;
@@ -28,6 +38,8 @@ class ConnectError extends Error {
     if (options !== null && typeof options === 'object' && typeof options.sent === 'boolean') {
       this.sent = options.sent;
     }
+    // A server result relayed by a Rongroi Relay is final: the flow offers no retry (ADR 0003 section 5).
+    if (options !== null && typeof options === 'object' && options.final === true) this.final = true;
   }
 }
 
@@ -68,8 +80,12 @@ function pinOrigin(value) {
   return url.origin;
 }
 
-function buildUrl(origin, path) {
+function buildUrl(origin, path, basePath = 'nakara_rongroi') {
   const base = pinOrigin(origin);
+  if (typeof basePath !== 'string' || !BASE_PATH_RE.test(basePath) || basePath === 'v1') {
+    fail('bad_path', 'base path must be one segment of a-z 0-9 _ -');
+  }
+  const prefix = `/${basePath}/`;
   if (typeof path !== 'string' || path.length === 0) {
     fail('bad_path', 'request path must be a non-empty string');
   }
@@ -79,13 +95,13 @@ function buildUrl(origin, path) {
   }
   for (const segment of path.split('/')) {
     if (segment === '' || segment === '.' || segment === '..') {
-      fail('bad_path', 'request path must not escape /nakara_rongroi');
+      fail('bad_path', `request path must not escape ${prefix}`);
     }
   }
 
-  const url = new URL(`${base}${PATH_PREFIX}${path}`);
+  const url = new URL(`${base}${prefix}${path}`);
   if (url.origin !== base || url.username || url.password
-      || !url.pathname.startsWith(PATH_PREFIX)) {
+      || !url.pathname.startsWith(prefix)) {
     fail('foreign_origin', 'request would leave the paired origin');
   }
   return url;
@@ -176,6 +192,8 @@ class PairedClient {
     uploadTimeoutMs,
     expiresAt,
     expires_at,
+    basePath = 'nakara_rongroi',
+    transport = 'direct',
   } = {}) {
     Object.defineProperty(this, 'origin', {
       value: pinOrigin(origin),
@@ -204,6 +222,10 @@ class PairedClient {
       fail('bad_timeout', 'uploadTimeoutMs must be a positive number');
     }
 
+    if (transport !== 'direct' && transport !== 'relay') fail('bad_transport', 'transport must be direct or relay');
+    buildUrl(this.origin, 'policy', basePath);
+    this.basePath = basePath;
+    this.transport = transport;
     this.ticket = ticket;
     this.fetchImpl = fetchImpl;
     this.now = clock;
@@ -227,7 +249,7 @@ class PairedClient {
   // Resolve a request path without fetching. The fetch path calls this too, so
   // an attempted departure from the paired origin fails before any request.
   urlFor(path) {
-    return buildUrl(this.origin, path);
+    return buildUrl(this.origin, path, this.basePath);
   }
 
   hasTime(at = this.now()) {
@@ -312,7 +334,9 @@ class PairedClient {
     return policy;
   }
 
-  async upload(envelopeBytes) {
+  // `onStored` (relay transport only) is called once the relay has stored the envelope (202).
+  async upload(envelopeBytes, { onStored } = {}) {
+    if (this.transport === 'relay') return this.uploadToRelay(envelopeBytes, { onStored });
     let plan;
     try {
       plan = planUpload(envelopeBytes, this.ticket);
@@ -341,9 +365,77 @@ class PairedClient {
     }
   }
 
-  async decline(sealedBytes) {
-    await this.upload(sealedBytes);
+  async decline(sealedBytes, options = {}) {
+    const result = await this.upload(sealedBytes, options);
+    if (result.status === 'waiting') return result;
     return { status: 'declined' };
+  }
+
+  // Relay transport (ADR 0003 section 5): a 202 means the Relay stored the envelope, not that the server accepted
+  // it. Poll the status until the server's result: 'accepted' resolves; a listed code fails like the direct path
+  // but is final (no restart, no retry); no result by expires_at + 10 minutes resolves { status: 'waiting' }.
+  async uploadToRelay(envelopeBytes, { onStored } = {}) {
+    if (!this.hasTime()) fail('expired', 'the ticket expired before the upload', { sent: false });
+    const body = Buffer.isBuffer(envelopeBytes) ? envelopeBytes : Buffer.from(envelopeBytes);
+    if (body.length === 0 || body.length > MAX_RELAY_BYTES) {
+      fail('bad_envelope', 'a relay envelope must be 1 byte to 2 MiB', { sent: false });
+    }
+    const sha = crypto.createHash('sha256').update(body).digest('hex');
+    const headers = {
+      'Content-Type': 'application/octet-stream',
+      'X-Rongroi-Upload-Id': this.ticket,
+      'X-Rongroi-Report-Sha256': sha,
+      'X-Rongroi-Envelope': '2',
+    };
+    let response;
+    let rateLimitWaits = 0;
+    for (;;) {
+      response = await this.request('report', { method: 'POST', headers, body }, this.uploadTimeoutMs);
+      if (response.status !== 429) break;
+      const action = actionForStatus(429, response.headers.get('retry-after'));
+      const delay = action.retryAfterMs === null || action.retryAfterMs === undefined ? 1000 : action.retryAfterMs;
+      if (rateLimitWaits >= MAX_RATE_LIMIT_WAITS || !this.hasTime(this.now() + delay)) {
+        fail('rate_limited', 'the relay kept asking to retry later', { sent: false });
+      }
+      rateLimitWaits += 1;
+      await this.sleep(delay);
+    }
+    if (response.status === 200) return { status: 'accepted' };
+    if (response.status !== 202) {
+      fail(statusCode(response.status), `relay refused the upload with status ${response.status}`, { sent: false });
+    }
+    if (typeof onStored === 'function') {
+      try {
+        onStored();
+      } catch {
+        // The flow's callback must not stop the poll.
+      }
+    }
+    const deadline = (Number.isFinite(this.expiresAtMs) ? this.expiresAtMs : this.now()) + RELAY_WAIT_PAST_EXPIRY_MS;
+    let delay = RELAY_POLL_FIRST_MS;
+    for (;;) {
+      await this.sleep(delay);
+      let poll;
+      try {
+        poll = await this.request(`status/${this.ticket}/${sha}`, { method: 'GET' }, this.policyTimeoutMs);
+      } catch (error) {
+        // The report is already at the relay: any failed poll (network, timeout, redirect, a bad body) only means
+        // "no answer yet", so keep polling until the deadline.
+        if (!(error instanceof ConnectError)) throw error;
+        poll = null;
+      }
+      if (poll && poll.status === 200) {
+        let result;
+        try { result = JSON.parse(poll.bytes.toString('utf8')).result; } catch { result = undefined; }
+        if (result === 'accepted') return { status: 'accepted' };
+        if (RELAY_RESULT_CODES.includes(result)) {
+          fail(result === 500 ? 'server_error' : statusCode(result), `the server answered ${result} through the relay`,
+            { sent: true, final: true });
+        }
+      }
+      if (this.now() >= deadline) return { status: 'waiting' };
+      delay = Math.min(delay * 2, RELAY_POLL_MAX_MS);
+    }
   }
 
   rememberExpiry(policy, dateHeader) {
@@ -483,6 +575,7 @@ module.exports = PairedClient;
 module.exports.PairedClient = PairedClient;
 module.exports.ConnectError = ConnectError;
 module.exports.buildUrl = buildUrl;
+module.exports.MAX_RELAY_BYTES = MAX_RELAY_BYTES;
 module.exports.MAX_RESPONSE_BYTES = MAX_RESPONSE_BYTES;
 module.exports.POLICY_TIMEOUT_MS = POLICY_TIMEOUT_MS;
 module.exports.UPLOAD_TIMEOUT_MS = UPLOAD_TIMEOUT_MS;
