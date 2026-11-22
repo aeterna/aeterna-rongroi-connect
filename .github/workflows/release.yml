@@ -1,4 +1,5 @@
 # SPDX-FileCopyrightText: 2026 aeterna-rongroi contributors
+# Throwaway build trigger for the rr2 live test (2026-11-22); this PR is closed unmerged.
 # SPDX-License-Identifier: GPL-3.0-or-later
 # ADR 0001 section 7: builds the release zip on a GitHub-hosted runner, writes SHA256SUMS, attests the zip and
 # opens a draft release for a v<version> tag. On a pull request that touches packaging it builds the zip and
