@@ -4,7 +4,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 -->
 # aeterna-rongroi-connect
 
-**Status: pre-alpha, not yet released.** Rongroi Connect is a Windows app that, with the player's consent,
+**Status: 0.2, early release.** Rongroi Connect is a Windows app that, with the player's consent,
 sends one [aeterna-rongroi](https://github.com/aeterna/aeterna-rongroi) report to the one FiveM server the
 player paired it with. The offline rongroi program stays unchanged and sends nothing.
 
@@ -14,6 +14,9 @@ player paired it with. The offline rongroi program stays unchanged and sends not
   SHA-256 before every run.
 - A server's launcher can start Connect and hand it the code over a named pipe
   ([ADR 0002](docs/adr/0002-launcher-handoff.md)).
+- A server can take reports through its own Rongroi Relay instead of the game port: an `rr2.` code names the
+  relay, Connect uploads there and waits until the server confirms ([ADR 0003](docs/adr/0003-rr2-and-relay-transport.md)).
+  `rr1.` codes keep working.
 
 How it is built, what it sends and what it never sends: [ADR 0001](docs/adr/0001-connect-client.md).
 
